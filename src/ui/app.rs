@@ -122,6 +122,8 @@ pub struct App {
     pub status_message: Option<String>,
     /// Status message timestamp
     pub status_time: Option<Instant>,
+    /// Whether number key shortcuts are enabled
+    pub shortcuts_enabled: bool,
 }
 
 impl App {
@@ -142,6 +144,7 @@ impl App {
             total_events: 0,
             status_message: None,
             status_time: None,
+            shortcuts_enabled: true,
         }
     }
 
@@ -186,6 +189,16 @@ impl App {
             current - 1
         };
         self.view = AppView::from_index(prev);
+    }
+
+    /// Toggle menu shortcuts (number keys)
+    pub fn toggle_shortcuts(&mut self) {
+        self.shortcuts_enabled = !self.shortcuts_enabled;
+        if self.shortcuts_enabled {
+            self.set_status("Menu shortcuts ON (1-8)".to_string());
+        } else {
+            self.set_status("Menu shortcuts OFF - number keys free".to_string());
+        }
     }
 
     /// Toggle pause state

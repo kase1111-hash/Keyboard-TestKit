@@ -130,14 +130,15 @@ fn main() -> Result<()> {
                     CtKeyCode::Tab => {
                         app.next_view();
                     }
-                    CtKeyCode::Char('1') => app.view = AppView::Dashboard,
-                    CtKeyCode::Char('2') => app.view = AppView::PollingRate,
-                    CtKeyCode::Char('3') => app.view = AppView::HoldRelease,
-                    CtKeyCode::Char('4') => app.view = AppView::Stickiness,
-                    CtKeyCode::Char('5') => app.view = AppView::Rollover,
-                    CtKeyCode::Char('6') => app.view = AppView::Latency,
-                    CtKeyCode::Char('7') => app.view = AppView::Shortcuts,
-                    CtKeyCode::Char('8') => app.view = AppView::Virtual,
+                    CtKeyCode::Char('m') => app.toggle_shortcuts(),
+                    CtKeyCode::Char('1') if app.shortcuts_enabled => app.view = AppView::Dashboard,
+                    CtKeyCode::Char('2') if app.shortcuts_enabled => app.view = AppView::PollingRate,
+                    CtKeyCode::Char('3') if app.shortcuts_enabled => app.view = AppView::HoldRelease,
+                    CtKeyCode::Char('4') if app.shortcuts_enabled => app.view = AppView::Stickiness,
+                    CtKeyCode::Char('5') if app.shortcuts_enabled => app.view = AppView::Rollover,
+                    CtKeyCode::Char('6') if app.shortcuts_enabled => app.view = AppView::Latency,
+                    CtKeyCode::Char('7') if app.shortcuts_enabled => app.view = AppView::Shortcuts,
+                    CtKeyCode::Char('8') if app.shortcuts_enabled => app.view = AppView::Virtual,
                     CtKeyCode::Char('v') => {
                         // Trigger virtual key test when on Virtual view
                         if app.view == AppView::Virtual {
