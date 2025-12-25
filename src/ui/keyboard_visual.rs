@@ -4,9 +4,20 @@ use crate::keyboard::{KeyCode, KeyboardState};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     widgets::Widget,
 };
+
+/// Modern color palette for keyboard
+mod palette {
+    use ratatui::style::Color;
+
+    pub const KEY_INACTIVE: Color = Color::Rgb(50, 50, 60);
+    pub const KEY_PRESSED: Color = Color::Rgb(100, 220, 140);
+    pub const KEY_RECENTLY_USED: Color = Color::Rgb(70, 70, 85);
+    pub const KEY_TEXT_LIGHT: Color = Color::Rgb(200, 200, 210);
+    pub const KEY_TEXT_DARK: Color = Color::Rgb(20, 20, 30);
+}
 
 /// Visual representation of a keyboard
 pub struct KeyboardVisual<'a> {
@@ -28,35 +39,33 @@ impl<'a> KeyboardVisual<'a> {
     }
 
     /// Get color for a key based on its state
-    fn key_color(&self, key_code: KeyCode) -> Color {
+    fn key_style(&self, key_code: KeyCode) -> (Color, Color, bool) {
         let pressed = self.keyboard_state.pressed_keys().contains(&key_code);
         let key_state = self.keyboard_state.get_key_state(key_code);
 
         if pressed {
-            Color::Green
+            (palette::KEY_PRESSED, palette::KEY_TEXT_DARK, true)
         } else if let Some(state) = key_state {
             if state.press_count > 0 {
-                Color::DarkGray
+                (palette::KEY_RECENTLY_USED, palette::KEY_TEXT_LIGHT, false)
             } else {
-                Color::Black
+                (palette::KEY_INACTIVE, palette::KEY_TEXT_LIGHT, false)
             }
         } else {
-            Color::Black
+            (palette::KEY_INACTIVE, palette::KEY_TEXT_LIGHT, false)
         }
     }
 
-    /// Render a single key
+    /// Render a single key with modern styling
     fn render_key(&self, buf: &mut Buffer, x: u16, y: u16, key: &str, key_code: KeyCode, width: u16) {
-        let bg_color = self.key_color(key_code);
-        let fg_color = if bg_color == Color::Green {
-            Color::Black
-        } else {
-            Color::White
-        };
+        let (bg_color, fg_color, is_pressed) = self.key_style(key_code);
 
-        let style = Style::default().fg(fg_color).bg(bg_color);
+        let mut style = Style::default().fg(fg_color).bg(bg_color);
+        if is_pressed {
+            style = style.add_modifier(Modifier::BOLD);
+        }
 
-        // Draw key border
+        // Draw key with centered label
         let key_str = format!("{:^width$}", key, width = width as usize);
         if y < buf.area.height && x + width <= buf.area.width {
             buf.set_string(x, y, &key_str, style);
@@ -66,9 +75,10 @@ impl<'a> KeyboardVisual<'a> {
 
 impl<'a> Widget for KeyboardVisual<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 40 || area.height < 6 {
-            // Too small, just show a message
-            buf.set_string(area.x, area.y, "Terminal too small", Style::default());
+        if area.width < 40 || area.height < 5 {
+            let msg = "⌨ Terminal too small for keyboard view";
+            let style = Style::default().fg(Color::Rgb(150, 150, 170));
+            buf.set_string(area.x, area.y, msg, style);
             return;
         }
 
@@ -90,7 +100,7 @@ impl<'a> Widget for KeyboardVisual<'a> {
             x += key_width + 1;
         }
         // Backspace (wider)
-        self.render_key(buf, x, start_y, "Bk", KeyCode(14), key_width + 2);
+        self.render_key(buf, x, start_y, "←", KeyCode(14), key_width + 2);
 
         // Row 2: QWERTY row
         let row2_keys = [
@@ -100,7 +110,7 @@ impl<'a> Widget for KeyboardVisual<'a> {
             ("\\", KeyCode(43)),
         ];
 
-        self.render_key(buf, start_x, start_y + 1, "Tab", KeyCode(15), key_width);
+        self.render_key(buf, start_x, start_y + 1, "⇥", KeyCode(15), key_width);
         x = start_x + key_width + 1;
         for (label, code) in &row2_keys {
             self.render_key(buf, x, start_y + 1, label, *code, key_width);
@@ -114,13 +124,13 @@ impl<'a> Widget for KeyboardVisual<'a> {
             ("L", KeyCode(38)), (";", KeyCode(39)), ("'", KeyCode(40)),
         ];
 
-        self.render_key(buf, start_x, start_y + 2, "Caps", KeyCode(58), key_width + 1);
+        self.render_key(buf, start_x, start_y + 2, "⇪", KeyCode(58), key_width + 1);
         x = start_x + key_width + 2;
         for (label, code) in &row3_keys {
             self.render_key(buf, x, start_y + 2, label, *code, key_width);
             x += key_width + 1;
         }
-        self.render_key(buf, x, start_y + 2, "Ret", KeyCode(28), key_width + 2);
+        self.render_key(buf, x, start_y + 2, "↵", KeyCode(28), key_width + 2);
 
         // Row 4: Shift row
         let row4_keys = [
@@ -129,23 +139,23 @@ impl<'a> Widget for KeyboardVisual<'a> {
             (".", KeyCode(52)), ("/", KeyCode(53)),
         ];
 
-        self.render_key(buf, start_x, start_y + 3, "Shift", KeyCode(42), key_width + 2);
+        self.render_key(buf, start_x, start_y + 3, "⇧", KeyCode(42), key_width + 2);
         x = start_x + key_width + 3;
         for (label, code) in &row4_keys {
             self.render_key(buf, x, start_y + 3, label, *code, key_width);
             x += key_width + 1;
         }
-        self.render_key(buf, x, start_y + 3, "Shift", KeyCode(54), key_width + 3);
+        self.render_key(buf, x, start_y + 3, "⇧", KeyCode(54), key_width + 3);
 
         // Row 5: Bottom row
         self.render_key(buf, start_x, start_y + 4, "Ctl", KeyCode(29), key_width);
-        self.render_key(buf, start_x + key_width + 1, start_y + 4, "Win", KeyCode(125), key_width);
+        self.render_key(buf, start_x + key_width + 1, start_y + 4, "⊞", KeyCode(125), key_width);
         self.render_key(buf, start_x + (key_width + 1) * 2, start_y + 4, "Alt", KeyCode(56), key_width);
 
         // Spacebar
         let space_start = start_x + (key_width + 1) * 3;
         let space_width = (key_width + 1) * 6;
-        self.render_key(buf, space_start, start_y + 4, "Space", KeyCode(57), space_width);
+        self.render_key(buf, space_start, start_y + 4, "━━━━━━", KeyCode(57), space_width);
 
         // Right side modifiers
         let right_start = space_start + space_width + 1;
@@ -155,10 +165,10 @@ impl<'a> Widget for KeyboardVisual<'a> {
         // Arrow keys (if space permits)
         if area.width > 70 {
             let arrow_x = right_start + (key_width + 1) * 3;
-            self.render_key(buf, arrow_x + key_width + 1, start_y + 3, "^", KeyCode(103), key_width);
-            self.render_key(buf, arrow_x, start_y + 4, "<", KeyCode(105), key_width);
-            self.render_key(buf, arrow_x + key_width + 1, start_y + 4, "v", KeyCode(108), key_width);
-            self.render_key(buf, arrow_x + (key_width + 1) * 2, start_y + 4, ">", KeyCode(106), key_width);
+            self.render_key(buf, arrow_x + key_width + 1, start_y + 3, "▲", KeyCode(103), key_width);
+            self.render_key(buf, arrow_x, start_y + 4, "◀", KeyCode(105), key_width);
+            self.render_key(buf, arrow_x + key_width + 1, start_y + 4, "▼", KeyCode(108), key_width);
+            self.render_key(buf, arrow_x + (key_width + 1) * 2, start_y + 4, "▶", KeyCode(106), key_width);
         }
     }
 }

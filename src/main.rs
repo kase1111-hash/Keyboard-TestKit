@@ -78,9 +78,9 @@ fn main() -> Result<()> {
 
             // Keyboard visual
             let kb_block = Block::default()
-                .title("Keyboard")
+                .title(" ⌨ Keyboard ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
+                .border_style(Style::default().fg(Color::Rgb(100, 100, 120)));
             let kb_inner = kb_block.inner(chunks[1]);
             frame.render_widget(kb_block, chunks[1]);
             let kb_visual = KeyboardVisual::new(&app.keyboard_state);
