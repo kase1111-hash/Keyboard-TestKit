@@ -3,8 +3,11 @@
 use crate::config::Config;
 use crate::keyboard::{KeyboardState, KeyEvent};
 use crate::tests::{
-    KeyboardTest, PollingRateTest, StickinessTest, RolloverTest, LatencyTest, TestResult,
+    KeyboardTest, PollingRateTest, StickinessTest, RolloverTest, LatencyTest,
+    HoldReleaseTest, ShortcutTest, VirtualKeyboardTest, TestResult,
 };
+use crate::report::SessionReport;
+use std::path::Path;
 use std::time::Instant;
 
 /// Current view/tab in the application
@@ -12,9 +15,12 @@ use std::time::Instant;
 pub enum AppView {
     Dashboard,
     PollingRate,
+    HoldRelease,
     Stickiness,
     Rollover,
     Latency,
+    Shortcuts,
+    Virtual,
     Help,
 }
 
@@ -22,10 +28,13 @@ impl AppView {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Dashboard => "Dashboard",
-            Self::PollingRate => "Polling Rate",
-            Self::Stickiness => "Stickiness",
-            Self::Rollover => "N-Key Rollover",
+            Self::PollingRate => "Polling",
+            Self::HoldRelease => "Bounce",
+            Self::Stickiness => "Sticky",
+            Self::Rollover => "NKRO",
             Self::Latency => "Latency",
+            Self::Shortcuts => "Shortcuts",
+            Self::Virtual => "Virtual",
             Self::Help => "Help",
         }
     }
@@ -34,9 +43,12 @@ impl AppView {
         &[
             Self::Dashboard,
             Self::PollingRate,
+            Self::HoldRelease,
             Self::Stickiness,
             Self::Rollover,
             Self::Latency,
+            Self::Shortcuts,
+            Self::Virtual,
             Self::Help,
         ]
     }
@@ -45,10 +57,13 @@ impl AppView {
         match self {
             Self::Dashboard => 0,
             Self::PollingRate => 1,
-            Self::Stickiness => 2,
-            Self::Rollover => 3,
-            Self::Latency => 4,
-            Self::Help => 5,
+            Self::HoldRelease => 2,
+            Self::Stickiness => 3,
+            Self::Rollover => 4,
+            Self::Latency => 5,
+            Self::Shortcuts => 6,
+            Self::Virtual => 7,
+            Self::Help => 8,
         }
     }
 
@@ -56,9 +71,12 @@ impl AppView {
         match index {
             0 => Self::Dashboard,
             1 => Self::PollingRate,
-            2 => Self::Stickiness,
-            3 => Self::Rollover,
-            4 => Self::Latency,
+            2 => Self::HoldRelease,
+            3 => Self::Stickiness,
+            4 => Self::Rollover,
+            5 => Self::Latency,
+            6 => Self::Shortcuts,
+            7 => Self::Virtual,
             _ => Self::Help,
         }
     }
@@ -84,12 +102,18 @@ pub struct App {
     pub keyboard_state: KeyboardState,
     /// Polling rate test
     pub polling_test: PollingRateTest,
+    /// Hold and release test
+    pub hold_release_test: HoldReleaseTest,
     /// Stickiness test
     pub stickiness_test: StickinessTest,
     /// Rollover test
     pub rollover_test: RolloverTest,
     /// Latency test
     pub latency_test: LatencyTest,
+    /// Shortcut detection test
+    pub shortcut_test: ShortcutTest,
+    /// Virtual keyboard detection test
+    pub virtual_test: VirtualKeyboardTest,
     /// Application start time
     pub start_time: Instant,
     /// Total events processed
@@ -108,9 +132,12 @@ impl App {
             config: config.clone(),
             keyboard_state: KeyboardState::new(),
             polling_test: PollingRateTest::new(config.polling.test_duration_secs),
+            hold_release_test: HoldReleaseTest::new(config.hold_release.bounce_window_ms),
             stickiness_test: StickinessTest::new(config.stickiness.stuck_threshold_ms),
             rollover_test: RolloverTest::new(),
             latency_test: LatencyTest::new(),
+            shortcut_test: ShortcutTest::new(),
+            virtual_test: VirtualKeyboardTest::new(),
             start_time: Instant::now(),
             total_events: 0,
             status_message: None,
@@ -129,9 +156,12 @@ impl App {
 
         // Process through all tests
         self.polling_test.process_event(event);
+        self.hold_release_test.process_event(event);
         self.stickiness_test.process_event(event);
         self.rollover_test.process_event(event);
         self.latency_test.process_event(event);
+        self.shortcut_test.process_event(event);
+        self.virtual_test.process_event(event);
 
         // Check for stuck keys periodically
         let stuck = self.stickiness_test.check_stuck_keys();
@@ -182,9 +212,12 @@ impl App {
     pub fn reset_all(&mut self) {
         self.keyboard_state.reset();
         self.polling_test.reset();
+        self.hold_release_test.reset();
         self.stickiness_test.reset();
         self.rollover_test.reset();
         self.latency_test.reset();
+        self.shortcut_test.reset();
+        self.virtual_test.reset();
         self.total_events = 0;
         self.set_status("All tests reset".to_string());
     }
@@ -195,6 +228,10 @@ impl App {
             AppView::PollingRate => {
                 self.polling_test.reset();
                 self.set_status("Polling rate test reset".to_string());
+            }
+            AppView::HoldRelease => {
+                self.hold_release_test.reset();
+                self.set_status("Hold/release test reset".to_string());
             }
             AppView::Stickiness => {
                 self.stickiness_test.reset();
@@ -207,6 +244,14 @@ impl App {
             AppView::Latency => {
                 self.latency_test.reset();
                 self.set_status("Latency test reset".to_string());
+            }
+            AppView::Shortcuts => {
+                self.shortcut_test.reset();
+                self.set_status("Shortcut test reset".to_string());
+            }
+            AppView::Virtual => {
+                self.virtual_test.reset();
+                self.set_status("Virtual detection test reset".to_string());
             }
             _ => {}
         }
@@ -231,9 +276,12 @@ impl App {
         match self.view {
             AppView::Dashboard => self.dashboard_results(),
             AppView::PollingRate => self.polling_test.get_results(),
+            AppView::HoldRelease => self.hold_release_test.get_results(),
             AppView::Stickiness => self.stickiness_test.get_results(),
             AppView::Rollover => self.rollover_test.get_results(),
             AppView::Latency => self.latency_test.get_results(),
+            AppView::Shortcuts => self.shortcut_test.get_results(),
+            AppView::Virtual => self.virtual_test.get_results(),
             AppView::Help => Vec::new(),
         }
     }
@@ -278,6 +326,30 @@ impl App {
         let mins = secs / 60;
         let secs = secs % 60;
         format!("{:02}:{:02}", mins, secs)
+    }
+
+    /// Generate a session report
+    pub fn generate_report(&self) -> SessionReport {
+        SessionReport::new(
+            self.start_time,
+            self.total_events,
+            &self.keyboard_state,
+            self.polling_test.get_results(),
+            self.hold_release_test.get_results(),
+            self.stickiness_test.get_results(),
+            self.rollover_test.get_results(),
+            self.latency_test.get_results(),
+        )
+    }
+
+    /// Export session report to JSON file
+    pub fn export_report(&mut self, filename: &str) -> Result<String, std::io::Error> {
+        let report = self.generate_report();
+        let path = Path::new(filename);
+        report.export_json(path)?;
+        let msg = format!("Exported to {}", filename);
+        self.set_status(msg.clone());
+        Ok(msg)
     }
 }
 

@@ -3,7 +3,7 @@
 use super::{KeyboardTest, TestResult, ResultStatus};
 use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Per-key latency statistics
 #[derive(Debug, Clone, Default)]
@@ -174,6 +174,25 @@ impl KeyboardTest for LatencyTest {
 
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
+
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Input latency = time from",
+            "keypress to PC detection",
+        ));
+        results.push(TestResult::info(
+            "Affected by: polling rate,",
+            "USB, debounce, drivers",
+        ));
+        results.push(TestResult::info(
+            "Look for: <10ms excellent,",
+            "<20ms good, >50ms poor",
+        ));
+        results.push(TestResult::info("", ""));
 
         results.push(TestResult::info(
             "Samples",

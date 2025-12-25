@@ -12,6 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
+    symbols::border,
     widgets::{Block, Borders},
     Terminal,
 };
@@ -78,9 +79,10 @@ fn main() -> Result<()> {
 
             // Keyboard visual
             let kb_block = Block::default()
-                .title("Keyboard")
+                .title(" ⌨ Keyboard ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Rgb(90, 90, 110)));
             let kb_inner = kb_block.inner(chunks[1]);
             frame.render_widget(kb_block, chunks[1]);
             let kb_visual = KeyboardVisual::new(&app.keyboard_state);
@@ -130,15 +132,37 @@ fn main() -> Result<()> {
                     }
                     CtKeyCode::Char('1') => app.view = AppView::Dashboard,
                     CtKeyCode::Char('2') => app.view = AppView::PollingRate,
-                    CtKeyCode::Char('3') => app.view = AppView::Stickiness,
-                    CtKeyCode::Char('4') => app.view = AppView::Rollover,
-                    CtKeyCode::Char('5') => app.view = AppView::Latency,
+                    CtKeyCode::Char('3') => app.view = AppView::HoldRelease,
+                    CtKeyCode::Char('4') => app.view = AppView::Stickiness,
+                    CtKeyCode::Char('5') => app.view = AppView::Rollover,
+                    CtKeyCode::Char('6') => app.view = AppView::Latency,
+                    CtKeyCode::Char('7') => app.view = AppView::Shortcuts,
+                    CtKeyCode::Char('8') => app.view = AppView::Virtual,
+                    CtKeyCode::Char('v') => {
+                        // Trigger virtual key test when on Virtual view
+                        if app.view == AppView::Virtual {
+                            app.virtual_test.request_virtual_test();
+                        }
+                    }
                     CtKeyCode::Char('?') => app.view = AppView::Help,
                     CtKeyCode::Char(' ') => app.toggle_pause(),
                     CtKeyCode::Char('r') => app.reset_current(),
                     CtKeyCode::Char('R') => app.reset_all(),
+                    CtKeyCode::Char('e') => {
+                        let filename = format!("keyboard_report_{}.json",
+                            chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+                        let _ = app.export_report(&filename);
+                    }
                     _ => {}
                 }
+            }
+        }
+
+        // Execute pending virtual key sends
+        if app.virtual_test.has_pending_send() {
+            match app.virtual_test.execute_virtual_send() {
+                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
+                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
             }
         }
 

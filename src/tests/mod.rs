@@ -4,11 +4,17 @@ mod polling;
 mod stickiness;
 mod rollover;
 mod latency;
+mod bounce;
+mod shortcuts;
+mod virtual_detect;
 
 pub use polling::PollingRateTest;
 pub use stickiness::StickinessTest;
 pub use rollover::RolloverTest;
 pub use latency::LatencyTest;
+pub use bounce::HoldReleaseTest;
+pub use shortcuts::ShortcutTest;
+pub use virtual_detect::VirtualKeyboardTest;
 
 use crate::keyboard::KeyEvent;
 use std::time::Instant;

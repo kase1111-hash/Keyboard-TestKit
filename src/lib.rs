@@ -7,5 +7,7 @@ pub mod keyboard;
 pub mod tests;
 pub mod ui;
 pub mod config;
+pub mod report;
 
 pub use config::Config;
+pub use report::SessionReport;

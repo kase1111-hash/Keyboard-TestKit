@@ -137,6 +137,25 @@ impl KeyboardTest for PollingRateTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Polling rate = how often",
+            "keyboard sends data to PC",
+        ));
+        results.push(TestResult::info(
+            "Higher Hz = lower latency",
+            "1000Hz=1ms, 125Hz=8ms delay",
+        ));
+        results.push(TestResult::info(
+            "Look for: 1000Hz gaming,",
+            "125Hz standard, low jitter",
+        ));
+        results.push(TestResult::info("", ""));
+
         results.push(TestResult::info(
             "Events Recorded",
             format!("{}", self.event_count),
