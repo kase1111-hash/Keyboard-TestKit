@@ -137,6 +137,12 @@ fn main() -> Result<()> {
                     CtKeyCode::Char('6') => app.view = AppView::Latency,
                     CtKeyCode::Char('7') => app.view = AppView::Shortcuts,
                     CtKeyCode::Char('8') => app.view = AppView::Virtual,
+                    CtKeyCode::Char('v') => {
+                        // Trigger virtual key test when on Virtual view
+                        if app.view == AppView::Virtual {
+                            app.virtual_test.request_virtual_test();
+                        }
+                    }
                     CtKeyCode::Char('?') => app.view = AppView::Help,
                     CtKeyCode::Char(' ') => app.toggle_pause(),
                     CtKeyCode::Char('r') => app.reset_current(),
@@ -148,6 +154,14 @@ fn main() -> Result<()> {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // Execute pending virtual key sends
+        if app.virtual_test.has_pending_send() {
+            match app.virtual_test.execute_virtual_send() {
+                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
+                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
             }
         }
 

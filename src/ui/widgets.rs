@@ -106,6 +106,7 @@ impl Widget for HelpPanel {
             " r                : Reset current test",
             " R                : Reset all tests",
             " e                : Export report to JSON",
+            " v                : Send virtual test keys (on Virtual view)",
             " ?                : Show this help",
             "",
             " TESTS",

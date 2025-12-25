@@ -25,6 +25,20 @@ serde_json = "1.0"
 anyhow = "1.0"
 thiserror = "2.0"
 
+# Cross-platform keyboard simulation (optional, requires system libs)
+[target.'cfg(target_os = "windows")'.dependencies]
+enigo = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+enigo = { version = "0.2", optional = true }
+
+[features]
+default = []
+virtual-send = ["enigo"]
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = true           # Link-time optimization for smaller binary
