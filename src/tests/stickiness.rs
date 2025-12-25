@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 /// Record of a potentially sticky key
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields stored for future detailed reporting
 struct StickyKeyRecord {
     key: KeyCode,
     press_time: Instant,

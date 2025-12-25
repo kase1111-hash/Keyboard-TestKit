@@ -4,7 +4,7 @@ use crate::keyboard::{KeyCode, KeyboardState};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     widgets::Widget,
 };
 
@@ -100,7 +100,6 @@ impl<'a> Widget for KeyboardVisual<'a> {
             ("\\", KeyCode(43)),
         ];
 
-        x = start_x + 2; // Offset for Tab key
         self.render_key(buf, start_x, start_y + 1, "Tab", KeyCode(15), key_width);
         x = start_x + key_width + 1;
         for (label, code) in &row2_keys {

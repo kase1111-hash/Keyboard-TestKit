@@ -3,7 +3,7 @@
 use super::{KeyboardTest, TestResult, ResultStatus};
 use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Per-key latency statistics
 #[derive(Debug, Clone, Default)]

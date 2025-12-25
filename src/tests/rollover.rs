@@ -25,6 +25,7 @@ pub struct RolloverTest {
 
 /// A detected ghosting event
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields stored for future detailed reporting
 struct GhostEvent {
     ghost_key: KeyCode,
     pressed_keys: Vec<KeyCode>,
@@ -78,15 +79,16 @@ impl RolloverTest {
         // For now, we track ghost detections when the user marks keys as unexpected
         // In practice, this would integrate with a visual UI where user can flag ghosts
 
-        if self.pressed_keys.len() >= 3 && self.expected_keys.len() > 0 {
-            if !self.expected_keys.contains(&new_key) {
-                self.ghost_detections.push(GhostEvent {
-                    ghost_key: new_key,
-                    pressed_keys: self.pressed_keys.iter().copied().collect(),
-                    timestamp,
-                });
-                return true;
-            }
+        if self.pressed_keys.len() >= 3
+            && !self.expected_keys.is_empty()
+            && !self.expected_keys.contains(&new_key)
+        {
+            self.ghost_detections.push(GhostEvent {
+                ghost_key: new_key,
+                pressed_keys: self.pressed_keys.iter().copied().collect(),
+                timestamp,
+            });
+            return true;
         }
 
         false

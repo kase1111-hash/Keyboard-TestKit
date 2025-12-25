@@ -1,6 +1,6 @@
 //! Hold down and release test with bounce detection
 
-use super::{KeyboardTest, TestResult, ResultStatus};
+use super::{KeyboardTest, TestResult};
 use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

@@ -25,7 +25,6 @@ use keyboard_testkit::{
     keyboard::{KeyboardListener, KeyEvent},
     ui::{App, AppState, AppView, KeyboardVisual, ResultsPanel, StatusBar, TabBar, HelpPanel},
 };
-use chrono;
 
 fn main() -> Result<()> {
     // Setup terminal
