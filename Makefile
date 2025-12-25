@@ -1,13 +1,16 @@
 # Keyboard TestKit - Build Automation
 # Cross-platform Makefile for building and packaging
 
-.PHONY: all build release debug test clean dist help install
+.PHONY: all build release debug test clean dist help install windows check-windows
 
 # Project configuration
 PROJECT := keyboard-testkit
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 BUILD_DIR := dist
 CARGO := cargo
+
+# Cross-compilation targets
+WINDOWS_TARGET := x86_64-pc-windows-gnu
 
 # Platform detection
 ifeq ($(OS),Windows_NT)
@@ -29,7 +32,9 @@ endif
 
 ARCH := $(shell uname -m)
 BINARY := target/release/$(PROJECT)$(EXE)
+WINDOWS_BINARY := target/$(WINDOWS_TARGET)/release/$(PROJECT).exe
 DIST_NAME := $(PROJECT)-$(VERSION)-$(PLATFORM)-$(ARCH)
+WINDOWS_DIST_NAME := $(PROJECT)-$(VERSION)-windows-x86_64
 
 # Default target
 all: release
@@ -53,6 +58,20 @@ release-full:
 	$(CARGO) build --release --features virtual-send
 	@echo "Done!"
 
+# Cross-compile for Windows (requires rustup target and mingw-w64)
+windows:
+	@echo "Cross-compiling for Windows..."
+	@rustup target add $(WINDOWS_TARGET) 2>/dev/null || true
+	$(CARGO) build --release --target $(WINDOWS_TARGET)
+	@echo "Done! Binary: $(WINDOWS_BINARY)"
+
+# Check Windows compilation (without linking)
+check-windows:
+	@echo "Checking Windows compilation..."
+	@rustup target add $(WINDOWS_TARGET) 2>/dev/null || true
+	$(CARGO) check --release --target $(WINDOWS_TARGET)
+	@echo "Windows check passed!"
+
 # Testing
 test:
 	@echo "Running tests..."
@@ -72,7 +91,7 @@ clean:
 	$(RM) $(BUILD_DIR) 2>/dev/null || true
 	@echo "Cleaned!"
 
-# Create distribution package
+# Create distribution package (native)
 dist: release
 	@echo "Creating distribution package..."
 	@$(MKDIR) $(BUILD_DIR)
@@ -87,6 +106,23 @@ ifeq ($(PLATFORM),macos)
 endif
 	@echo ""
 	@echo "Distribution package created:"
+	@ls -lh $(BUILD_DIR)/
+
+# Create Windows distribution package
+dist-windows: windows
+	@echo "Creating Windows distribution package..."
+	@$(MKDIR) $(BUILD_DIR)
+	@cp $(WINDOWS_BINARY) $(BUILD_DIR)/$(WINDOWS_DIST_NAME).exe
+	@x86_64-w64-mingw32-strip $(BUILD_DIR)/$(WINDOWS_DIST_NAME).exe 2>/dev/null || true
+	@cd $(BUILD_DIR) && zip -q $(WINDOWS_DIST_NAME).zip $(WINDOWS_DIST_NAME).exe 2>/dev/null || true
+	@echo ""
+	@echo "Windows distribution package created:"
+	@ls -lh $(BUILD_DIR)/$(WINDOWS_DIST_NAME)*
+
+# Build all platforms
+dist-all: dist dist-windows
+	@echo ""
+	@echo "All distribution packages created:"
 	@ls -lh $(BUILD_DIR)/
 
 # Install to system (Linux/macOS)
@@ -138,26 +174,34 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  release      Build optimized release binary (default)"
-	@echo "  debug        Build debug binary"
-	@echo "  release-full Build with all features (virtual-send)"
+	@echo "  release       Build optimized release binary (default)"
+	@echo "  debug         Build debug binary"
+	@echo "  release-full  Build with all features (virtual-send)"
+	@echo "  windows       Cross-compile for Windows (requires mingw-w64)"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test         Run all tests and clippy"
-	@echo "  check        Check code without building"
+	@echo "  test          Run all tests and clippy"
+	@echo "  check         Check code without building"
+	@echo "  check-windows Check Windows compilation (no linker needed)"
 	@echo ""
 	@echo "Distribution:"
-	@echo "  dist         Create distribution package"
-	@echo "  install      Install to /usr/local/bin"
-	@echo "  uninstall    Remove from /usr/local/bin"
+	@echo "  dist          Create native distribution package"
+	@echo "  dist-windows  Create Windows distribution package"
+	@echo "  dist-all      Create all distribution packages"
+	@echo "  install       Install to /usr/local/bin"
+	@echo "  uninstall     Remove from /usr/local/bin"
 	@echo ""
 	@echo "Utility:"
-	@echo "  clean        Remove build artifacts"
-	@echo "  run          Build debug and run"
-	@echo "  run-release  Build release and run"
-	@echo "  size         Show binary size info"
-	@echo "  doc          Generate documentation"
-	@echo "  fmt          Format source code"
+	@echo "  clean         Remove build artifacts"
+	@echo "  run           Build debug and run"
+	@echo "  run-release   Build release and run"
+	@echo "  size          Show binary size info"
+	@echo "  doc           Generate documentation"
+	@echo "  fmt           Format source code"
 	@echo ""
 	@echo "Project: $(PROJECT) v$(VERSION)"
 	@echo "Platform: $(PLATFORM)-$(ARCH)"
+	@echo ""
+	@echo "Note: Windows cross-compilation requires:"
+	@echo "  - rustup target add x86_64-pc-windows-gnu"
+	@echo "  - apt install mingw-w64 (for linking)"

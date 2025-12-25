@@ -20,6 +20,11 @@ VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 BUILD_DIR="dist"
 TARGET_DIR="target"
 
+# Cross-compilation targets
+WINDOWS_TARGET="x86_64-pc-windows-gnu"
+LINUX_TARGET="x86_64-unknown-linux-gnu"
+MACOS_TARGET="x86_64-apple-darwin"
+
 # Print styled messages
 info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC} $1"; }
@@ -79,32 +84,68 @@ clean() {
     fi
 }
 
-# Build release binary
+# Build release binary for a specific target
 build_release() {
     local features="$1"
-    local suffix=""
+    local target="$2"
 
     header "Building Release Binary"
 
-    if [ -n "$features" ]; then
-        info "Features: $features"
-        suffix="-$features"
-        cargo build --release --features "$features"
-    else
-        info "Features: default (minimal)"
-        cargo build --release
+    local build_cmd="cargo build --release"
+
+    if [ -n "$target" ]; then
+        info "Target: $target"
+        build_cmd="$build_cmd --target $target"
     fi
 
+    if [ -n "$features" ]; then
+        info "Features: $features"
+        build_cmd="$build_cmd --features $features"
+    else
+        info "Features: default (minimal)"
+    fi
+
+    eval "$build_cmd"
     success "Build complete"
+}
+
+# Build for Windows (cross-compilation)
+build_windows() {
+    local features="$1"
+
+    header "Building for Windows"
+
+    # Check if Windows target is installed
+    if ! rustup target list --installed | grep -q "$WINDOWS_TARGET"; then
+        info "Installing Windows target..."
+        rustup target add "$WINDOWS_TARGET"
+    fi
+    success "Windows target ready: $WINDOWS_TARGET"
+
+    # Check for MinGW linker
+    if ! command -v x86_64-w64-mingw32-gcc &> /dev/null; then
+        warn "MinGW not found. Install with: apt install mingw-w64"
+        warn "Attempting build anyway (may work with cargo's bundled linker)..."
+    fi
+
+    build_release "$features" "$WINDOWS_TARGET"
 }
 
 # Strip and optimize binary
 optimize_binary() {
+    local target="$1"
+
     header "Optimizing Binary"
 
-    local binary="${TARGET_DIR}/release/${PROJECT_NAME}"
+    local binary
+    if [ -n "$target" ]; then
+        binary="${TARGET_DIR}/${target}/release/${PROJECT_NAME}"
+    else
+        binary="${TARGET_DIR}/release/${PROJECT_NAME}"
+    fi
 
-    if [ "$OS" == "windows" ]; then
+    # Add .exe for Windows
+    if [[ "$target" == *"windows"* ]] || [ "$OS" == "windows" ]; then
         binary="${binary}.exe"
     fi
 
@@ -115,8 +156,14 @@ optimize_binary() {
     local size_before=$(du -h "$binary" | cut -f1)
     info "Size before optimization: $size_before"
 
-    # Strip debug symbols
-    if command -v strip &> /dev/null; then
+    # Strip debug symbols (use appropriate strip for target)
+    if [[ "$target" == *"windows"* ]]; then
+        if command -v x86_64-w64-mingw32-strip &> /dev/null; then
+            x86_64-w64-mingw32-strip "$binary" 2>/dev/null || warn "Strip failed"
+        else
+            warn "mingw-strip not found, skipping strip for Windows binary"
+        fi
+    elif command -v strip &> /dev/null; then
         strip "$binary" 2>/dev/null || warn "Strip failed (may already be stripped)"
     fi
 
@@ -127,7 +174,10 @@ optimize_binary() {
 # Package for distribution
 package() {
     local features="$1"
+    local target="$2"
     local suffix=""
+    local target_os="$OS"
+    local target_arch="$ARCH"
 
     header "Packaging for Distribution"
 
@@ -137,22 +187,50 @@ package() {
         suffix="-${features}"
     fi
 
-    local binary_name="${PROJECT_NAME}"
-    local src_binary="${TARGET_DIR}/release/${binary_name}"
-    local dest_name="${PROJECT_NAME}-${VERSION}-${PLATFORM}${suffix}"
+    # Determine platform from target
+    if [ -n "$target" ]; then
+        case "$target" in
+            *windows*) target_os="windows"; target_arch="x86_64" ;;
+            *linux*) target_os="linux"; target_arch="x86_64" ;;
+            *darwin*) target_os="macos"; target_arch="x86_64" ;;
+            *aarch64*) target_arch="aarch64" ;;
+        esac
+    fi
 
-    if [ "$OS" == "windows" ]; then
+    local binary_name="${PROJECT_NAME}"
+    local src_binary
+    local dest_name="${PROJECT_NAME}-${VERSION}-${target_os}-${target_arch}${suffix}"
+
+    if [ -n "$target" ]; then
+        src_binary="${TARGET_DIR}/${target}/release/${binary_name}"
+    else
+        src_binary="${TARGET_DIR}/release/${binary_name}"
+    fi
+
+    if [ "$target_os" == "windows" ]; then
         binary_name="${binary_name}.exe"
         src_binary="${src_binary}.exe"
         dest_name="${dest_name}.exe"
+    fi
+
+    if [ ! -f "$src_binary" ]; then
+        error "Binary not found: $src_binary"
     fi
 
     # Copy binary
     cp "$src_binary" "${BUILD_DIR}/${dest_name}"
     success "Created: ${BUILD_DIR}/${dest_name}"
 
-    # Create tarball (non-Windows)
-    if [ "$OS" != "windows" ]; then
+    # Create archive
+    if [ "$target_os" == "windows" ]; then
+        # Create zip for Windows
+        if command -v zip &> /dev/null; then
+            local zipfile="${dest_name%.exe}.zip"
+            (cd "$BUILD_DIR" && zip -q "$zipfile" "${dest_name}")
+            success "Created: ${BUILD_DIR}/${zipfile}"
+        fi
+    else
+        # Create tarball for Unix
         local tarball="${dest_name}.tar.gz"
         (cd "$BUILD_DIR" && tar -czf "$tarball" "$dest_name")
         success "Created: ${BUILD_DIR}/${tarball}"
@@ -174,23 +252,29 @@ run_tests() {
     cargo clippy --release -- -D warnings 2>/dev/null || warn "Clippy warnings present"
 }
 
-# Build all variants
+# Build all variants including cross-compilation
 build_all() {
     header "Building All Variants"
 
-    # Default build (minimal, portable)
-    info "Building minimal version..."
-    build_release ""
-    optimize_binary
-    package ""
+    # Native build (minimal, portable)
+    info "Building native version..."
+    build_release "" ""
+    optimize_binary ""
+    package "" ""
 
-    # With virtual-send feature
+    # Windows cross-compile
+    info "Building Windows version..."
+    build_windows ""
+    optimize_binary "$WINDOWS_TARGET"
+    package "" "$WINDOWS_TARGET"
+
+    # With virtual-send feature (Linux only, requires libxdo)
     if [ "$OS" == "linux" ]; then
         if pkg-config --exists xdo 2>/dev/null; then
             info "Building with virtual-send feature..."
-            build_release "virtual-send"
-            optimize_binary
-            package "virtual-send"
+            build_release "virtual-send" ""
+            optimize_binary ""
+            package "virtual-send" ""
         else
             warn "libxdo not found, skipping virtual-send build"
         fi
@@ -205,7 +289,8 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  build       Build release binary (default)"
-    echo "  all         Build all variants"
+    echo "  windows     Cross-compile for Windows"
+    echo "  all         Build all variants (native + Windows)"
     echo "  test        Run tests then build"
     echo "  clean       Clean build artifacts"
     echo "  clean-full  Clean everything including cargo cache"
@@ -215,12 +300,14 @@ usage() {
     echo "Options:"
     echo "  --features <list>   Comma-separated features to enable"
     echo "                      Available: virtual-send"
+    echo "  --target <triple>   Cross-compile target (e.g., x86_64-pc-windows-gnu)"
     echo ""
     echo "Examples:"
-    echo "  $0 build"
-    echo "  $0 build --features virtual-send"
-    echo "  $0 all"
-    echo "  $0 test"
+    echo "  $0 build                           # Build for current platform"
+    echo "  $0 windows                         # Cross-compile for Windows"
+    echo "  $0 build --features virtual-send   # Build with virtual key sending"
+    echo "  $0 all                             # Build all platforms"
+    echo "  $0 package --target x86_64-pc-windows-gnu"
     echo ""
 }
 
@@ -249,6 +336,7 @@ summary() {
 main() {
     local command="${1:-build}"
     local features=""
+    local target=""
 
     # Parse arguments
     shift || true
@@ -256,6 +344,10 @@ main() {
         case "$1" in
             --features)
                 features="$2"
+                shift 2
+                ;;
+            --target)
+                target="$2"
                 shift 2
                 ;;
             *)
@@ -270,8 +362,15 @@ main() {
     case "$command" in
         build)
             check_deps
-            build_release "$features"
-            optimize_binary
+            build_release "$features" "$target"
+            optimize_binary "$target"
+            summary
+            ;;
+        windows)
+            check_deps
+            build_windows "$features"
+            optimize_binary "$WINDOWS_TARGET"
+            package "$features" "$WINDOWS_TARGET"
             summary
             ;;
         all)
@@ -283,8 +382,8 @@ main() {
         test)
             check_deps
             run_tests
-            build_release "$features"
-            optimize_binary
+            build_release "$features" "$target"
+            optimize_binary "$target"
             summary
             ;;
         clean)
@@ -297,10 +396,9 @@ main() {
             ;;
         package)
             check_deps
-            clean
-            build_release "$features"
-            optimize_binary
-            package "$features"
+            build_release "$features" "$target"
+            optimize_binary "$target"
+            package "$features" "$target"
             summary
             ;;
         help|--help|-h)
