@@ -12,6 +12,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
+    symbols::border,
     widgets::{Block, Borders},
     Terminal,
 };
@@ -80,7 +81,8 @@ fn main() -> Result<()> {
             let kb_block = Block::default()
                 .title(" ⌨ Keyboard ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(100, 100, 120)));
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(Color::Rgb(90, 90, 110)));
             let kb_inner = kb_block.inner(chunks[1]);
             frame.render_widget(kb_block, chunks[1]);
             let kb_visual = KeyboardVisual::new(&app.keyboard_state);
