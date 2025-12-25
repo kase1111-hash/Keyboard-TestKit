@@ -97,7 +97,7 @@ impl Widget for HelpPanel {
             " NAVIGATION",
             " -----------",
             " Tab / Shift+Tab  : Switch between test views",
-            " 1-6              : Jump to specific view",
+            " 1-7              : Jump to specific view",
             " q / Esc          : Quit application",
             "",
             " CONTROLS",
@@ -116,6 +116,7 @@ impl Widget for HelpPanel {
             " 4. Sticky        : Detect stuck/sticky keys",
             " 5. NKRO          : Test N-key rollover & ghosting",
             " 6. Latency       : Measure per-key input latency",
+            " 7. Shortcuts     : Detect shortcuts & conflicts",
             "",
             " Press any key to start testing!",
         ];

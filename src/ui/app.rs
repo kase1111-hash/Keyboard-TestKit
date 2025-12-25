@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::keyboard::{KeyboardState, KeyEvent};
 use crate::tests::{
     KeyboardTest, PollingRateTest, StickinessTest, RolloverTest, LatencyTest,
-    HoldReleaseTest, TestResult,
+    HoldReleaseTest, ShortcutTest, TestResult,
 };
 use crate::report::SessionReport;
 use std::path::Path;
@@ -19,6 +19,7 @@ pub enum AppView {
     Stickiness,
     Rollover,
     Latency,
+    Shortcuts,
     Help,
 }
 
@@ -27,10 +28,11 @@ impl AppView {
         match self {
             Self::Dashboard => "Dashboard",
             Self::PollingRate => "Polling",
-            Self::HoldRelease => "Hold/Bounce",
+            Self::HoldRelease => "Bounce",
             Self::Stickiness => "Sticky",
             Self::Rollover => "NKRO",
             Self::Latency => "Latency",
+            Self::Shortcuts => "Shortcuts",
             Self::Help => "Help",
         }
     }
@@ -43,6 +45,7 @@ impl AppView {
             Self::Stickiness,
             Self::Rollover,
             Self::Latency,
+            Self::Shortcuts,
             Self::Help,
         ]
     }
@@ -55,7 +58,8 @@ impl AppView {
             Self::Stickiness => 3,
             Self::Rollover => 4,
             Self::Latency => 5,
-            Self::Help => 6,
+            Self::Shortcuts => 6,
+            Self::Help => 7,
         }
     }
 
@@ -67,6 +71,7 @@ impl AppView {
             3 => Self::Stickiness,
             4 => Self::Rollover,
             5 => Self::Latency,
+            6 => Self::Shortcuts,
             _ => Self::Help,
         }
     }
@@ -100,6 +105,8 @@ pub struct App {
     pub rollover_test: RolloverTest,
     /// Latency test
     pub latency_test: LatencyTest,
+    /// Shortcut detection test
+    pub shortcut_test: ShortcutTest,
     /// Application start time
     pub start_time: Instant,
     /// Total events processed
@@ -122,6 +129,7 @@ impl App {
             stickiness_test: StickinessTest::new(config.stickiness.stuck_threshold_ms),
             rollover_test: RolloverTest::new(),
             latency_test: LatencyTest::new(),
+            shortcut_test: ShortcutTest::new(),
             start_time: Instant::now(),
             total_events: 0,
             status_message: None,
@@ -144,6 +152,7 @@ impl App {
         self.stickiness_test.process_event(event);
         self.rollover_test.process_event(event);
         self.latency_test.process_event(event);
+        self.shortcut_test.process_event(event);
 
         // Check for stuck keys periodically
         let stuck = self.stickiness_test.check_stuck_keys();
@@ -198,6 +207,7 @@ impl App {
         self.stickiness_test.reset();
         self.rollover_test.reset();
         self.latency_test.reset();
+        self.shortcut_test.reset();
         self.total_events = 0;
         self.set_status("All tests reset".to_string());
     }
@@ -224,6 +234,10 @@ impl App {
             AppView::Latency => {
                 self.latency_test.reset();
                 self.set_status("Latency test reset".to_string());
+            }
+            AppView::Shortcuts => {
+                self.shortcut_test.reset();
+                self.set_status("Shortcut test reset".to_string());
             }
             _ => {}
         }
@@ -252,6 +266,7 @@ impl App {
             AppView::Stickiness => self.stickiness_test.get_results(),
             AppView::Rollover => self.rollover_test.get_results(),
             AppView::Latency => self.latency_test.get_results(),
+            AppView::Shortcuts => self.shortcut_test.get_results(),
             AppView::Help => Vec::new(),
         }
     }
