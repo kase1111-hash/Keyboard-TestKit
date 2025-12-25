@@ -221,6 +221,25 @@ impl KeyboardTest for HoldReleaseTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Tests key hold/release and",
+            "detects switch bounce",
+        ));
+        results.push(TestResult::info(
+            "Bounce = false triggers from",
+            "switch contact vibration",
+        ));
+        results.push(TestResult::info(
+            "Look for: 0 bounces, stable",
+            "hold times, clean releases",
+        ));
+        results.push(TestResult::info("", ""));
+
         results.push(TestResult::info(
             "Total Presses",
             format!("{}", self.total_presses),

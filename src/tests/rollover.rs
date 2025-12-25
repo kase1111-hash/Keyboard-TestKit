@@ -151,6 +151,25 @@ impl KeyboardTest for RolloverTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "N-Key Rollover = max keys",
+            "pressed simultaneously",
+        ));
+        results.push(TestResult::info(
+            "Ghosting = false key press",
+            "from matrix limitations",
+        ));
+        results.push(TestResult::info(
+            "Look for: 6KRO+ gaming,",
+            "NKRO for pro, no ghosts",
+        ));
+        results.push(TestResult::info("", ""));
+
         // Current state
         results.push(TestResult::info(
             "Currently Pressed",

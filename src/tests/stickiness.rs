@@ -126,6 +126,25 @@ impl KeyboardTest for StickinessTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Detects keys that stay",
+            "'pressed' after release",
+        ));
+        results.push(TestResult::info(
+            "Causes: debris, worn switch",
+            "or driver/software issue",
+        ));
+        results.push(TestResult::info(
+            "Look for: no stuck keys,",
+            "clean release behavior",
+        ));
+        results.push(TestResult::info("", ""));
+
         results.push(TestResult::info(
             "Keys Tested",
             format!("{}", self.keys_tested),

@@ -574,6 +574,25 @@ impl KeyboardTest for VirtualKeyboardTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Detects virtual/automated",
+            "input vs physical keys",
+        ));
+        results.push(TestResult::info(
+            "Diagnoses hardware vs",
+            "software keyboard issues",
+        ));
+        results.push(TestResult::info(
+            "Look for: 'Physical' input,",
+            "low suspicious %, no anomalies",
+        ));
+        results.push(TestResult::info("", ""));
+
         // Diagnostic section
         results.push(TestResult::info("=== DIAGNOSTIC TEST ===", ""));
         results.push(TestResult::new(

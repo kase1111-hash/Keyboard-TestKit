@@ -222,6 +222,25 @@ impl KeyboardTest for ShortcutTest {
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
+        // Tooltip: Explain what this test measures
+        results.push(TestResult::info(
+            "--- What This Measures ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "Detects modifier combos",
+            "(Ctrl/Alt/Shift + keys)",
+        ));
+        results.push(TestResult::info(
+            "Flags shortcuts that may",
+            "conflict with apps/system",
+        ));
+        results.push(TestResult::info(
+            "Look for: working combos,",
+            "no unexpected conflicts",
+        ));
+        results.push(TestResult::info("", ""));
+
         // Current modifier state
         let mod_status = if self.modifiers.any_held() {
             self.modifiers.to_prefix().trim_end_matches('+').to_string()
