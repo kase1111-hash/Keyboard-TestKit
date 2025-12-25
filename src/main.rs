@@ -1,0 +1,165 @@
+//! Keyboard TestKit - Portable keyboard testing utility
+//!
+//! A single-executable keyboard diagnostic tool for USB portability.
+
+use anyhow::Result;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders},
+    Terminal,
+};
+use std::{
+    io::stdout,
+    sync::mpsc,
+};
+
+use keyboard_testkit::{
+    config::Config,
+    keyboard::{KeyboardListener, KeyEvent},
+    ui::{App, AppState, AppView, KeyboardVisual, ResultsPanel, StatusBar, TabBar, HelpPanel},
+};
+
+fn main() -> Result<()> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create application
+    let config = Config::default();
+    let mut app = App::new(config.clone());
+
+    // Create keyboard event channel
+    let (event_tx, event_rx) = mpsc::channel::<KeyEvent>();
+
+    // Create keyboard listener
+    let mut listener = KeyboardListener::new(event_tx);
+
+    // Main loop
+    let tick_rate = config.refresh_interval();
+
+    loop {
+        // Poll keyboard state
+        listener.poll();
+
+        // Process keyboard events
+        while let Ok(key_event) = event_rx.try_recv() {
+            app.process_event(&key_event);
+        }
+
+        // Draw UI
+        terminal.draw(|frame| {
+            let size = frame.area();
+
+            // Create layout
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),  // Tab bar
+                    Constraint::Length(7),  // Keyboard visual
+                    Constraint::Min(10),    // Main content
+                    Constraint::Length(1),  // Status bar
+                ])
+                .split(size);
+
+            // Tab bar
+            let tab_names: Vec<&str> = AppView::all().iter().map(|v| v.name()).collect();
+            let tab_bar = TabBar::new(&tab_names, app.view.index());
+            frame.render_widget(tab_bar, chunks[0]);
+
+            // Keyboard visual
+            let kb_block = Block::default()
+                .title("Keyboard")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+            let kb_inner = kb_block.inner(chunks[1]);
+            frame.render_widget(kb_block, chunks[1]);
+            let kb_visual = KeyboardVisual::new(&app.keyboard_state);
+            frame.render_widget(kb_visual, kb_inner);
+
+            // Main content area
+            match app.view {
+                AppView::Help => {
+                    frame.render_widget(HelpPanel, chunks[2]);
+                }
+                _ => {
+                    let results = app.current_results();
+                    let panel = ResultsPanel::new(&results, app.view.name());
+                    frame.render_widget(panel, chunks[2]);
+                }
+            }
+
+            // Status bar
+            let state_str = match app.state {
+                AppState::Running => "RUNNING",
+                AppState::Paused => "PAUSED",
+                AppState::Quitting => "QUITTING",
+            };
+            let elapsed = app.elapsed_formatted();
+            let status = StatusBar::new(
+                state_str,
+                app.view.name(),
+                &elapsed,
+                app.total_events,
+            )
+            .message(app.get_status());
+            frame.render_widget(status, chunks[3]);
+        })?;
+
+        // Handle terminal events (for navigation/control)
+        if event::poll(tick_rate)? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    CtKeyCode::Char('q') | CtKeyCode::Esc => {
+                        app.quit();
+                    }
+                    CtKeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.prev_view();
+                    }
+                    CtKeyCode::Tab => {
+                        app.next_view();
+                    }
+                    CtKeyCode::Char('1') => app.view = AppView::Dashboard,
+                    CtKeyCode::Char('2') => app.view = AppView::PollingRate,
+                    CtKeyCode::Char('3') => app.view = AppView::Stickiness,
+                    CtKeyCode::Char('4') => app.view = AppView::Rollover,
+                    CtKeyCode::Char('5') => app.view = AppView::Latency,
+                    CtKeyCode::Char('?') => app.view = AppView::Help,
+                    CtKeyCode::Char(' ') => app.toggle_pause(),
+                    CtKeyCode::Char('r') => app.reset_current(),
+                    CtKeyCode::Char('R') => app.reset_all(),
+                    _ => {}
+                }
+            }
+        }
+
+        // Check if we should quit
+        if app.state == AppState::Quitting {
+            break;
+        }
+    }
+
+    // Cleanup terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    println!("\nKeyboard TestKit session complete.");
+    println!("Total events processed: {}", app.total_events);
+    println!("Session duration: {}", app.elapsed_formatted());
+
+    Ok(())
+}
