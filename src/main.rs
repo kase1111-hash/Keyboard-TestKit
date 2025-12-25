@@ -136,6 +136,7 @@ fn main() -> Result<()> {
                     CtKeyCode::Char('5') => app.view = AppView::Rollover,
                     CtKeyCode::Char('6') => app.view = AppView::Latency,
                     CtKeyCode::Char('7') => app.view = AppView::Shortcuts,
+                    CtKeyCode::Char('8') => app.view = AppView::Virtual,
                     CtKeyCode::Char('?') => app.view = AppView::Help,
                     CtKeyCode::Char(' ') => app.toggle_pause(),
                     CtKeyCode::Char('r') => app.reset_current(),
