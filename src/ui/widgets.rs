@@ -126,6 +126,27 @@ impl Widget for HelpPanel {
         let inner = block.inner(area);
         block.render(area, buf);
 
+        // ASCII art logo
+        let logo_lines = [
+            "  ┌─────────────────────────────────────┐",
+            "  │  ⌨  KEYBOARD TESTKIT  v0.1.0       │",
+            "  │  Portable Keyboard Diagnostic Tool  │",
+            "  └─────────────────────────────────────┘",
+        ];
+
+        let mut y_offset = 0;
+        for line in &logo_lines {
+            if y_offset < inner.height {
+                buf.set_string(
+                    inner.x,
+                    inner.y + y_offset,
+                    line,
+                    Style::default().fg(palette::ACCENT_CYAN).add_modifier(Modifier::BOLD),
+                );
+                y_offset += 1;
+            }
+        }
+
         let help_sections = vec![
             ("", ""),
             ("  NAVIGATION", "header"),
@@ -157,8 +178,10 @@ impl Widget for HelpPanel {
             ("  Press any key to begin testing", "hint"),
         ];
 
+        // Render help sections below the logo
         for (i, (left, right)) in help_sections.iter().enumerate() {
-            if i as u16 >= inner.height {
+            let y_pos = y_offset + i as u16;
+            if y_pos >= inner.height {
                 break;
             }
 
@@ -197,7 +220,7 @@ impl Widget for HelpPanel {
                 ])
             };
 
-            buf.set_line(inner.x, inner.y + i as u16, &line, inner.width);
+            buf.set_line(inner.x, inner.y + y_pos, &line, inner.width);
         }
     }
 }
