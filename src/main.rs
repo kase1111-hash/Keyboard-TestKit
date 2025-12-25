@@ -25,6 +25,7 @@ use keyboard_testkit::{
     keyboard::{KeyboardListener, KeyEvent},
     ui::{App, AppState, AppView, KeyboardVisual, ResultsPanel, StatusBar, TabBar, HelpPanel},
 };
+use chrono;
 
 fn main() -> Result<()> {
     // Setup terminal
@@ -130,13 +131,19 @@ fn main() -> Result<()> {
                     }
                     CtKeyCode::Char('1') => app.view = AppView::Dashboard,
                     CtKeyCode::Char('2') => app.view = AppView::PollingRate,
-                    CtKeyCode::Char('3') => app.view = AppView::Stickiness,
-                    CtKeyCode::Char('4') => app.view = AppView::Rollover,
-                    CtKeyCode::Char('5') => app.view = AppView::Latency,
+                    CtKeyCode::Char('3') => app.view = AppView::HoldRelease,
+                    CtKeyCode::Char('4') => app.view = AppView::Stickiness,
+                    CtKeyCode::Char('5') => app.view = AppView::Rollover,
+                    CtKeyCode::Char('6') => app.view = AppView::Latency,
                     CtKeyCode::Char('?') => app.view = AppView::Help,
                     CtKeyCode::Char(' ') => app.toggle_pause(),
                     CtKeyCode::Char('r') => app.reset_current(),
                     CtKeyCode::Char('R') => app.reset_all(),
+                    CtKeyCode::Char('e') => {
+                        let filename = format!("keyboard_report_{}.json",
+                            chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+                        let _ = app.export_report(&filename);
+                    }
                     _ => {}
                 }
             }

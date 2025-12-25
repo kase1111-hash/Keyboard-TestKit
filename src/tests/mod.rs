@@ -4,11 +4,13 @@ mod polling;
 mod stickiness;
 mod rollover;
 mod latency;
+mod bounce;
 
 pub use polling::PollingRateTest;
 pub use stickiness::StickinessTest;
 pub use rollover::RolloverTest;
 pub use latency::LatencyTest;
+pub use bounce::HoldReleaseTest;
 
 use crate::keyboard::KeyEvent;
 use std::time::Instant;
