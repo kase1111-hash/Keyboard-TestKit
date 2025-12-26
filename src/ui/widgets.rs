@@ -115,7 +115,7 @@ impl Widget for HelpPanel {
         }
 
         let sections = [
-            ("NAV", &[("Tab", "Switch view"), ("1-8", "Jump to view"), ("q", "Quit")][..]),
+            ("NAV", &[("Tab", "Switch view"), ("1-8", "Jump to view"), ("m", "Toggle shortcuts"), ("q", "Quit")][..]),
             ("CTL", &[("Space", "Pause"), ("r/R", "Reset"), ("e", "Export"), ("?", "Help")][..]),
             ("TESTS", &[
                 ("1", "Dashboard"), ("2", "Polling"), ("3", "Bounce"), ("4", "Sticky"),
