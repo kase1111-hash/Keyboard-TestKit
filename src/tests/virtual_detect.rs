@@ -40,7 +40,7 @@ impl InputClassification {
         }
     }
 
-    pub fn to_status(&self) -> ResultStatus {
+    pub fn to_status(self) -> ResultStatus {
         match self {
             Self::Physical | Self::LikelyPhysical => ResultStatus::Ok,
             Self::Uncertain => ResultStatus::Info,
@@ -83,7 +83,7 @@ impl DiagnosticResult {
         }
     }
 
-    pub fn to_status(&self) -> ResultStatus {
+    pub fn to_status(self) -> ResultStatus {
         match self {
             Self::NotTested | Self::NotAvailable => ResultStatus::Info,
             Self::KeyboardOk => ResultStatus::Ok,
