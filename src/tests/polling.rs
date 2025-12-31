@@ -216,3 +216,168 @@ impl KeyboardTest for PollingRateTest {
         self.max_interval_us = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard::KeyCode;
+
+    fn make_press_event(timestamp: Instant, delta_us: u64) -> KeyEvent {
+        KeyEvent {
+            key: KeyCode(30),
+            event_type: KeyEventType::Press,
+            timestamp,
+            delta_us,
+        }
+    }
+
+    fn make_release_event(timestamp: Instant) -> KeyEvent {
+        KeyEvent {
+            key: KeyCode(30),
+            event_type: KeyEventType::Release,
+            timestamp,
+            delta_us: 0,
+        }
+    }
+
+    #[test]
+    fn new_test_has_no_data() {
+        let test = PollingRateTest::new(10);
+        assert!(test.avg_rate_hz().is_none());
+        assert!(test.min_rate_hz().is_none());
+        assert!(test.max_rate_hz().is_none());
+        assert!(test.jitter_us().is_none());
+        assert_eq!(test.progress(), 0.0);
+    }
+
+    #[test]
+    fn avg_rate_hz_1000hz() {
+        let mut test = PollingRateTest::new(10);
+        // Manually set intervals of 1000us each = 1000 Hz
+        test.intervals_us = vec![1000, 1000, 1000, 1000, 1000];
+
+        let rate = test.avg_rate_hz().unwrap();
+        assert!((rate - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn avg_rate_hz_125hz() {
+        let mut test = PollingRateTest::new(10);
+        // 8000us intervals = 125 Hz
+        test.intervals_us = vec![8000, 8000, 8000, 8000];
+
+        let rate = test.avg_rate_hz().unwrap();
+        assert!((rate - 125.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn min_max_rate_calculation() {
+        let mut test = PollingRateTest::new(10);
+        test.min_interval_us = Some(500);  // 2000 Hz
+        test.max_interval_us = Some(2000); // 500 Hz
+
+        let max_rate = test.max_rate_hz().unwrap();
+        assert!((max_rate - 2000.0).abs() < 0.01);
+
+        let min_rate = test.min_rate_hz().unwrap();
+        assert!((min_rate - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn jitter_calculation_uniform() {
+        let mut test = PollingRateTest::new(10);
+        // All same intervals = 0 jitter
+        test.intervals_us = vec![1000, 1000, 1000, 1000, 1000];
+
+        let jitter = test.jitter_us().unwrap();
+        assert!(jitter.abs() < 0.01);
+    }
+
+    #[test]
+    fn jitter_calculation_varied() {
+        let mut test = PollingRateTest::new(10);
+        // Varied intervals should have non-zero jitter
+        test.intervals_us = vec![500, 1500, 500, 1500, 500, 1500];
+
+        let jitter = test.jitter_us().unwrap();
+        assert!(jitter > 0.0);
+        // Standard deviation of [500, 1500, ...] with mean 1000 is 500
+        assert!((jitter - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn jitter_requires_two_samples() {
+        let mut test = PollingRateTest::new(10);
+        test.intervals_us = vec![1000];
+        assert!(test.jitter_us().is_none());
+    }
+
+    #[test]
+    fn process_event_ignores_release() {
+        let mut test = PollingRateTest::new(10);
+        let now = Instant::now();
+
+        test.process_event(&make_release_event(now));
+
+        assert_eq!(test.event_count, 0);
+        assert!(test.start_time.is_none());
+    }
+
+    #[test]
+    fn process_event_starts_test() {
+        let mut test = PollingRateTest::new(10);
+        let now = Instant::now();
+
+        test.process_event(&make_press_event(now, 0));
+
+        assert!(test.start_time.is_some());
+        assert_eq!(test.event_count, 1);
+    }
+
+    #[test]
+    fn process_event_filters_large_intervals() {
+        let mut test = PollingRateTest::new(10);
+        let now = Instant::now();
+
+        // First event
+        test.process_event(&make_press_event(now, 0));
+
+        // Simulate a long pause (200ms = 200000us) - this should be filtered
+        let later = now + Duration::from_millis(200);
+        test.process_event(&make_press_event(later, 0));
+
+        // The large interval should not be recorded
+        assert!(test.intervals_us.is_empty());
+    }
+
+    #[test]
+    fn reset_clears_all() {
+        let mut test = PollingRateTest::new(10);
+        test.start_time = Some(Instant::now());
+        test.intervals_us = vec![1000, 2000];
+        test.event_count = 5;
+        test.min_interval_us = Some(500);
+        test.max_interval_us = Some(2000);
+
+        test.reset();
+
+        assert!(test.start_time.is_none());
+        assert!(test.intervals_us.is_empty());
+        assert_eq!(test.event_count, 0);
+        assert!(test.min_interval_us.is_none());
+        assert!(test.max_interval_us.is_none());
+    }
+
+    #[test]
+    fn is_complete_before_start() {
+        let test = PollingRateTest::new(10);
+        assert!(!test.is_complete());
+    }
+
+    #[test]
+    fn test_name_and_description() {
+        let test = PollingRateTest::new(10);
+        assert_eq!(test.name(), "Polling Rate Test");
+        assert!(!test.description().is_empty());
+    }
+}
