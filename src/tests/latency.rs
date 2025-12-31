@@ -2,6 +2,7 @@
 
 use super::{KeyboardTest, TestResult, ResultStatus};
 use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
+use crate::utils::MinMaxExt;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -16,8 +17,8 @@ struct KeyLatencyStats {
 impl KeyLatencyStats {
     fn add_sample(&mut self, latency_us: u64) {
         self.samples.push(latency_us);
-        self.min_us = Some(self.min_us.map(|m| m.min(latency_us)).unwrap_or(latency_us));
-        self.max_us = Some(self.max_us.map(|m| m.max(latency_us)).unwrap_or(latency_us));
+        self.min_us.update_min(latency_us);
+        self.max_us.update_max(latency_us);
     }
 
     fn avg_us(&self) -> Option<f64> {
@@ -150,12 +151,8 @@ impl KeyboardTest for LatencyTest {
         // Record global sample
         if latency_us < 1_000_000 { // Ignore >1s gaps
             self.global_samples.push(latency_us);
-            self.global_min_us = Some(
-                self.global_min_us.map(|m| m.min(latency_us)).unwrap_or(latency_us)
-            );
-            self.global_max_us = Some(
-                self.global_max_us.map(|m| m.max(latency_us)).unwrap_or(latency_us)
-            );
+            self.global_min_us.update_min(latency_us);
+            self.global_max_us.update_max(latency_us);
 
             // Record per-key sample
             self.key_stats
@@ -276,24 +273,7 @@ impl KeyboardTest for LatencyTest {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_press_event(key: KeyCode, delta_us: u64) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Press,
-            timestamp: Instant::now(),
-            delta_us,
-        }
-    }
-
-    fn make_release_event(key: KeyCode) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Release,
-            timestamp: Instant::now(),
-            delta_us: 0,
-        }
-    }
+    use crate::tests::test_helpers::{make_press, release};
 
     #[test]
     fn new_test_initial_state() {
@@ -384,7 +364,7 @@ mod tests {
     #[test]
     fn process_event_ignores_release() {
         let mut test = LatencyTest::new();
-        test.process_event(&make_release_event(KeyCode(30)));
+        test.process_event(&release(KeyCode(30)));
 
         assert_eq!(test.total_events, 0);
         assert!(test.global_samples.is_empty());
@@ -393,7 +373,7 @@ mod tests {
     #[test]
     fn process_event_records_latency() {
         let mut test = LatencyTest::new();
-        test.process_event(&make_press_event(KeyCode(30), 5000)); // 5ms
+        test.process_event(&make_press(KeyCode(30), 5000)); // 5ms
 
         assert_eq!(test.total_events, 1);
         assert_eq!(test.global_samples.len(), 1);
@@ -406,7 +386,7 @@ mod tests {
     fn process_event_filters_large_latency() {
         let mut test = LatencyTest::new();
         // >1 second gaps should be filtered
-        test.process_event(&make_press_event(KeyCode(30), 2_000_000));
+        test.process_event(&make_press(KeyCode(30), 2_000_000));
 
         assert_eq!(test.total_events, 1);
         assert!(test.global_samples.is_empty());
@@ -415,9 +395,9 @@ mod tests {
     #[test]
     fn min_max_tracking() {
         let mut test = LatencyTest::new();
-        test.process_event(&make_press_event(KeyCode(30), 5000));
-        test.process_event(&make_press_event(KeyCode(31), 2000));
-        test.process_event(&make_press_event(KeyCode(32), 8000));
+        test.process_event(&make_press(KeyCode(30), 5000));
+        test.process_event(&make_press(KeyCode(31), 2000));
+        test.process_event(&make_press(KeyCode(32), 8000));
 
         assert_eq!(test.global_min_us, Some(2000));
         assert_eq!(test.global_max_us, Some(8000));
@@ -427,9 +407,9 @@ mod tests {
     fn fastest_slowest_key() {
         let mut test = LatencyTest::new();
         // Key 30: 2ms, Key 31: 5ms, Key 32: 3ms
-        test.process_event(&make_press_event(KeyCode(30), 2000));
-        test.process_event(&make_press_event(KeyCode(31), 5000));
-        test.process_event(&make_press_event(KeyCode(32), 3000));
+        test.process_event(&make_press(KeyCode(30), 2000));
+        test.process_event(&make_press(KeyCode(31), 5000));
+        test.process_event(&make_press(KeyCode(32), 3000));
 
         let (fastest_key, fastest_latency) = test.fastest_key().unwrap();
         assert_eq!(fastest_key, KeyCode(30));
@@ -443,8 +423,8 @@ mod tests {
     #[test]
     fn reset_clears_all() {
         let mut test = LatencyTest::new();
-        test.process_event(&make_press_event(KeyCode(30), 5000));
-        test.process_event(&make_press_event(KeyCode(31), 3000));
+        test.process_event(&make_press(KeyCode(30), 5000));
+        test.process_event(&make_press(KeyCode(31), 3000));
 
         test.reset();
 
@@ -465,7 +445,7 @@ mod tests {
     #[test]
     fn is_never_complete() {
         let mut test = LatencyTest::new();
-        test.process_event(&make_press_event(KeyCode(30), 5000));
+        test.process_event(&make_press(KeyCode(30), 5000));
         assert!(!test.is_complete()); // Continuous test
     }
 

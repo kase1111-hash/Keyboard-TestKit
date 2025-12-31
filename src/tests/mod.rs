@@ -46,6 +46,9 @@ mod bounce;
 mod shortcuts;
 mod virtual_detect;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 pub use polling::PollingRateTest;
 pub use stickiness::StickinessTest;
 pub use rollover::RolloverTest;

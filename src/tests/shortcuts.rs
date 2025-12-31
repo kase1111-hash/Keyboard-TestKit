@@ -94,23 +94,14 @@ impl ShortcutTest {
         }
     }
 
-    /// Check if a key is a modifier
-    fn is_modifier(key: KeyCode) -> bool {
-        matches!(key.0,
-            29 | 97 |   // Ctrl (left/right)
-            56 | 100 |  // Alt (left/right)
-            42 | 54 |   // Shift (left/right)
-            125 | 126   // Super/Win (left/right)
-        )
-    }
-
     /// Update modifier state based on key event
     fn update_modifiers(&mut self, key: KeyCode, pressed: bool) {
-        match key.0 {
-            29 | 97 => self.modifiers.ctrl = pressed,
-            56 | 100 => self.modifiers.alt = pressed,
-            42 | 54 => self.modifiers.shift = pressed,
-            125 | 126 => self.modifiers.super_key = pressed,
+        use crate::keyboard::keymap::*;
+        match key {
+            KEY_LCTRL | KEY_RCTRL => self.modifiers.ctrl = pressed,
+            KEY_LALT | KEY_RALT => self.modifiers.alt = pressed,
+            KEY_LSHIFT | KEY_RSHIFT => self.modifiers.shift = pressed,
+            KEY_LSUPER | KEY_RSUPER => self.modifiers.super_key = pressed,
             _ => {}
         }
     }
@@ -191,7 +182,7 @@ impl KeyboardTest for ShortcutTest {
             self.start_time = Some(Instant::now());
         }
 
-        let is_modifier = Self::is_modifier(event.key);
+        let is_modifier = keymap::is_modifier(event.key);
 
         match event.event_type {
             KeyEventType::Press => {
