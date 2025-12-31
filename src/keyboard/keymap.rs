@@ -1,11 +1,52 @@
 //! Key code definitions and keyboard layout mapping
+//!
+//! This module provides key code mapping between device_query and Linux evdev scancodes,
+//! as well as key metadata like display names and labels.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// Represents a physical key code
+/// Represents a physical key code (Linux evdev scancode)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyCode(pub u16);
+
+// ============================================================================
+// Modifier Key Constants
+// ============================================================================
+
+/// Left Control key (evdev scancode 29)
+pub const KEY_LCTRL: KeyCode = KeyCode(29);
+/// Right Control key (evdev scancode 97)
+pub const KEY_RCTRL: KeyCode = KeyCode(97);
+/// Left Shift key (evdev scancode 42)
+pub const KEY_LSHIFT: KeyCode = KeyCode(42);
+/// Right Shift key (evdev scancode 54)
+pub const KEY_RSHIFT: KeyCode = KeyCode(54);
+/// Left Alt key (evdev scancode 56)
+pub const KEY_LALT: KeyCode = KeyCode(56);
+/// Right Alt key (evdev scancode 100)
+pub const KEY_RALT: KeyCode = KeyCode(100);
+/// Left Super/Windows/Meta key (evdev scancode 125)
+pub const KEY_LSUPER: KeyCode = KeyCode(125);
+/// Right Super/Windows/Meta key (evdev scancode 126)
+pub const KEY_RSUPER: KeyCode = KeyCode(126);
+
+/// All modifier key codes for easy iteration
+pub const MODIFIER_KEYS: &[KeyCode] = &[
+    KEY_LCTRL, KEY_RCTRL,
+    KEY_LSHIFT, KEY_RSHIFT,
+    KEY_LALT, KEY_RALT,
+    KEY_LSUPER, KEY_RSUPER,
+];
+
+/// Returns true if the given key code is a modifier key
+pub fn is_modifier(key: KeyCode) -> bool {
+    MODIFIER_KEYS.contains(&key)
+}
+
+// ============================================================================
+// KeyCode Implementation
+// ============================================================================
 
 impl KeyCode {
     pub fn new(code: u16) -> Self {
@@ -450,5 +491,52 @@ mod tests {
 
         let tab = get_key_info(KeyCode(15));
         assert!((tab.width - 1.5).abs() < 0.01);
+    }
+
+    // Modifier key constants tests
+
+    #[test]
+    fn modifier_key_constants_correct() {
+        assert_eq!(KEY_LCTRL.0, 29);
+        assert_eq!(KEY_RCTRL.0, 97);
+        assert_eq!(KEY_LSHIFT.0, 42);
+        assert_eq!(KEY_RSHIFT.0, 54);
+        assert_eq!(KEY_LALT.0, 56);
+        assert_eq!(KEY_RALT.0, 100);
+        assert_eq!(KEY_LSUPER.0, 125);
+        assert_eq!(KEY_RSUPER.0, 126);
+    }
+
+    #[test]
+    fn modifier_keys_array_contains_all() {
+        assert_eq!(MODIFIER_KEYS.len(), 8);
+        assert!(MODIFIER_KEYS.contains(&KEY_LCTRL));
+        assert!(MODIFIER_KEYS.contains(&KEY_RCTRL));
+        assert!(MODIFIER_KEYS.contains(&KEY_LSHIFT));
+        assert!(MODIFIER_KEYS.contains(&KEY_RSHIFT));
+        assert!(MODIFIER_KEYS.contains(&KEY_LALT));
+        assert!(MODIFIER_KEYS.contains(&KEY_RALT));
+        assert!(MODIFIER_KEYS.contains(&KEY_LSUPER));
+        assert!(MODIFIER_KEYS.contains(&KEY_RSUPER));
+    }
+
+    #[test]
+    fn is_modifier_returns_true_for_modifiers() {
+        assert!(is_modifier(KEY_LCTRL));
+        assert!(is_modifier(KEY_RCTRL));
+        assert!(is_modifier(KEY_LSHIFT));
+        assert!(is_modifier(KEY_RSHIFT));
+        assert!(is_modifier(KEY_LALT));
+        assert!(is_modifier(KEY_RALT));
+        assert!(is_modifier(KEY_LSUPER));
+        assert!(is_modifier(KEY_RSUPER));
+    }
+
+    #[test]
+    fn is_modifier_returns_false_for_non_modifiers() {
+        assert!(!is_modifier(KeyCode(30))); // A
+        assert!(!is_modifier(KeyCode(57))); // Space
+        assert!(!is_modifier(KeyCode(28))); // Enter
+        assert!(!is_modifier(KeyCode(1)));  // Escape
     }
 }

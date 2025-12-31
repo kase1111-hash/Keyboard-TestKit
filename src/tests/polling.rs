@@ -2,6 +2,7 @@
 
 use super::{KeyboardTest, TestResult, ResultStatus};
 use crate::keyboard::{KeyEvent, KeyEventType};
+use crate::utils::MinMaxExt;
 use std::time::{Duration, Instant};
 
 /// Test for measuring keyboard polling rate
@@ -113,13 +114,8 @@ impl KeyboardTest for PollingRateTest {
             // Filter out unreasonably large intervals (likely pauses in typing)
             if interval_us < 100_000 { // Less than 100ms
                 self.intervals_us.push(interval_us);
-
-                self.min_interval_us = Some(
-                    self.min_interval_us.map(|m| m.min(interval_us)).unwrap_or(interval_us)
-                );
-                self.max_interval_us = Some(
-                    self.max_interval_us.map(|m| m.max(interval_us)).unwrap_or(interval_us)
-                );
+                self.min_interval_us.update_min(interval_us);
+                self.max_interval_us.update_max(interval_us);
             }
         }
 
@@ -220,25 +216,7 @@ impl KeyboardTest for PollingRateTest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyboard::KeyCode;
-
-    fn make_press_event(timestamp: Instant, delta_us: u64) -> KeyEvent {
-        KeyEvent {
-            key: KeyCode(30),
-            event_type: KeyEventType::Press,
-            timestamp,
-            delta_us,
-        }
-    }
-
-    fn make_release_event(timestamp: Instant) -> KeyEvent {
-        KeyEvent {
-            key: KeyCode(30),
-            event_type: KeyEventType::Release,
-            timestamp,
-            delta_us: 0,
-        }
-    }
+    use crate::tests::test_helpers::{press_at, release_at, DEFAULT_KEY};
 
     #[test]
     fn new_test_has_no_data() {
@@ -317,7 +295,7 @@ mod tests {
         let mut test = PollingRateTest::new(10);
         let now = Instant::now();
 
-        test.process_event(&make_release_event(now));
+        test.process_event(&release_at(DEFAULT_KEY, now));
 
         assert_eq!(test.event_count, 0);
         assert!(test.start_time.is_none());
@@ -328,7 +306,7 @@ mod tests {
         let mut test = PollingRateTest::new(10);
         let now = Instant::now();
 
-        test.process_event(&make_press_event(now, 0));
+        test.process_event(&press_at(DEFAULT_KEY, now, 0));
 
         assert!(test.start_time.is_some());
         assert_eq!(test.event_count, 1);
@@ -340,11 +318,11 @@ mod tests {
         let now = Instant::now();
 
         // First event
-        test.process_event(&make_press_event(now, 0));
+        test.process_event(&press_at(DEFAULT_KEY, now, 0));
 
         // Simulate a long pause (200ms = 200000us) - this should be filtered
         let later = now + Duration::from_millis(200);
-        test.process_event(&make_press_event(later, 0));
+        test.process_event(&press_at(DEFAULT_KEY, later, 0));
 
         // The large interval should not be recorded
         assert!(test.intervals_us.is_empty());

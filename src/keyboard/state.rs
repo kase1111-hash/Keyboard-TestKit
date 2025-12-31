@@ -228,24 +228,7 @@ impl Default for KeyboardState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_press_event(key: KeyCode, delta_us: u64) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Press,
-            timestamp: Instant::now(),
-            delta_us,
-        }
-    }
-
-    fn make_release_event(key: KeyCode, delta_us: u64) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Release,
-            timestamp: Instant::now(),
-            delta_us,
-        }
-    }
+    use crate::tests::test_helpers::{make_press, make_release};
 
     // KeyState tests
 
@@ -329,7 +312,7 @@ mod tests {
     #[test]
     fn keyboard_state_process_press_event() {
         let mut state = KeyboardState::new();
-        let event = make_press_event(KeyCode(30), 1000); // 'A' key
+        let event = make_press(KeyCode(30), 1000); // 'A' key
 
         state.process_event(&event);
 
@@ -345,8 +328,8 @@ mod tests {
         let key = KeyCode(30);
 
         // Press then release
-        state.process_event(&make_press_event(key, 1000));
-        state.process_event(&make_release_event(key, 1000));
+        state.process_event(&make_press(key, 1000));
+        state.process_event(&make_release(key, 1000));
 
         assert_eq!(state.total_events(), 2);
         assert_eq!(state.current_rollover(), 0);
@@ -359,14 +342,14 @@ mod tests {
         let mut state = KeyboardState::new();
 
         // Press 3 keys
-        state.process_event(&make_press_event(KeyCode(30), 1000)); // A
-        state.process_event(&make_press_event(KeyCode(31), 1000)); // S
-        state.process_event(&make_press_event(KeyCode(32), 1000)); // D
+        state.process_event(&make_press(KeyCode(30), 1000)); // A
+        state.process_event(&make_press(KeyCode(31), 1000)); // S
+        state.process_event(&make_press(KeyCode(32), 1000)); // D
 
         assert_eq!(state.max_rollover(), 3);
 
         // Release one
-        state.process_event(&make_release_event(KeyCode(30), 1000));
+        state.process_event(&make_release(KeyCode(30), 1000));
         assert_eq!(state.current_rollover(), 2);
         assert_eq!(state.max_rollover(), 3); // Max should stay at 3
     }
@@ -377,8 +360,8 @@ mod tests {
 
         // Add events with 1000us intervals (1000 Hz)
         for _ in 0..10 {
-            state.process_event(&make_press_event(KeyCode(30), 1000));
-            state.process_event(&make_release_event(KeyCode(30), 1000));
+            state.process_event(&make_press(KeyCode(30), 1000));
+            state.process_event(&make_release(KeyCode(30), 1000));
         }
 
         let rate = state.global_polling_rate_hz().unwrap();
@@ -390,8 +373,8 @@ mod tests {
         let mut state = KeyboardState::new();
 
         // Add some events
-        state.process_event(&make_press_event(KeyCode(30), 1000));
-        state.process_event(&make_press_event(KeyCode(31), 1000));
+        state.process_event(&make_press(KeyCode(30), 1000));
+        state.process_event(&make_press(KeyCode(31), 1000));
 
         state.reset();
 
@@ -406,7 +389,7 @@ mod tests {
         let mut state = KeyboardState::new();
         let key = KeyCode(30);
 
-        state.process_event(&make_press_event(key, 1000));
+        state.process_event(&make_press(key, 1000));
 
         let key_state = state.get_key_state(key).unwrap();
         assert!(key_state.is_pressed);
@@ -419,7 +402,7 @@ mod tests {
 
         // Add 1500 events, buffer should cap at 1000
         for _ in 0..1500 {
-            state.process_event(&make_press_event(KeyCode(30), 1000));
+            state.process_event(&make_press(KeyCode(30), 1000));
         }
 
         assert_eq!(state.global_intervals_us.len(), 1000);

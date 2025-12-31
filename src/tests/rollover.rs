@@ -250,24 +250,7 @@ impl KeyboardTest for RolloverTest {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_press_event(key: KeyCode) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Press,
-            timestamp: Instant::now(),
-            delta_us: 1000,
-        }
-    }
-
-    fn make_release_event(key: KeyCode) -> KeyEvent {
-        KeyEvent {
-            key,
-            event_type: KeyEventType::Release,
-            timestamp: Instant::now(),
-            delta_us: 1000,
-        }
-    }
+    use crate::tests::test_helpers::{press, release};
 
     #[test]
     fn new_test_initial_state() {
@@ -312,13 +295,13 @@ mod tests {
     fn process_press_increments_count() {
         let mut test = RolloverTest::new();
 
-        test.process_event(&make_press_event(KeyCode(30))); // A
+        test.process_event(&press(KeyCode(30))); // A
         assert_eq!(test.current_count(), 1);
 
-        test.process_event(&make_press_event(KeyCode(31))); // S
+        test.process_event(&press(KeyCode(31))); // S
         assert_eq!(test.current_count(), 2);
 
-        test.process_event(&make_press_event(KeyCode(32))); // D
+        test.process_event(&press(KeyCode(32))); // D
         assert_eq!(test.current_count(), 3);
     }
 
@@ -326,11 +309,11 @@ mod tests {
     fn process_release_decrements_count() {
         let mut test = RolloverTest::new();
 
-        test.process_event(&make_press_event(KeyCode(30)));
-        test.process_event(&make_press_event(KeyCode(31)));
+        test.process_event(&press(KeyCode(30)));
+        test.process_event(&press(KeyCode(31)));
         assert_eq!(test.current_count(), 2);
 
-        test.process_event(&make_release_event(KeyCode(30)));
+        test.process_event(&release(KeyCode(30)));
         assert_eq!(test.current_count(), 1);
     }
 
@@ -340,13 +323,13 @@ mod tests {
 
         // Press 4 keys
         for i in 30..34 {
-            test.process_event(&make_press_event(KeyCode(i)));
+            test.process_event(&press(KeyCode(i)));
         }
         assert_eq!(test.max_rollover(), 4);
 
         // Release 2 keys
-        test.process_event(&make_release_event(KeyCode(30)));
-        test.process_event(&make_release_event(KeyCode(31)));
+        test.process_event(&release(KeyCode(30)));
+        test.process_event(&release(KeyCode(31)));
         assert_eq!(test.current_count(), 2);
         assert_eq!(test.max_rollover(), 4); // Max stays at 4
     }
@@ -356,9 +339,9 @@ mod tests {
         let mut test = RolloverTest::new();
 
         // Press 3 keys one by one: history = [1, 2, 3]
-        test.process_event(&make_press_event(KeyCode(30)));
-        test.process_event(&make_press_event(KeyCode(31)));
-        test.process_event(&make_press_event(KeyCode(32)));
+        test.process_event(&press(KeyCode(30)));
+        test.process_event(&press(KeyCode(31)));
+        test.process_event(&press(KeyCode(32)));
 
         // Average of [1, 2, 3] = 2.0
         assert!((test.avg_rollover() - 2.0).abs() < 0.01);
@@ -374,12 +357,12 @@ mod tests {
         test.expected_keys.insert(KeyCode(32));
 
         // Press expected keys
-        test.process_event(&make_press_event(KeyCode(30)));
-        test.process_event(&make_press_event(KeyCode(31)));
-        test.process_event(&make_press_event(KeyCode(32)));
+        test.process_event(&press(KeyCode(30)));
+        test.process_event(&press(KeyCode(31)));
+        test.process_event(&press(KeyCode(32)));
 
         // Press an unexpected key (F = 33) - should trigger ghost detection
-        test.process_event(&make_press_event(KeyCode(33)));
+        test.process_event(&press(KeyCode(33)));
 
         assert_eq!(test.ghost_detections.len(), 1);
     }
@@ -390,7 +373,7 @@ mod tests {
 
         // Press 4 keys without setting expected keys
         for i in 30..34 {
-            test.process_event(&make_press_event(KeyCode(i)));
+            test.process_event(&press(KeyCode(i)));
         }
 
         // No ghost detection because expected_keys is empty
@@ -401,8 +384,8 @@ mod tests {
     fn reset_clears_all() {
         let mut test = RolloverTest::new();
 
-        test.process_event(&make_press_event(KeyCode(30)));
-        test.process_event(&make_press_event(KeyCode(31)));
+        test.process_event(&press(KeyCode(30)));
+        test.process_event(&press(KeyCode(31)));
         test.max_simultaneous = 5;
         test.expected_keys.insert(KeyCode(30));
 
@@ -426,7 +409,7 @@ mod tests {
     #[test]
     fn is_never_complete() {
         let mut test = RolloverTest::new();
-        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&press(KeyCode(30)));
         assert!(!test.is_complete()); // Continuous test
     }
 
@@ -434,9 +417,9 @@ mod tests {
     fn total_events_counted() {
         let mut test = RolloverTest::new();
 
-        test.process_event(&make_press_event(KeyCode(30)));
-        test.process_event(&make_release_event(KeyCode(30)));
-        test.process_event(&make_press_event(KeyCode(31)));
+        test.process_event(&press(KeyCode(30)));
+        test.process_event(&release(KeyCode(30)));
+        test.process_event(&press(KeyCode(31)));
 
         assert_eq!(test.total_events, 3);
     }
