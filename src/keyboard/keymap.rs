@@ -267,3 +267,188 @@ pub fn get_key_info(code: KeyCode) -> KeyInfo {
         KeyInfo::new("Unknown", "?", 0, 0, 1.0)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // KeyCode tests
+
+    #[test]
+    fn keycode_new() {
+        let code = KeyCode::new(42);
+        assert_eq!(code.as_u16(), 42);
+    }
+
+    #[test]
+    fn keycode_from_u16() {
+        let code: KeyCode = 30u16.into();
+        assert_eq!(code.0, 30);
+    }
+
+    #[test]
+    fn keycode_equality() {
+        let a = KeyCode(30);
+        let b = KeyCode(30);
+        let c = KeyCode(31);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn keycode_hash() {
+        use std::collections::HashSet;
+
+        let mut set = HashSet::new();
+        set.insert(KeyCode(30));
+        set.insert(KeyCode(30)); // Duplicate
+        set.insert(KeyCode(31));
+
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn keycode_from_device_query_letters() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::A).0, 30);
+        assert_eq!(KeyCode::from(DK::S).0, 31);
+        assert_eq!(KeyCode::from(DK::D).0, 32);
+        assert_eq!(KeyCode::from(DK::W).0, 17);
+        assert_eq!(KeyCode::from(DK::Z).0, 44);
+    }
+
+    #[test]
+    fn keycode_from_device_query_numbers() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::Key1).0, 2);
+        assert_eq!(KeyCode::from(DK::Key2).0, 3);
+        assert_eq!(KeyCode::from(DK::Key0).0, 11);
+    }
+
+    #[test]
+    fn keycode_from_device_query_modifiers() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::LShift).0, 42);
+        assert_eq!(KeyCode::from(DK::RShift).0, 54);
+        assert_eq!(KeyCode::from(DK::LControl).0, 29);
+        assert_eq!(KeyCode::from(DK::RControl).0, 97);
+        assert_eq!(KeyCode::from(DK::LAlt).0, 56);
+        assert_eq!(KeyCode::from(DK::RAlt).0, 100);
+    }
+
+    #[test]
+    fn keycode_from_device_query_special() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::Escape).0, 1);
+        assert_eq!(KeyCode::from(DK::Space).0, 57);
+        assert_eq!(KeyCode::from(DK::Enter).0, 28);
+        assert_eq!(KeyCode::from(DK::Tab).0, 15);
+        assert_eq!(KeyCode::from(DK::Backspace).0, 14);
+    }
+
+    #[test]
+    fn keycode_from_device_query_function_keys() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::F1).0, 59);
+        assert_eq!(KeyCode::from(DK::F5).0, 63);
+        assert_eq!(KeyCode::from(DK::F10).0, 68);
+        assert_eq!(KeyCode::from(DK::F11).0, 87);
+        assert_eq!(KeyCode::from(DK::F12).0, 88);
+    }
+
+    #[test]
+    fn keycode_from_device_query_arrows() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::Up).0, 103);
+        assert_eq!(KeyCode::from(DK::Down).0, 108);
+        assert_eq!(KeyCode::from(DK::Left).0, 105);
+        assert_eq!(KeyCode::from(DK::Right).0, 106);
+    }
+
+    #[test]
+    fn keycode_from_device_query_numpad() {
+        use device_query::Keycode as DK;
+
+        assert_eq!(KeyCode::from(DK::Numpad0).0, 82);
+        assert_eq!(KeyCode::from(DK::Numpad5).0, 76);
+        assert_eq!(KeyCode::from(DK::NumpadAdd).0, 78);
+        assert_eq!(KeyCode::from(DK::NumpadSubtract).0, 74);
+    }
+
+    // KeyInfo tests
+
+    #[test]
+    fn keyinfo_new() {
+        let info = KeyInfo::new("Test", "T", 1, 2, 1.5);
+        assert_eq!(info.name, "Test");
+        assert_eq!(info.label, "T");
+        assert_eq!(info.row, 1);
+        assert_eq!(info.col, 2);
+        assert!((info.width - 1.5).abs() < 0.01);
+    }
+
+    // KEYMAP tests
+
+    #[test]
+    fn keymap_contains_common_keys() {
+        // Check that common keys are in the map
+        assert!(KEYMAP.contains_key(&KeyCode(30))); // A
+        assert!(KEYMAP.contains_key(&KeyCode(57))); // Space
+        assert!(KEYMAP.contains_key(&KeyCode(28))); // Enter
+        assert!(KEYMAP.contains_key(&KeyCode(1)));  // Escape
+    }
+
+    #[test]
+    fn keymap_key_info_correct() {
+        let a_info = KEYMAP.get(&KeyCode(30)).unwrap();
+        assert_eq!(a_info.name, "A");
+        assert_eq!(a_info.label, "A");
+        assert_eq!(a_info.row, 3); // Home row
+
+        let space_info = KEYMAP.get(&KeyCode(57)).unwrap();
+        assert_eq!(space_info.name, "Space");
+        assert!((space_info.width - 6.25).abs() < 0.01); // Wide key
+    }
+
+    #[test]
+    fn keymap_function_keys_in_row_0() {
+        for code in [59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88] {
+            let info = KEYMAP.get(&KeyCode(code)).unwrap();
+            assert_eq!(info.row, 0, "F-key {} should be in row 0", info.name);
+        }
+    }
+
+    // get_key_info tests
+
+    #[test]
+    fn get_key_info_known_key() {
+        let info = get_key_info(KeyCode(30));
+        assert_eq!(info.name, "A");
+    }
+
+    #[test]
+    fn get_key_info_unknown_key() {
+        let info = get_key_info(KeyCode(9999));
+        assert_eq!(info.name, "Unknown");
+        assert_eq!(info.label, "?");
+    }
+
+    #[test]
+    fn get_key_info_modifier_widths() {
+        let lshift = get_key_info(KeyCode(42));
+        assert!((lshift.width - 2.25).abs() < 0.01);
+
+        let rshift = get_key_info(KeyCode(54));
+        assert!((rshift.width - 2.75).abs() < 0.01);
+
+        let tab = get_key_info(KeyCode(15));
+        assert!((tab.width - 1.5).abs() < 0.01);
+    }
+}

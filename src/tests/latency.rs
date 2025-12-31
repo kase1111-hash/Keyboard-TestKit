@@ -272,3 +272,224 @@ impl KeyboardTest for LatencyTest {
         self.global_max_us = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_press_event(key: KeyCode, delta_us: u64) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Press,
+            timestamp: Instant::now(),
+            delta_us,
+        }
+    }
+
+    fn make_release_event(key: KeyCode) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Release,
+            timestamp: Instant::now(),
+            delta_us: 0,
+        }
+    }
+
+    #[test]
+    fn new_test_initial_state() {
+        let test = LatencyTest::new();
+        assert!(test.global_avg_us().is_none());
+        assert!(test.global_avg_ms().is_none());
+        assert!(test.std_dev_us().is_none());
+        assert!(test.slowest_key().is_none());
+        assert!(test.fastest_key().is_none());
+    }
+
+    #[test]
+    fn latency_rating_not_measured() {
+        let test = LatencyTest::new();
+        assert_eq!(test.latency_rating(), "Not measured");
+    }
+
+    #[test]
+    fn latency_rating_excellent() {
+        let mut test = LatencyTest::new();
+        // 4ms = 4000us
+        test.global_samples = vec![4000, 4000, 4000];
+        assert_eq!(test.latency_rating(), "Excellent (<5ms)");
+    }
+
+    #[test]
+    fn latency_rating_great() {
+        let mut test = LatencyTest::new();
+        // 8ms = 8000us
+        test.global_samples = vec![8000, 8000, 8000];
+        assert_eq!(test.latency_rating(), "Great (<10ms)");
+    }
+
+    #[test]
+    fn latency_rating_good() {
+        let mut test = LatencyTest::new();
+        // 15ms = 15000us
+        test.global_samples = vec![15000, 15000, 15000];
+        assert_eq!(test.latency_rating(), "Good (<20ms)");
+    }
+
+    #[test]
+    fn latency_rating_acceptable() {
+        let mut test = LatencyTest::new();
+        // 30ms = 30000us
+        test.global_samples = vec![30000, 30000, 30000];
+        assert_eq!(test.latency_rating(), "Acceptable (<50ms)");
+    }
+
+    #[test]
+    fn latency_rating_poor() {
+        let mut test = LatencyTest::new();
+        // 60ms = 60000us
+        test.global_samples = vec![60000, 60000, 60000];
+        assert_eq!(test.latency_rating(), "Poor (>50ms)");
+    }
+
+    #[test]
+    fn global_avg_calculation() {
+        let mut test = LatencyTest::new();
+        test.global_samples = vec![1000, 2000, 3000]; // avg = 2000us
+
+        let avg_us = test.global_avg_us().unwrap();
+        assert!((avg_us - 2000.0).abs() < 0.01);
+
+        let avg_ms = test.global_avg_ms().unwrap();
+        assert!((avg_ms - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn std_dev_calculation() {
+        let mut test = LatencyTest::new();
+        // [1000, 2000, 3000] - mean = 2000, variance = ((1000)^2 + 0 + (1000)^2) / 3
+        test.global_samples = vec![1000, 2000, 3000];
+
+        let std_dev = test.std_dev_us().unwrap();
+        // Expected: sqrt((1000000 + 0 + 1000000) / 3) ≈ 816.5
+        assert!(std_dev > 800.0 && std_dev < 850.0);
+    }
+
+    #[test]
+    fn std_dev_requires_two_samples() {
+        let mut test = LatencyTest::new();
+        test.global_samples = vec![1000];
+        assert!(test.std_dev_us().is_none());
+    }
+
+    #[test]
+    fn process_event_ignores_release() {
+        let mut test = LatencyTest::new();
+        test.process_event(&make_release_event(KeyCode(30)));
+
+        assert_eq!(test.total_events, 0);
+        assert!(test.global_samples.is_empty());
+    }
+
+    #[test]
+    fn process_event_records_latency() {
+        let mut test = LatencyTest::new();
+        test.process_event(&make_press_event(KeyCode(30), 5000)); // 5ms
+
+        assert_eq!(test.total_events, 1);
+        assert_eq!(test.global_samples.len(), 1);
+        assert_eq!(test.global_samples[0], 5000);
+        assert_eq!(test.global_min_us, Some(5000));
+        assert_eq!(test.global_max_us, Some(5000));
+    }
+
+    #[test]
+    fn process_event_filters_large_latency() {
+        let mut test = LatencyTest::new();
+        // >1 second gaps should be filtered
+        test.process_event(&make_press_event(KeyCode(30), 2_000_000));
+
+        assert_eq!(test.total_events, 1);
+        assert!(test.global_samples.is_empty());
+    }
+
+    #[test]
+    fn min_max_tracking() {
+        let mut test = LatencyTest::new();
+        test.process_event(&make_press_event(KeyCode(30), 5000));
+        test.process_event(&make_press_event(KeyCode(31), 2000));
+        test.process_event(&make_press_event(KeyCode(32), 8000));
+
+        assert_eq!(test.global_min_us, Some(2000));
+        assert_eq!(test.global_max_us, Some(8000));
+    }
+
+    #[test]
+    fn fastest_slowest_key() {
+        let mut test = LatencyTest::new();
+        // Key 30: 2ms, Key 31: 5ms, Key 32: 3ms
+        test.process_event(&make_press_event(KeyCode(30), 2000));
+        test.process_event(&make_press_event(KeyCode(31), 5000));
+        test.process_event(&make_press_event(KeyCode(32), 3000));
+
+        let (fastest_key, fastest_latency) = test.fastest_key().unwrap();
+        assert_eq!(fastest_key, KeyCode(30));
+        assert!((fastest_latency - 2000.0).abs() < 0.01);
+
+        let (slowest_key, slowest_latency) = test.slowest_key().unwrap();
+        assert_eq!(slowest_key, KeyCode(31));
+        assert!((slowest_latency - 5000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn reset_clears_all() {
+        let mut test = LatencyTest::new();
+        test.process_event(&make_press_event(KeyCode(30), 5000));
+        test.process_event(&make_press_event(KeyCode(31), 3000));
+
+        test.reset();
+
+        assert!(test.global_samples.is_empty());
+        assert!(test.key_stats.is_empty());
+        assert_eq!(test.total_events, 0);
+        assert!(test.global_min_us.is_none());
+        assert!(test.global_max_us.is_none());
+    }
+
+    #[test]
+    fn test_name_and_description() {
+        let test = LatencyTest::new();
+        assert_eq!(test.name(), "Latency Test");
+        assert!(!test.description().is_empty());
+    }
+
+    #[test]
+    fn is_never_complete() {
+        let mut test = LatencyTest::new();
+        test.process_event(&make_press_event(KeyCode(30), 5000));
+        assert!(!test.is_complete()); // Continuous test
+    }
+
+    // KeyLatencyStats tests
+    #[test]
+    fn key_latency_stats_add_sample() {
+        let mut stats = KeyLatencyStats::default();
+        stats.add_sample(1000);
+        stats.add_sample(2000);
+        stats.add_sample(500);
+
+        assert_eq!(stats.samples.len(), 3);
+        assert_eq!(stats.min_us, Some(500));
+        assert_eq!(stats.max_us, Some(2000));
+    }
+
+    #[test]
+    fn key_latency_stats_avg() {
+        let mut stats = KeyLatencyStats::default();
+        stats.add_sample(1000);
+        stats.add_sample(2000);
+        stats.add_sample(3000);
+
+        let avg = stats.avg_us().unwrap();
+        assert!((avg - 2000.0).abs() < 0.01);
+    }
+}

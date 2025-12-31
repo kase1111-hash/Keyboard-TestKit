@@ -224,3 +224,204 @@ impl Default for KeyboardState {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_press_event(key: KeyCode, delta_us: u64) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Press,
+            timestamp: Instant::now(),
+            delta_us,
+        }
+    }
+
+    fn make_release_event(key: KeyCode, delta_us: u64) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Release,
+            timestamp: Instant::now(),
+            delta_us,
+        }
+    }
+
+    // KeyState tests
+
+    #[test]
+    fn key_state_default_values() {
+        let state = KeyState::default();
+        assert!(!state.is_pressed);
+        assert!(state.last_press.is_none());
+        assert!(state.last_release.is_none());
+        assert_eq!(state.press_count, 0);
+        assert!(state.last_press_duration.is_none());
+        assert!(state.recent_intervals_us.is_empty());
+    }
+
+    #[test]
+    fn key_state_avg_polling_rate_empty() {
+        let state = KeyState::default();
+        assert!(state.avg_polling_rate_hz().is_none());
+    }
+
+    #[test]
+    fn key_state_avg_polling_rate_1000hz() {
+        let mut state = KeyState::default();
+        // 1000us intervals = 1000 Hz
+        for _ in 0..10 {
+            state.record_interval(1000);
+        }
+        let rate = state.avg_polling_rate_hz().unwrap();
+        assert!((rate - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn key_state_avg_polling_rate_125hz() {
+        let mut state = KeyState::default();
+        // 8000us intervals = 125 Hz
+        for _ in 0..10 {
+            state.record_interval(8000);
+        }
+        let rate = state.avg_polling_rate_hz().unwrap();
+        assert!((rate - 125.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn key_state_record_interval_buffer_limit() {
+        let mut state = KeyState::default();
+        // Add 150 intervals, should only keep 100
+        for i in 0..150 {
+            state.record_interval(i);
+        }
+        assert_eq!(state.recent_intervals_us.len(), 100);
+        // Should have dropped the first 50 values
+        assert_eq!(state.recent_intervals_us[0], 50);
+    }
+
+    #[test]
+    fn key_state_is_potentially_stuck_not_pressed() {
+        let state = KeyState::default();
+        assert!(!state.is_potentially_stuck(Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn key_state_is_potentially_stuck_recently_pressed() {
+        let mut state = KeyState::default();
+        state.is_pressed = true;
+        state.last_press = Some(Instant::now());
+        // Just pressed, shouldn't be stuck yet with 1 second threshold
+        assert!(!state.is_potentially_stuck(Duration::from_secs(1)));
+    }
+
+    // KeyboardState tests
+
+    #[test]
+    fn keyboard_state_new() {
+        let state = KeyboardState::new();
+        assert_eq!(state.current_rollover(), 0);
+        assert_eq!(state.max_rollover(), 0);
+        assert_eq!(state.total_events(), 0);
+        assert!(state.global_polling_rate_hz().is_none());
+    }
+
+    #[test]
+    fn keyboard_state_process_press_event() {
+        let mut state = KeyboardState::new();
+        let event = make_press_event(KeyCode(30), 1000); // 'A' key
+
+        state.process_event(&event);
+
+        assert_eq!(state.total_events(), 1);
+        assert_eq!(state.current_rollover(), 1);
+        assert_eq!(state.max_rollover(), 1);
+        assert!(state.pressed_keys().contains(&KeyCode(30)));
+    }
+
+    #[test]
+    fn keyboard_state_process_release_event() {
+        let mut state = KeyboardState::new();
+        let key = KeyCode(30);
+
+        // Press then release
+        state.process_event(&make_press_event(key, 1000));
+        state.process_event(&make_release_event(key, 1000));
+
+        assert_eq!(state.total_events(), 2);
+        assert_eq!(state.current_rollover(), 0);
+        assert_eq!(state.max_rollover(), 1);
+        assert!(!state.pressed_keys().contains(&key));
+    }
+
+    #[test]
+    fn keyboard_state_max_rollover_tracking() {
+        let mut state = KeyboardState::new();
+
+        // Press 3 keys
+        state.process_event(&make_press_event(KeyCode(30), 1000)); // A
+        state.process_event(&make_press_event(KeyCode(31), 1000)); // S
+        state.process_event(&make_press_event(KeyCode(32), 1000)); // D
+
+        assert_eq!(state.max_rollover(), 3);
+
+        // Release one
+        state.process_event(&make_release_event(KeyCode(30), 1000));
+        assert_eq!(state.current_rollover(), 2);
+        assert_eq!(state.max_rollover(), 3); // Max should stay at 3
+    }
+
+    #[test]
+    fn keyboard_state_global_polling_rate() {
+        let mut state = KeyboardState::new();
+
+        // Add events with 1000us intervals (1000 Hz)
+        for _ in 0..10 {
+            state.process_event(&make_press_event(KeyCode(30), 1000));
+            state.process_event(&make_release_event(KeyCode(30), 1000));
+        }
+
+        let rate = state.global_polling_rate_hz().unwrap();
+        assert!((rate - 1000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn keyboard_state_reset() {
+        let mut state = KeyboardState::new();
+
+        // Add some events
+        state.process_event(&make_press_event(KeyCode(30), 1000));
+        state.process_event(&make_press_event(KeyCode(31), 1000));
+
+        state.reset();
+
+        assert_eq!(state.current_rollover(), 0);
+        assert_eq!(state.max_rollover(), 0);
+        assert_eq!(state.total_events(), 0);
+        assert!(state.global_polling_rate_hz().is_none());
+    }
+
+    #[test]
+    fn keyboard_state_key_state_tracking() {
+        let mut state = KeyboardState::new();
+        let key = KeyCode(30);
+
+        state.process_event(&make_press_event(key, 1000));
+
+        let key_state = state.get_key_state(key).unwrap();
+        assert!(key_state.is_pressed);
+        assert_eq!(key_state.press_count, 1);
+    }
+
+    #[test]
+    fn keyboard_state_global_buffer_limit() {
+        let mut state = KeyboardState::new();
+
+        // Add 1500 events, buffer should cap at 1000
+        for _ in 0..1500 {
+            state.process_event(&make_press_event(KeyCode(30), 1000));
+        }
+
+        assert_eq!(state.global_intervals_us.len(), 1000);
+    }
+}

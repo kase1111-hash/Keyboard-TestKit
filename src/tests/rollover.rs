@@ -242,3 +242,198 @@ impl KeyboardTest for RolloverTest {
         self.expected_keys.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_press_event(key: KeyCode) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Press,
+            timestamp: Instant::now(),
+            delta_us: 1000,
+        }
+    }
+
+    fn make_release_event(key: KeyCode) -> KeyEvent {
+        KeyEvent {
+            key,
+            event_type: KeyEventType::Release,
+            timestamp: Instant::now(),
+            delta_us: 1000,
+        }
+    }
+
+    #[test]
+    fn new_test_initial_state() {
+        let test = RolloverTest::new();
+        assert_eq!(test.current_count(), 0);
+        assert_eq!(test.max_rollover(), 0);
+        assert_eq!(test.avg_rollover(), 0.0);
+        assert!(test.pressed_keys().is_empty());
+    }
+
+    #[test]
+    fn rollover_rating_not_tested() {
+        let test = RolloverTest::new();
+        assert_eq!(test.rollover_rating(), "Not tested");
+    }
+
+    #[test]
+    fn rollover_rating_2kro() {
+        let mut test = RolloverTest::new();
+        test.max_simultaneous = 2;
+        assert_eq!(test.rollover_rating(), "2KRO");
+    }
+
+    #[test]
+    fn rollover_rating_6kro() {
+        let mut test = RolloverTest::new();
+        test.max_simultaneous = 6;
+        assert_eq!(test.rollover_rating(), "6KRO");
+    }
+
+    #[test]
+    fn rollover_rating_nkro() {
+        let mut test = RolloverTest::new();
+        test.max_simultaneous = 10;
+        assert_eq!(test.rollover_rating(), "NKRO");
+
+        test.max_simultaneous = 15;
+        assert_eq!(test.rollover_rating(), "NKRO");
+    }
+
+    #[test]
+    fn process_press_increments_count() {
+        let mut test = RolloverTest::new();
+
+        test.process_event(&make_press_event(KeyCode(30))); // A
+        assert_eq!(test.current_count(), 1);
+
+        test.process_event(&make_press_event(KeyCode(31))); // S
+        assert_eq!(test.current_count(), 2);
+
+        test.process_event(&make_press_event(KeyCode(32))); // D
+        assert_eq!(test.current_count(), 3);
+    }
+
+    #[test]
+    fn process_release_decrements_count() {
+        let mut test = RolloverTest::new();
+
+        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&make_press_event(KeyCode(31)));
+        assert_eq!(test.current_count(), 2);
+
+        test.process_event(&make_release_event(KeyCode(30)));
+        assert_eq!(test.current_count(), 1);
+    }
+
+    #[test]
+    fn max_rollover_tracking() {
+        let mut test = RolloverTest::new();
+
+        // Press 4 keys
+        for i in 30..34 {
+            test.process_event(&make_press_event(KeyCode(i)));
+        }
+        assert_eq!(test.max_rollover(), 4);
+
+        // Release 2 keys
+        test.process_event(&make_release_event(KeyCode(30)));
+        test.process_event(&make_release_event(KeyCode(31)));
+        assert_eq!(test.current_count(), 2);
+        assert_eq!(test.max_rollover(), 4); // Max stays at 4
+    }
+
+    #[test]
+    fn avg_rollover_calculation() {
+        let mut test = RolloverTest::new();
+
+        // Press 3 keys one by one: history = [1, 2, 3]
+        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&make_press_event(KeyCode(31)));
+        test.process_event(&make_press_event(KeyCode(32)));
+
+        // Average of [1, 2, 3] = 2.0
+        assert!((test.avg_rollover() - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn ghost_detection_with_expected_keys() {
+        let mut test = RolloverTest::new();
+
+        // Set up expected keys (A, S, D)
+        test.expected_keys.insert(KeyCode(30));
+        test.expected_keys.insert(KeyCode(31));
+        test.expected_keys.insert(KeyCode(32));
+
+        // Press expected keys
+        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&make_press_event(KeyCode(31)));
+        test.process_event(&make_press_event(KeyCode(32)));
+
+        // Press an unexpected key (F = 33) - should trigger ghost detection
+        test.process_event(&make_press_event(KeyCode(33)));
+
+        assert_eq!(test.ghost_detections.len(), 1);
+    }
+
+    #[test]
+    fn no_ghost_detection_without_expected_keys() {
+        let mut test = RolloverTest::new();
+
+        // Press 4 keys without setting expected keys
+        for i in 30..34 {
+            test.process_event(&make_press_event(KeyCode(i)));
+        }
+
+        // No ghost detection because expected_keys is empty
+        assert!(test.ghost_detections.is_empty());
+    }
+
+    #[test]
+    fn reset_clears_all() {
+        let mut test = RolloverTest::new();
+
+        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&make_press_event(KeyCode(31)));
+        test.max_simultaneous = 5;
+        test.expected_keys.insert(KeyCode(30));
+
+        test.reset();
+
+        assert_eq!(test.current_count(), 0);
+        assert_eq!(test.max_rollover(), 0);
+        assert!(test.rollover_history.is_empty());
+        assert!(test.ghost_detections.is_empty());
+        assert_eq!(test.total_events, 0);
+        assert!(test.expected_keys.is_empty());
+    }
+
+    #[test]
+    fn test_name_and_description() {
+        let test = RolloverTest::new();
+        assert_eq!(test.name(), "N-Key Rollover Test");
+        assert!(!test.description().is_empty());
+    }
+
+    #[test]
+    fn is_never_complete() {
+        let mut test = RolloverTest::new();
+        test.process_event(&make_press_event(KeyCode(30)));
+        assert!(!test.is_complete()); // Continuous test
+    }
+
+    #[test]
+    fn total_events_counted() {
+        let mut test = RolloverTest::new();
+
+        test.process_event(&make_press_event(KeyCode(30)));
+        test.process_event(&make_release_event(KeyCode(30)));
+        test.process_event(&make_press_event(KeyCode(31)));
+
+        assert_eq!(test.total_events, 3);
+    }
+}
