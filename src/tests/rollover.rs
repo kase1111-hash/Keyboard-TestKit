@@ -25,11 +25,9 @@ pub struct RolloverTest {
 
 /// A detected ghosting event
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields stored for future detailed reporting
 struct GhostEvent {
     ghost_key: KeyCode,
-    pressed_keys: Vec<KeyCode>,
-    timestamp: Instant,
+    context_keys: usize,
 }
 
 impl RolloverTest {
@@ -71,7 +69,7 @@ impl RolloverTest {
 
     /// Check for potential ghosting
     /// Returns true if ghosting was detected
-    fn check_ghosting(&mut self, new_key: KeyCode, timestamp: Instant) -> bool {
+    fn check_ghosting(&mut self, new_key: KeyCode) -> bool {
         // Simple ghosting detection: if we have 3+ keys and this key wasn't expected
         // Note: This is a simplified heuristic. Real ghosting detection would need
         // to understand the keyboard matrix layout.
@@ -85,8 +83,7 @@ impl RolloverTest {
         {
             self.ghost_detections.push(GhostEvent {
                 ghost_key: new_key,
-                pressed_keys: self.pressed_keys.iter().copied().collect(),
-                timestamp,
+                context_keys: self.pressed_keys.len(),
             });
             return true;
         }
@@ -130,7 +127,7 @@ impl KeyboardTest for RolloverTest {
                 self.pressed_keys.insert(event.key);
 
                 // Check for ghosting before updating max
-                self.check_ghosting(event.key, event.timestamp);
+                self.check_ghosting(event.key);
 
                 let count = self.pressed_keys.len();
                 self.rollover_history.push(count);
@@ -210,6 +207,13 @@ impl KeyboardTest for RolloverTest {
                 "Ghost Events",
                 format!("{} detected", self.ghost_detections.len()),
             ));
+            for ghost in self.ghost_detections.iter().take(3) {
+                let key_info = keymap::get_key_info(ghost.ghost_key);
+                results.push(TestResult::error(
+                    format!("  Ghost: {}", key_info.label),
+                    format!("with {} keys held", ghost.context_keys),
+                ));
+            }
         }
 
         // Currently pressed key names

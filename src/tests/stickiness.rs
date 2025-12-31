@@ -7,10 +7,8 @@ use std::time::{Duration, Instant};
 
 /// Record of a potentially sticky key
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields stored for future detailed reporting
 struct StickyKeyRecord {
     key: KeyCode,
-    press_time: Instant,
     duration_at_detection: Duration,
     occurrences: u32,
 }
@@ -60,7 +58,6 @@ impl StickinessTest {
                 } else {
                     self.flagged_keys.push(StickyKeyRecord {
                         key,
-                        press_time,
                         duration_at_detection: duration,
                         occurrences: 1,
                     });
@@ -173,7 +170,11 @@ impl KeyboardTest for StickinessTest {
                 let key_info = keymap::get_key_info(record.key);
                 results.push(TestResult::error(
                     format!("  {}", key_info.name),
-                    format!("{} occurrences", record.occurrences),
+                    format!(
+                        "{}x (held {:.1}s)",
+                        record.occurrences,
+                        record.duration_at_detection.as_secs_f64()
+                    ),
                 ));
             }
         }
