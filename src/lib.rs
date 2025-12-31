@@ -41,5 +41,5 @@ pub mod ui;
 pub mod config;
 pub mod report;
 
-pub use config::Config;
+pub use config::{Config, ConfigError, config_path};
 pub use report::SessionReport;
