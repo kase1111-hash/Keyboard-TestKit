@@ -2,9 +2,10 @@
 
 use crate::config::Config;
 use crate::keyboard::{KeyboardState, KeyEvent};
+use crate::keyboard::remap::FnKeyMode;
 use crate::tests::{
     KeyboardTest, PollingRateTest, StickinessTest, RolloverTest, LatencyTest,
-    HoldReleaseTest, ShortcutTest, VirtualKeyboardTest, TestResult,
+    HoldReleaseTest, ShortcutTest, VirtualKeyboardTest, OemKeyTest, TestResult,
 };
 use crate::report::SessionReport;
 use std::path::Path;
@@ -21,6 +22,7 @@ pub enum AppView {
     Latency,
     Shortcuts,
     Virtual,
+    OemKeys,
     Help,
 }
 
@@ -35,6 +37,7 @@ impl AppView {
             Self::Latency => "Latency",
             Self::Shortcuts => "Shortcuts",
             Self::Virtual => "Virtual",
+            Self::OemKeys => "OEM/FN",
             Self::Help => "Help",
         }
     }
@@ -49,6 +52,7 @@ impl AppView {
             Self::Latency,
             Self::Shortcuts,
             Self::Virtual,
+            Self::OemKeys,
             Self::Help,
         ]
     }
@@ -63,7 +67,8 @@ impl AppView {
             Self::Latency => 5,
             Self::Shortcuts => 6,
             Self::Virtual => 7,
-            Self::Help => 8,
+            Self::OemKeys => 8,
+            Self::Help => 9,
         }
     }
 
@@ -77,6 +82,7 @@ impl AppView {
             5 => Self::Latency,
             6 => Self::Shortcuts,
             7 => Self::Virtual,
+            8 => Self::OemKeys,
             _ => Self::Help,
         }
     }
@@ -114,6 +120,8 @@ pub struct App {
     pub shortcut_test: ShortcutTest,
     /// Virtual keyboard detection test
     pub virtual_test: VirtualKeyboardTest,
+    /// OEM key capture and FN restoration test
+    pub oem_test: OemKeyTest,
     /// Application start time
     pub start_time: Instant,
     /// Total events processed
@@ -128,6 +136,32 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        // Set up OEM test with config settings
+        let mut oem_test = OemKeyTest::new();
+        let fn_mode = match config.oem_keys.fn_mode {
+            crate::config::FnKeyMode::Disabled => FnKeyMode::Disabled,
+            crate::config::FnKeyMode::CaptureOnly => FnKeyMode::CaptureOnly,
+            crate::config::FnKeyMode::RestoreWithModifier => FnKeyMode::RestoreWithModifier,
+            crate::config::FnKeyMode::MapToFKeys => FnKeyMode::MapToFKeys,
+            crate::config::FnKeyMode::MapToMedia => FnKeyMode::MapToMedia,
+        };
+        oem_test.set_fn_mode(fn_mode);
+
+        // Load custom FN scancodes
+        for scancode in &config.oem_keys.fn_scancodes {
+            oem_test.add_fn_scancode(*scancode);
+        }
+
+        // Load custom key mappings
+        for (from, to) in &config.oem_keys.key_mappings {
+            oem_test.add_mapping(*from, *to);
+        }
+
+        // Load custom FN combos
+        for (key, result) in &config.oem_keys.fn_combos {
+            oem_test.remapper_mut().add_fn_combo(*key, *result);
+        }
+
         Self {
             view: AppView::Dashboard,
             state: AppState::Running,
@@ -140,6 +174,7 @@ impl App {
             latency_test: LatencyTest::new(),
             shortcut_test: ShortcutTest::new(),
             virtual_test: VirtualKeyboardTest::new(),
+            oem_test,
             start_time: Instant::now(),
             total_events: 0,
             status_message: None,
@@ -165,6 +200,7 @@ impl App {
         self.latency_test.process_event(event);
         self.shortcut_test.process_event(event);
         self.virtual_test.process_event(event);
+        self.oem_test.process_event(event);
 
         // Check for stuck keys periodically
         let stuck = self.stickiness_test.check_stuck_keys();
@@ -231,6 +267,7 @@ impl App {
         self.latency_test.reset();
         self.shortcut_test.reset();
         self.virtual_test.reset();
+        self.oem_test.reset();
         self.total_events = 0;
         self.set_status("All tests reset".to_string());
     }
@@ -266,6 +303,10 @@ impl App {
                 self.virtual_test.reset();
                 self.set_status("Virtual detection test reset".to_string());
             }
+            AppView::OemKeys => {
+                self.oem_test.reset();
+                self.set_status("OEM key test reset".to_string());
+            }
             _ => {}
         }
     }
@@ -295,6 +336,7 @@ impl App {
             AppView::Latency => self.latency_test.get_results(),
             AppView::Shortcuts => self.shortcut_test.get_results(),
             AppView::Virtual => self.virtual_test.get_results(),
+            AppView::OemKeys => self.oem_test.get_results(),
             AppView::Help => Vec::new(),
         }
     }

@@ -45,6 +45,118 @@ pub fn is_modifier(key: KeyCode) -> bool {
 }
 
 // ============================================================================
+// OEM / Vendor-Specific Key Constants
+// ============================================================================
+// These scancodes are commonly used by laptop/keyboard manufacturers for
+// special function keys that are typically handled by OEM software.
+
+/// Fn key - commonly used scancode (vendor-specific, may vary)
+/// Note: The Fn key often doesn't generate a scancode at the OS level
+/// as it's typically handled in keyboard firmware. These are fallback codes.
+pub const KEY_FN: KeyCode = KeyCode(464);  // KEY_FN in Linux input.h
+
+/// Alternative Fn key scancode (some vendors use this)
+pub const KEY_FN_ALT: KeyCode = KeyCode(480);  // Alternate FN key code
+
+/// Fn + Esc combination key (some keyboards)
+pub const KEY_FN_ESC: KeyCode = KeyCode(465);
+
+/// Fn + F1-F12 for secondary functions (brightness, volume, etc.)
+pub const KEY_FN_F1: KeyCode = KeyCode(466);
+pub const KEY_FN_F2: KeyCode = KeyCode(467);
+pub const KEY_FN_F3: KeyCode = KeyCode(468);
+pub const KEY_FN_F4: KeyCode = KeyCode(469);
+pub const KEY_FN_F5: KeyCode = KeyCode(470);
+pub const KEY_FN_F6: KeyCode = KeyCode(471);
+pub const KEY_FN_F7: KeyCode = KeyCode(472);
+pub const KEY_FN_F8: KeyCode = KeyCode(473);
+pub const KEY_FN_F9: KeyCode = KeyCode(474);
+pub const KEY_FN_F10: KeyCode = KeyCode(475);
+pub const KEY_FN_F11: KeyCode = KeyCode(476);
+pub const KEY_FN_F12: KeyCode = KeyCode(477);
+
+// Media / Multimedia Keys (common OEM keys)
+/// Mute key (evdev scancode 113)
+pub const KEY_MUTE: KeyCode = KeyCode(113);
+/// Volume Down (evdev scancode 114)
+pub const KEY_VOLUMEDOWN: KeyCode = KeyCode(114);
+/// Volume Up (evdev scancode 115)
+pub const KEY_VOLUMEUP: KeyCode = KeyCode(115);
+/// Play/Pause media key (evdev scancode 164)
+pub const KEY_PLAYPAUSE: KeyCode = KeyCode(164);
+/// Stop media key (evdev scancode 166)
+pub const KEY_STOPCD: KeyCode = KeyCode(166);
+/// Previous track (evdev scancode 165)
+pub const KEY_PREVIOUSSONG: KeyCode = KeyCode(165);
+/// Next track (evdev scancode 163)
+pub const KEY_NEXTSONG: KeyCode = KeyCode(163);
+
+// Display / Brightness Keys
+/// Brightness Down (evdev scancode 224)
+pub const KEY_BRIGHTNESSDOWN: KeyCode = KeyCode(224);
+/// Brightness Up (evdev scancode 225)
+pub const KEY_BRIGHTNESSUP: KeyCode = KeyCode(225);
+/// Display toggle / switch displays (evdev scancode 227)
+pub const KEY_SWITCHVIDEOMODE: KeyCode = KeyCode(227);
+
+// Laptop-specific Keys
+/// Keyboard backlight toggle (evdev scancode 228)
+pub const KEY_KBDILLUMTOGGLE: KeyCode = KeyCode(228);
+/// Keyboard backlight down (evdev scancode 229)
+pub const KEY_KBDILLUMDOWN: KeyCode = KeyCode(229);
+/// Keyboard backlight up (evdev scancode 230)
+pub const KEY_KBDILLUMUP: KeyCode = KeyCode(230);
+/// WiFi toggle (evdev scancode 238)
+pub const KEY_WLAN: KeyCode = KeyCode(238);
+/// Bluetooth toggle (evdev scancode 237)
+pub const KEY_BLUETOOTH: KeyCode = KeyCode(237);
+/// Touchpad toggle (evdev scancode 530)
+pub const KEY_TOUCHPAD_TOGGLE: KeyCode = KeyCode(530);
+/// Camera toggle (evdev scancode 212)
+pub const KEY_CAMERA: KeyCode = KeyCode(212);
+/// Sleep key (evdev scancode 142)
+pub const KEY_SLEEP: KeyCode = KeyCode(142);
+/// Power key (evdev scancode 116)
+pub const KEY_POWER: KeyCode = KeyCode(116);
+
+// Print Screen / Screenshot related
+/// Print Screen (evdev scancode 99)
+pub const KEY_PRINT: KeyCode = KeyCode(99);
+/// SysRq (evdev scancode 99, same as PrtSc)
+pub const KEY_SYSRQ: KeyCode = KeyCode(99);
+/// Scroll Lock (evdev scancode 70)
+pub const KEY_SCROLLLOCK: KeyCode = KeyCode(70);
+/// Pause/Break (evdev scancode 119)
+pub const KEY_PAUSE: KeyCode = KeyCode(119);
+
+/// Collection of all known OEM/special key codes for iteration
+pub const OEM_KEYS: &[KeyCode] = &[
+    KEY_FN, KEY_FN_ALT, KEY_FN_ESC,
+    KEY_FN_F1, KEY_FN_F2, KEY_FN_F3, KEY_FN_F4, KEY_FN_F5, KEY_FN_F6,
+    KEY_FN_F7, KEY_FN_F8, KEY_FN_F9, KEY_FN_F10, KEY_FN_F11, KEY_FN_F12,
+    KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP,
+    KEY_PLAYPAUSE, KEY_STOPCD, KEY_PREVIOUSSONG, KEY_NEXTSONG,
+    KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_SWITCHVIDEOMODE,
+    KEY_KBDILLUMTOGGLE, KEY_KBDILLUMDOWN, KEY_KBDILLUMUP,
+    KEY_WLAN, KEY_BLUETOOTH, KEY_TOUCHPAD_TOGGLE, KEY_CAMERA,
+    KEY_SLEEP, KEY_POWER, KEY_PRINT, KEY_SCROLLLOCK, KEY_PAUSE,
+];
+
+/// Returns true if the given key code is an OEM/special function key
+pub fn is_oem_key(key: KeyCode) -> bool {
+    OEM_KEYS.contains(&key)
+}
+
+/// Returns true if the given key code is an Fn-related key
+pub fn is_fn_key(key: KeyCode) -> bool {
+    matches!(key,
+        KEY_FN | KEY_FN_ALT | KEY_FN_ESC |
+        KEY_FN_F1 | KEY_FN_F2 | KEY_FN_F3 | KEY_FN_F4 | KEY_FN_F5 | KEY_FN_F6 |
+        KEY_FN_F7 | KEY_FN_F8 | KEY_FN_F9 | KEY_FN_F10 | KEY_FN_F11 | KEY_FN_F12
+    )
+}
+
+// ============================================================================
 // KeyCode Implementation
 // ============================================================================
 
@@ -298,6 +410,62 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(111), KeyInfo::new("Delete", "Del", 2, 15, 1.0));
     map.insert(KeyCode(107), KeyInfo::new("End", "End", 2, 16, 1.0));
     map.insert(KeyCode(109), KeyInfo::new("PageDown", "PgDn", 2, 17, 1.0));
+
+    // OEM / Special keys
+    map.insert(KeyCode(464), KeyInfo::new("Fn", "Fn", 5, 8, 1.0));
+    map.insert(KeyCode(480), KeyInfo::new("Fn", "Fn", 5, 8, 1.0));
+    map.insert(KeyCode(465), KeyInfo::new("Fn+Esc", "FnEsc", 0, 0, 1.0));
+    map.insert(KeyCode(466), KeyInfo::new("Fn+F1", "FnF1", 0, 2, 1.0));
+    map.insert(KeyCode(467), KeyInfo::new("Fn+F2", "FnF2", 0, 3, 1.0));
+    map.insert(KeyCode(468), KeyInfo::new("Fn+F3", "FnF3", 0, 4, 1.0));
+    map.insert(KeyCode(469), KeyInfo::new("Fn+F4", "FnF4", 0, 5, 1.0));
+    map.insert(KeyCode(470), KeyInfo::new("Fn+F5", "FnF5", 0, 7, 1.0));
+    map.insert(KeyCode(471), KeyInfo::new("Fn+F6", "FnF6", 0, 8, 1.0));
+    map.insert(KeyCode(472), KeyInfo::new("Fn+F7", "FnF7", 0, 9, 1.0));
+    map.insert(KeyCode(473), KeyInfo::new("Fn+F8", "FnF8", 0, 10, 1.0));
+    map.insert(KeyCode(474), KeyInfo::new("Fn+F9", "FnF9", 0, 12, 1.0));
+    map.insert(KeyCode(475), KeyInfo::new("Fn+F10", "FnF10", 0, 13, 1.0));
+    map.insert(KeyCode(476), KeyInfo::new("Fn+F11", "FnF11", 0, 14, 1.0));
+    map.insert(KeyCode(477), KeyInfo::new("Fn+F12", "FnF12", 0, 15, 1.0));
+
+    // Media keys
+    map.insert(KeyCode(113), KeyInfo::new("Mute", "Mute", 0, 17, 1.0));
+    map.insert(KeyCode(114), KeyInfo::new("VolumeDown", "Vol-", 0, 18, 1.0));
+    map.insert(KeyCode(115), KeyInfo::new("VolumeUp", "Vol+", 0, 19, 1.0));
+    map.insert(KeyCode(164), KeyInfo::new("PlayPause", "Play", 0, 20, 1.0));
+    map.insert(KeyCode(166), KeyInfo::new("Stop", "Stop", 0, 21, 1.0));
+    map.insert(KeyCode(165), KeyInfo::new("Previous", "Prev", 0, 22, 1.0));
+    map.insert(KeyCode(163), KeyInfo::new("Next", "Next", 0, 23, 1.0));
+
+    // Brightness keys
+    map.insert(KeyCode(224), KeyInfo::new("BrightnessDown", "Bri-", 0, 24, 1.0));
+    map.insert(KeyCode(225), KeyInfo::new("BrightnessUp", "Bri+", 0, 25, 1.0));
+    map.insert(KeyCode(227), KeyInfo::new("DisplaySwitch", "Disp", 0, 26, 1.0));
+
+    // Keyboard backlight
+    map.insert(KeyCode(228), KeyInfo::new("KbdBacklightToggle", "KbdL", 0, 27, 1.0));
+    map.insert(KeyCode(229), KeyInfo::new("KbdBacklightDown", "Kbd-", 0, 28, 1.0));
+    map.insert(KeyCode(230), KeyInfo::new("KbdBacklightUp", "Kbd+", 0, 29, 1.0));
+
+    // Connectivity
+    map.insert(KeyCode(238), KeyInfo::new("WiFiToggle", "WiFi", 0, 30, 1.0));
+    map.insert(KeyCode(237), KeyInfo::new("BluetoothToggle", "BT", 0, 31, 1.0));
+
+    // Other laptop keys
+    map.insert(KeyCode(530), KeyInfo::new("TouchpadToggle", "TPad", 0, 32, 1.0));
+    map.insert(KeyCode(212), KeyInfo::new("Camera", "Cam", 0, 33, 1.0));
+    map.insert(KeyCode(142), KeyInfo::new("Sleep", "Slp", 0, 34, 1.0));
+    map.insert(KeyCode(116), KeyInfo::new("Power", "Pwr", 0, 35, 1.0));
+
+    // Print, Scroll Lock, Pause
+    map.insert(KeyCode(99), KeyInfo::new("PrintScreen", "PrtSc", 1, 18, 1.0));
+    map.insert(KeyCode(70), KeyInfo::new("ScrollLock", "ScrLk", 1, 19, 1.0));
+    map.insert(KeyCode(119), KeyInfo::new("Pause", "Pause", 1, 20, 1.0));
+
+    // Numlock and numpad enter (missing from original)
+    map.insert(KeyCode(69), KeyInfo::new("NumLock", "NumLk", 1, 21, 1.0));
+    map.insert(KeyCode(96), KeyInfo::new("NumpadEnter", "Ent", 4, 18, 1.0));
+    map.insert(KeyCode(83), KeyInfo::new("NumpadDelete", "Del", 6, 17, 1.0));
 
     map
 });
