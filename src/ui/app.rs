@@ -406,6 +406,54 @@ impl App {
         self.set_status(msg.clone());
         Ok(msg)
     }
+
+    /// Add a mapping for the last detected unknown key
+    /// This allows users to remap OEM keys that are detected but not recognized
+    pub fn add_oem_mapping_for_last_unknown(&mut self) {
+        let unknown_keys = self.oem_test.detected_unknown();
+        if unknown_keys.is_empty() {
+            self.set_status("No unknown keys detected yet. Press an OEM key first.".to_string());
+            return;
+        }
+
+        // Get the most recently pressed unknown key
+        if let Some((&scancode, &_count)) = unknown_keys.iter().max_by_key(|(_, &c)| c) {
+            // Map unknown key to itself initially (pass-through, but registered)
+            // User can later configure specific mappings in config file
+            self.oem_test.add_fn_scancode(scancode);
+            self.set_status(format!(
+                "Added scancode 0x{:03X} ({}) as FN key. Edit config for custom mapping.",
+                scancode, scancode
+            ));
+        }
+    }
+
+    /// Cycle through FN key modes
+    pub fn cycle_fn_mode(&mut self) {
+        let current_mode = self.oem_test.fn_mode();
+        let next_mode = match current_mode {
+            FnKeyMode::Disabled => FnKeyMode::CaptureOnly,
+            FnKeyMode::CaptureOnly => FnKeyMode::MapToFKeys,
+            FnKeyMode::MapToFKeys => FnKeyMode::MapToMedia,
+            FnKeyMode::MapToMedia => FnKeyMode::RestoreWithModifier,
+            FnKeyMode::RestoreWithModifier => FnKeyMode::Disabled,
+        };
+        self.oem_test.set_fn_mode(next_mode);
+        let mode_name = match next_mode {
+            FnKeyMode::Disabled => "Disabled",
+            FnKeyMode::CaptureOnly => "Capture Only",
+            FnKeyMode::MapToFKeys => "Map to F-Keys",
+            FnKeyMode::MapToMedia => "Map to Media",
+            FnKeyMode::RestoreWithModifier => "Restore as Modifier",
+        };
+        self.set_status(format!("FN mode: {}", mode_name));
+    }
+
+    /// Clear all OEM key mappings
+    pub fn clear_oem_mappings(&mut self) {
+        self.oem_test.remapper_mut().clear_mappings();
+        self.set_status("OEM key mappings cleared".to_string());
+    }
 }
 
 impl Default for App {

@@ -27,6 +27,9 @@ use keyboard_testkit::{
     ui::{App, AppState, AppView, KeyboardVisual, ResultsPanel, StatusBar, TabBar, HelpPanel},
 };
 
+#[cfg(target_os = "linux")]
+use keyboard_testkit::keyboard::{EvdevListener, evdev_status};
+
 fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -42,14 +45,45 @@ fn main() -> Result<()> {
     // Create keyboard event channel
     let (event_tx, event_rx) = mpsc::channel::<KeyEvent>();
 
-    // Create keyboard listener
-    let mut listener = KeyboardListener::new(event_tx);
+    // Create keyboard listener (device_query based - fallback)
+    let mut listener = KeyboardListener::new(event_tx.clone());
+
+    // On Linux, try to use evdev for better OEM key detection
+    #[cfg(target_os = "linux")]
+    let mut evdev_listener = {
+        match EvdevListener::try_new(event_tx) {
+            Some(evdev) => {
+                app.set_status(format!("Evdev: {}", evdev_status()));
+                Some(evdev)
+            }
+            None => {
+                app.set_status("Evdev unavailable - using fallback (limited OEM key support)".to_string());
+                None
+            }
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let _use_evdev = evdev_listener.is_some();
+
+    #[cfg(not(target_os = "linux"))]
+    let _use_evdev = false;
 
     // Main loop
     let tick_rate = config.refresh_interval();
 
     loop {
-        // Poll keyboard state
+        // Poll keyboard state - use evdev on Linux if available, otherwise fallback
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref mut evdev) = evdev_listener {
+                evdev.poll();
+            } else {
+                listener.poll();
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
         listener.poll();
 
         // Process keyboard events
@@ -145,6 +179,24 @@ fn main() -> Result<()> {
                         // Trigger virtual key test when on Virtual view
                         if app.view == AppView::Virtual {
                             app.virtual_test.request_virtual_test();
+                        }
+                    }
+                    CtKeyCode::Char('a') => {
+                        // Add mapping for last detected unknown key when on OEM view
+                        if app.view == AppView::OemKeys {
+                            app.add_oem_mapping_for_last_unknown();
+                        }
+                    }
+                    CtKeyCode::Char('f') => {
+                        // Cycle FN mode when on OEM view
+                        if app.view == AppView::OemKeys {
+                            app.cycle_fn_mode();
+                        }
+                    }
+                    CtKeyCode::Char('c') => {
+                        // Clear OEM mappings when on OEM view
+                        if app.view == AppView::OemKeys {
+                            app.clear_oem_mappings();
                         }
                     }
                     CtKeyCode::Char('?') => app.view = AppView::Help,

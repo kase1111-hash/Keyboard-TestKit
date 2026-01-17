@@ -111,6 +111,24 @@ impl OemKeyTest {
         self.remapper.add_fn_scancode(scancode);
     }
 
+    /// Add a direct key mapping (remap one key to another)
+    pub fn add_direct_mapping(&mut self, from_scancode: u16, to_scancode: u16) {
+        self.remapper.add_mapping(from_scancode, to_scancode);
+    }
+
+    /// Get the last detected unknown scancode (if any)
+    pub fn last_unknown_scancode(&self) -> Option<u16> {
+        self.detected_unknown
+            .iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&scancode, _)| scancode)
+    }
+
+    /// Add an FN+key combination mapping
+    pub fn add_fn_combo(&mut self, key_scancode: u16, result_scancode: u16) {
+        self.remapper.add_fn_combo(key_scancode, result_scancode);
+    }
+
     /// Check if FN is currently held
     pub fn is_fn_held(&self) -> bool {
         self.remapper.is_fn_held()
@@ -422,6 +440,23 @@ impl KeyboardTest for OemKeyTest {
         // Help text
         results.push(TestResult::info("", ""));
         results.push(TestResult::info(
+            "--- Controls ---",
+            "",
+        ));
+        results.push(TestResult::info(
+            "[a] Add last unknown",
+            "as FN scancode",
+        ));
+        results.push(TestResult::info(
+            "[f] Cycle FN mode",
+            "",
+        ));
+        results.push(TestResult::info(
+            "[c] Clear mappings",
+            "",
+        ));
+        results.push(TestResult::info("", ""));
+        results.push(TestResult::info(
             "--- Tips ---",
             "",
         ));
@@ -430,8 +465,8 @@ impl KeyboardTest for OemKeyTest {
             "capture their scancodes",
         ));
         results.push(TestResult::info(
-            "Use scancodes to set up",
-            "custom mappings in config",
+            "Add custom mappings in",
+            "~/.config/keyboard-testkit/config.toml",
         ));
 
         results
