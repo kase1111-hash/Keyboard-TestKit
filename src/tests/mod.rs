@@ -13,6 +13,7 @@
 //! | [`HoldReleaseTest`] | Analyzes key hold duration and mechanical bounce |
 //! | [`ShortcutTest`] | Validates keyboard shortcut combinations |
 //! | [`VirtualKeyboardTest`] | Compares physical vs virtual key events |
+//! | [`OemKeyTest`] | Captures OEM keys and provides FN key restoration |
 //!
 //! ## Usage
 //!
@@ -45,6 +46,7 @@ mod latency;
 mod bounce;
 mod shortcuts;
 mod virtual_detect;
+mod oem_keys;
 
 #[cfg(test)]
 pub mod test_helpers;
@@ -56,6 +58,7 @@ pub use latency::LatencyTest;
 pub use bounce::HoldReleaseTest;
 pub use shortcuts::ShortcutTest;
 pub use virtual_detect::VirtualKeyboardTest;
+pub use oem_keys::OemKeyTest;
 
 use crate::keyboard::KeyEvent;
 use std::time::Instant;

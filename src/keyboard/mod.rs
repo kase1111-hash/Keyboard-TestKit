@@ -11,6 +11,7 @@
 //! - [`KeyState`] - Per-key metrics (press count, durations, polling intervals)
 //! - [`KeyCode`] - Platform-independent key identifier (Linux evdev scancodes)
 //! - [`KeyInfo`] - Key metadata including name, label, and position
+//! - [`remap`] - Key remapping and OEM/FN key restoration
 //!
 //! ## Usage
 //!
@@ -37,6 +38,7 @@
 mod event;
 mod state;
 pub mod keymap;
+pub mod remap;
 
 pub use event::{KeyEvent, KeyEventType, KeyboardListener};
 pub use state::{KeyState, KeyboardState};

@@ -108,6 +108,9 @@ pub struct Config {
     pub hold_release: HoldReleaseConfig,
     /// UI settings
     pub ui: UiConfig,
+    /// OEM key and remapping settings
+    #[serde(default)]
+    pub oem_keys: OemKeyConfig,
 }
 
 impl Default for Config {
@@ -117,6 +120,7 @@ impl Default for Config {
             stickiness: StickinessConfig::default(),
             hold_release: HoldReleaseConfig::default(),
             ui: UiConfig::default(),
+            oem_keys: OemKeyConfig::default(),
         }
     }
 }
@@ -201,6 +205,99 @@ impl Default for UiConfig {
 pub enum Theme {
     Dark,
     Light,
+}
+
+/// FN key handling mode for OEM key restoration
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FnKeyMode {
+    /// Don't modify FN key behavior
+    Disabled,
+    /// Capture FN key presses but don't remap
+    CaptureOnly,
+    /// Restore FN key as a modifier (like Ctrl/Alt)
+    RestoreWithModifier,
+    /// Map FN+key combinations to F-keys
+    MapToFKeys,
+    /// Map FN+key combinations to media keys
+    MapToMedia,
+}
+
+impl Default for FnKeyMode {
+    fn default() -> Self {
+        Self::CaptureOnly
+    }
+}
+
+/// OEM key and remapping configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OemKeyConfig {
+    /// Enable OEM key capture and remapping
+    pub enabled: bool,
+    /// FN key handling mode
+    pub fn_mode: FnKeyMode,
+    /// Custom FN key scancodes to recognize (in addition to defaults)
+    #[serde(default)]
+    pub fn_scancodes: Vec<u16>,
+    /// Custom key remappings: (source_scancode, target_scancode)
+    #[serde(default)]
+    pub key_mappings: Vec<(u16, u16)>,
+    /// Custom FN+key combinations: (key_scancode, result_scancode)
+    #[serde(default)]
+    pub fn_combos: Vec<(u16, u16)>,
+    /// Capture unknown/unmapped keys for analysis
+    pub capture_unknown: bool,
+    /// Show OEM key notifications
+    pub show_notifications: bool,
+}
+
+impl Default for OemKeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fn_mode: FnKeyMode::CaptureOnly,
+            fn_scancodes: Vec::new(),
+            key_mappings: Vec::new(),
+            fn_combos: Vec::new(),
+            capture_unknown: true,
+            show_notifications: true,
+        }
+    }
+}
+
+impl OemKeyConfig {
+    /// Create a config with FN key restoration enabled
+    pub fn with_fn_restoration() -> Self {
+        Self {
+            enabled: true,
+            fn_mode: FnKeyMode::MapToFKeys,
+            fn_scancodes: Vec::new(),
+            key_mappings: Vec::new(),
+            fn_combos: Vec::new(),
+            capture_unknown: true,
+            show_notifications: true,
+        }
+    }
+
+    /// Add a key mapping
+    pub fn add_mapping(&mut self, from: u16, to: u16) {
+        // Remove existing mapping for same source
+        self.key_mappings.retain(|(k, _)| *k != from);
+        self.key_mappings.push((from, to));
+    }
+
+    /// Add an FN+key combo
+    pub fn add_fn_combo(&mut self, key: u16, result: u16) {
+        // Remove existing combo for same key
+        self.fn_combos.retain(|(k, _)| *k != key);
+        self.fn_combos.push((key, result));
+    }
+
+    /// Add an FN key scancode
+    pub fn add_fn_scancode(&mut self, scancode: u16) {
+        if !self.fn_scancodes.contains(&scancode) {
+            self.fn_scancodes.push(scancode);
+        }
+    }
 }
 
 impl Config {
