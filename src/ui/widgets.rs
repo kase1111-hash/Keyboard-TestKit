@@ -115,12 +115,14 @@ impl Widget for HelpPanel {
         }
 
         let sections = [
-            ("NAV", &[("Tab", "Switch view"), ("1-8", "Jump to view"), ("m", "Toggle shortcuts"), ("q", "Quit")][..]),
+            ("NAV", &[("Tab", "Switch view"), ("1-0", "Jump to view"), ("m", "Toggle shortcuts"), ("q", "Quit")][..]),
             ("CTL", &[("Space", "Pause"), ("r/R", "Reset"), ("e", "Export"), ("?", "Help")][..]),
             ("TESTS", &[
                 ("1", "Dashboard"), ("2", "Polling"), ("3", "Bounce"), ("4", "Sticky"),
                 ("5", "NKRO"), ("6", "Latency"), ("7", "Shortcuts"), ("8", "Virtual"),
+                ("9", "OEM/FN"), ("0", "Help"),
             ][..]),
+            ("OEM", &[("a", "Add FN scancode"), ("f", "Cycle FN mode"), ("c", "Clear mappings")][..]),
         ];
 
         for (header, items) in &sections {

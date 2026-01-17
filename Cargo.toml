@@ -38,6 +38,8 @@ enigo = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 enigo = { version = "0.2", optional = true }
+evdev = "0.12"
+nix = { version = "0.28", features = ["fs", "ioctl"] }
 
 [features]
 default = []
