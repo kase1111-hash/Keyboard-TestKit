@@ -138,7 +138,7 @@ impl KeyRemapper {
             mappings: HashMap::new(),
             fn_mode: FnKeyMode::CaptureOnly,
             fn_held: false,
-            fn_scancodes: vec![464, 0x1d3], // Common FN key scancodes
+            fn_scancodes: vec![464, 480], // Common FN key scancodes
             unknown_behavior: UnknownKeyBehavior::CaptureAndPassThrough,
             captured_keys: HashMap::new(),
             fn_combos: HashMap::new(),
