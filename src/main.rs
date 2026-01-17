@@ -139,6 +139,8 @@ fn main() -> Result<()> {
                     CtKeyCode::Char('6') if app.shortcuts_enabled => app.view = AppView::Latency,
                     CtKeyCode::Char('7') if app.shortcuts_enabled => app.view = AppView::Shortcuts,
                     CtKeyCode::Char('8') if app.shortcuts_enabled => app.view = AppView::Virtual,
+                    CtKeyCode::Char('9') if app.shortcuts_enabled => app.view = AppView::OemKeys,
+                    CtKeyCode::Char('0') if app.shortcuts_enabled => app.view = AppView::Help,
                     CtKeyCode::Char('v') => {
                         // Trigger virtual key test when on Virtual view
                         if app.view == AppView::Virtual {
