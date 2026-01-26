@@ -32,7 +32,7 @@ impl<'a> KeyboardVisual<'a> {
         let pressed = self.keyboard_state.pressed_keys().contains(&code);
         if pressed {
             (palette::KEY_ON, palette::TEXT_ON, true)
-        } else if self.keyboard_state.get_key_state(code).map_or(false, |s| s.press_count > 0) {
+        } else if self.keyboard_state.get_key_state(code).is_some_and(|s| s.press_count > 0) {
             (palette::KEY_USED, palette::TEXT, false)
         } else {
             (palette::KEY_OFF, palette::TEXT, false)
@@ -44,7 +44,7 @@ impl<'a> KeyboardVisual<'a> {
         let mut style = Style::default().fg(fg).bg(bg);
         if bold { style = style.add_modifier(Modifier::BOLD); }
         if y < buf.area.height && x + w <= buf.area.width {
-            buf.set_string(x, y, &format!("{:^w$}", label, w = w as usize), style);
+            buf.set_string(x, y, format!("{:^w$}", label, w = w as usize), style);
         }
     }
 }

@@ -98,7 +98,7 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// Main application configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     /// Polling rate test settings
     pub polling: PollingConfig,
@@ -111,18 +111,6 @@ pub struct Config {
     /// OEM key and remapping settings
     #[serde(default)]
     pub oem_keys: OemKeyConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            polling: PollingConfig::default(),
-            stickiness: StickinessConfig::default(),
-            hold_release: HoldReleaseConfig::default(),
-            ui: UiConfig::default(),
-            oem_keys: OemKeyConfig::default(),
-        }
-    }
 }
 
 /// Polling rate test configuration
@@ -208,11 +196,12 @@ pub enum Theme {
 }
 
 /// FN key handling mode for OEM key restoration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FnKeyMode {
     /// Don't modify FN key behavior
     Disabled,
     /// Capture FN key presses but don't remap
+    #[default]
     CaptureOnly,
     /// Restore FN key as a modifier (like Ctrl/Alt)
     RestoreWithModifier,
@@ -220,12 +209,6 @@ pub enum FnKeyMode {
     MapToFKeys,
     /// Map FN+key combinations to media keys
     MapToMedia,
-}
-
-impl Default for FnKeyMode {
-    fn default() -> Self {
-        Self::CaptureOnly
-    }
 }
 
 /// OEM key and remapping configuration

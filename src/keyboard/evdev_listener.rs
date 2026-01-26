@@ -100,7 +100,7 @@ fn find_keyboard_devices() -> Result<Vec<PathBuf>, EvdevError> {
 }
 
 /// Check if a device is a keyboard by examining /sys/class/input
-fn is_keyboard_device(device_path: &PathBuf) -> bool {
+fn is_keyboard_device(device_path: &std::path::Path) -> bool {
     let device_name = device_path.file_name().and_then(|n| n.to_str());
     if let Some(name) = device_name {
         // Try to read device capabilities from sysfs
@@ -156,6 +156,9 @@ impl EvdevListener {
                 Ok(file) => {
                     // Set non-blocking mode
                     let fd = file.as_raw_fd();
+                    // SAFETY: fcntl F_GETFL/F_SETFL are safe operations on valid file descriptors.
+                    // The fd is valid because it was obtained from a successfully opened File.
+                    // O_NONBLOCK flag modification does not affect memory safety.
                     unsafe {
                         let flags = libc::fcntl(fd, libc::F_GETFL);
                         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -240,7 +243,11 @@ impl EvdevListener {
                             let offset = i * INPUT_EVENT_SIZE;
                             let event_bytes = &self.buffer[offset..offset + INPUT_EVENT_SIZE];
 
-                            // Parse the input event
+                            // SAFETY: This is safe because:
+                            // 1. event_bytes is guaranteed to have exactly INPUT_EVENT_SIZE bytes
+                            // 2. InputEvent is #[repr(C)] and matches the kernel's input_event struct layout
+                            // 3. The slice was obtained from a buffer read from the kernel evdev interface
+                            // 4. All bit patterns are valid for InputEvent's primitive fields
                             let input_event: InputEvent = unsafe {
                                 std::ptr::read(event_bytes.as_ptr() as *const InputEvent)
                             };
@@ -261,11 +268,9 @@ impl EvdevListener {
                                         // Key was already pressed, skip
                                         continue;
                                     }
-                                } else {
-                                    if !self.pressed_keys.remove(&scancode) {
-                                        // Key wasn't pressed, skip
-                                        continue;
-                                    }
+                                } else if !self.pressed_keys.remove(&scancode) {
+                                    // Key wasn't pressed, skip
+                                    continue;
                                 }
 
                                 // Create and send the event

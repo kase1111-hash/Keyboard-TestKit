@@ -291,9 +291,11 @@ mod tests {
 
     #[test]
     fn key_state_is_potentially_stuck_recently_pressed() {
-        let mut state = KeyState::default();
-        state.is_pressed = true;
-        state.last_press = Some(Instant::now());
+        let state = KeyState {
+            is_pressed: true,
+            last_press: Some(Instant::now()),
+            ..Default::default()
+        };
         // Just pressed, shouldn't be stuck yet with 1 second threshold
         assert!(!state.is_potentially_stuck(Duration::from_secs(1)));
     }

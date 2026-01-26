@@ -229,8 +229,8 @@ impl<'a> Widget for TabBar<'a> {
 
             let label = format!("{}.{}", i + 1, tab);
             if x + label.len() as u16 + 2 <= area.x + area.width {
-                buf.set_string(x, area.y, &format!("{}", i + 1), num_style);
-                buf.set_string(x + 1, area.y, &format!(".{} ", tab), style);
+                buf.set_string(x, area.y, format!("{}", i + 1), num_style);
+                buf.set_string(x + 1, area.y, format!(".{} ", tab), style);
                 x += label.len() as u16 + 2;
             }
         }

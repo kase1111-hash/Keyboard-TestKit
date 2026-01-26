@@ -25,11 +25,12 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 /// Describes how the FN key should be handled
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FnKeyMode {
     /// Don't modify FN key behavior
     Disabled,
     /// Capture FN key presses but don't remap
+    #[default]
     CaptureOnly,
     /// Restore FN key as a modifier (like Ctrl/Alt)
     RestoreWithModifier,
@@ -39,27 +40,16 @@ pub enum FnKeyMode {
     MapToMedia,
 }
 
-impl Default for FnKeyMode {
-    fn default() -> Self {
-        Self::CaptureOnly
-    }
-}
-
 /// Describes how to handle unmapped/unknown key presses
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnknownKeyBehavior {
     /// Pass through unchanged
     PassThrough,
     /// Capture and log but pass through
+    #[default]
     CaptureAndPassThrough,
     /// Block unknown keys
     Block,
-}
-
-impl Default for UnknownKeyBehavior {
-    fn default() -> Self {
-        Self::CaptureAndPassThrough
-    }
 }
 
 /// Record of a captured OEM/unknown key press
@@ -312,9 +302,8 @@ impl KeyRemapper {
         if super::keymap::KEYMAP.get(&key).is_none() {
             self.capture_key(scancode, pressed, None);
 
-            match self.unknown_behavior {
-                UnknownKeyBehavior::Block => return RemapResult::Blocked(key),
-                _ => {}
+            if self.unknown_behavior == UnknownKeyBehavior::Block {
+                return RemapResult::Blocked(key);
             }
         }
 
