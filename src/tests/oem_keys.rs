@@ -259,32 +259,16 @@ impl KeyboardTest for OemKeyTest {
     }
 
     fn get_results(&self) -> Vec<TestResult> {
-        let mut results = Vec::new();
-
-        // Explanation header
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
-        results.push(TestResult::info(
-            "Captures OEM/vendor keys",
-            "(media, brightness, etc.)",
-        ));
-        results.push(TestResult::info(
-            "Restores FN key function",
-            "when OEM software removed",
-        ));
-        results.push(TestResult::info(
-            "Maps FN+key combos to",
-            "standard function keys",
-        ));
-        results.push(TestResult::info("", ""));
-
-        // FN key status
-        results.push(TestResult::info(
-            "--- FN Key Status ---",
-            "",
-        ));
+        let mut results = vec![
+            // Explanation header
+            TestResult::info("--- What This Measures ---", ""),
+            TestResult::info("Captures OEM/vendor keys", "(media, brightness, etc.)"),
+            TestResult::info("Restores FN key function", "when OEM software removed"),
+            TestResult::info("Maps FN+key combos to", "standard function keys"),
+            TestResult::info("", ""),
+            // FN key status
+            TestResult::info("--- FN Key Status ---", ""),
+        ];
 
         let fn_status = if self.remapper.is_fn_held() {
             ResultStatus::Ok

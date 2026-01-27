@@ -572,38 +572,18 @@ impl KeyboardTest for VirtualKeyboardTest {
     }
 
     fn get_results(&self) -> Vec<TestResult> {
-        let mut results = Vec::new();
-
-        // Tooltip: Explain what this test measures
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
-        results.push(TestResult::info(
-            "Detects virtual/automated",
-            "input vs physical keys",
-        ));
-        results.push(TestResult::info(
-            "Diagnoses hardware vs",
-            "software keyboard issues",
-        ));
-        results.push(TestResult::info(
-            "Look for: 'Physical' input,",
-            "low suspicious %, no anomalies",
-        ));
-        results.push(TestResult::info("", ""));
-
-        // Diagnostic section
-        results.push(TestResult::info("=== DIAGNOSTIC TEST ===", ""));
-        results.push(TestResult::new(
-            "Status",
-            self.diagnostic.as_str(),
-            self.diagnostic.to_status(),
-        ));
-        results.push(TestResult::info(
-            "Info",
-            self.diagnostic.description().to_string(),
-        ));
+        let mut results = vec![
+            // Tooltip: Explain what this test measures
+            TestResult::info("--- What This Measures ---", ""),
+            TestResult::info("Detects virtual/automated", "input vs physical keys"),
+            TestResult::info("Diagnoses hardware vs", "software keyboard issues"),
+            TestResult::info("Look for: 'Physical' input,", "low suspicious %, no anomalies"),
+            TestResult::info("", ""),
+            // Diagnostic section
+            TestResult::info("=== DIAGNOSTIC TEST ===", ""),
+            TestResult::new("Status", self.diagnostic.as_str(), self.diagnostic.to_status()),
+            TestResult::info("Info", self.diagnostic.description().to_string()),
+        ];
 
         if self.diagnostic == DiagnosticResult::NotTested {
             results.push(TestResult::info(

@@ -105,6 +105,7 @@ impl From<&TestResult> for ResultEntry {
 
 impl SessionReport {
     /// Create a new session report
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         start_time: Instant,
         total_events: u64,
