@@ -1,7 +1,7 @@
 //! Keyboard state tracking
 
 use super::{KeyCode, KeyEvent, KeyEventType};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// State of a single key
@@ -22,7 +22,7 @@ pub struct KeyState {
     /// Maximum press duration seen
     pub max_press_duration: Option<Duration>,
     /// Recent polling intervals for this key (for rate calculation)
-    pub recent_intervals_us: Vec<u64>,
+    pub recent_intervals_us: VecDeque<u64>,
 }
 
 impl Default for KeyState {
@@ -35,7 +35,7 @@ impl Default for KeyState {
             last_press_duration: None,
             min_press_duration: None,
             max_press_duration: None,
-            recent_intervals_us: Vec::with_capacity(100),
+            recent_intervals_us: VecDeque::with_capacity(100),
         }
     }
 }
@@ -66,10 +66,10 @@ impl KeyState {
 
     /// Add a polling interval measurement
     pub fn record_interval(&mut self, interval_us: u64) {
-        self.recent_intervals_us.push(interval_us);
+        self.recent_intervals_us.push_back(interval_us);
         // Keep only last 100 samples
         if self.recent_intervals_us.len() > 100 {
-            self.recent_intervals_us.remove(0);
+            self.recent_intervals_us.pop_front();
         }
     }
 }
@@ -85,7 +85,7 @@ pub struct KeyboardState {
     /// Total events processed
     total_events: u64,
     /// Global polling rate measurements
-    global_intervals_us: Vec<u64>,
+    global_intervals_us: VecDeque<u64>,
 }
 
 impl KeyboardState {
@@ -95,7 +95,7 @@ impl KeyboardState {
             pressed_keys: Vec::new(),
             max_simultaneous: 0,
             total_events: 0,
-            global_intervals_us: Vec::with_capacity(1000),
+            global_intervals_us: VecDeque::with_capacity(1000),
         }
     }
 
@@ -104,9 +104,9 @@ impl KeyboardState {
         self.total_events += 1;
 
         // Record global interval
-        self.global_intervals_us.push(event.delta_us);
+        self.global_intervals_us.push_back(event.delta_us);
         if self.global_intervals_us.len() > 1000 {
-            self.global_intervals_us.remove(0);
+            self.global_intervals_us.pop_front();
         }
 
         let key_state = self.keys.entry(event.key).or_default();
@@ -139,14 +139,16 @@ impl KeyboardState {
 
                     // Update min/max
                     key_state.min_press_duration = Some(
-                        key_state.min_press_duration
+                        key_state
+                            .min_press_duration
                             .map(|d| d.min(duration))
-                            .unwrap_or(duration)
+                            .unwrap_or(duration),
                     );
                     key_state.max_press_duration = Some(
-                        key_state.max_press_duration
+                        key_state
+                            .max_press_duration
                             .map(|d| d.max(duration))
-                            .unwrap_or(duration)
+                            .unwrap_or(duration),
                     );
                 }
 

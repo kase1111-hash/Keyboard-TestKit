@@ -1,6 +1,6 @@
 //! Polling rate test module
 
-use super::{KeyboardTest, TestResult, ResultStatus};
+use super::{KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{KeyEvent, KeyEventType};
 use crate::utils::MinMaxExt;
 use std::time::{Duration, Instant};
@@ -41,8 +41,8 @@ impl PollingRateTest {
         if self.intervals_us.is_empty() {
             return None;
         }
-        let avg_us: f64 = self.intervals_us.iter().sum::<u64>() as f64
-            / self.intervals_us.len() as f64;
+        let avg_us: f64 =
+            self.intervals_us.iter().sum::<u64>() as f64 / self.intervals_us.len() as f64;
         if avg_us > 0.0 {
             Some(1_000_000.0 / avg_us)
         } else {
@@ -66,12 +66,15 @@ impl PollingRateTest {
             return None;
         }
         let mean = self.intervals_us.iter().sum::<u64>() as f64 / self.intervals_us.len() as f64;
-        let variance = self.intervals_us.iter()
+        let variance = self
+            .intervals_us
+            .iter()
             .map(|&x| {
                 let diff = x as f64 - mean;
                 diff * diff
             })
-            .sum::<f64>() / self.intervals_us.len() as f64;
+            .sum::<f64>()
+            / self.intervals_us.len() as f64;
         Some(variance.sqrt())
     }
 
@@ -112,7 +115,8 @@ impl KeyboardTest for PollingRateTest {
             let interval_us = event.timestamp.duration_since(last).as_micros() as u64;
 
             // Filter out unreasonably large intervals (likely pauses in typing)
-            if interval_us < 100_000 { // Less than 100ms
+            if interval_us < 100_000 {
+                // Less than 100ms
                 self.intervals_us.push(interval_us);
                 self.min_interval_us.update_min(interval_us);
                 self.max_interval_us.update_max(interval_us);
@@ -134,10 +138,7 @@ impl KeyboardTest for PollingRateTest {
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
+        results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
             "Polling rate = how often",
             "keyboard sends data to PC",
@@ -251,7 +252,7 @@ mod tests {
     #[test]
     fn min_max_rate_calculation() {
         let mut test = PollingRateTest::new(10);
-        test.min_interval_us = Some(500);  // 2000 Hz
+        test.min_interval_us = Some(500); // 2000 Hz
         test.max_interval_us = Some(2000); // 500 Hz
 
         let max_rate = test.max_rate_hz().unwrap();

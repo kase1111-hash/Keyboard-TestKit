@@ -6,10 +6,10 @@
 //! - Key remapping validation
 //! - Unknown/unmapped key detection
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
-use crate::keyboard::remap::{KeyRemapper, RemapResult, FnKeyMode, RemapStats};
-use std::collections::HashMap;
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::remap::{FnKeyMode, KeyRemapper, RemapResult, RemapStats};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 /// Record of an OEM key event
@@ -38,7 +38,7 @@ pub struct OemKeyTest {
     /// Remapping statistics
     stats: RemapStats,
     /// History of OEM key events
-    oem_events: Vec<OemKeyEvent>,
+    oem_events: VecDeque<OemKeyEvent>,
     /// Detected OEM keys with press counts
     detected_oem_keys: HashMap<u16, u32>,
     /// Detected unknown keys (not in keymap)
@@ -62,7 +62,7 @@ impl OemKeyTest {
         Self {
             remapper: KeyRemapper::new(),
             stats: RemapStats::new(),
-            oem_events: Vec::new(),
+            oem_events: VecDeque::new(),
             detected_oem_keys: HashMap::new(),
             detected_unknown: HashMap::new(),
             fn_press_count: 0,
@@ -205,11 +205,11 @@ impl OemKeyTest {
                 self.last_oem_key = Some(oem_event.clone());
             }
 
-            self.oem_events.push(oem_event);
+            self.oem_events.push_back(oem_event);
 
             // Keep only last 100 events
             if self.oem_events.len() > 100 {
-                self.oem_events.remove(0);
+                self.oem_events.pop_front();
             }
         }
     }
@@ -247,7 +247,9 @@ impl KeyboardTest for OemKeyTest {
         }
 
         // Process through remapper
-        let result = self.remapper.process_key(event.key, event.event_type == KeyEventType::Press);
+        let result = self
+            .remapper
+            .process_key(event.key, event.event_type == KeyEventType::Press);
         self.stats.record(&result);
 
         // Record the event
@@ -277,14 +279,15 @@ impl KeyboardTest for OemKeyTest {
         };
         results.push(TestResult::new(
             "FN Key Held",
-            if self.remapper.is_fn_held() { "Yes" } else { "No" },
+            if self.remapper.is_fn_held() {
+                "Yes"
+            } else {
+                "No"
+            },
             fn_status,
         ));
 
-        results.push(TestResult::info(
-            "FN Mode",
-            self.fn_mode_display(),
-        ));
+        results.push(TestResult::info("FN Mode", self.fn_mode_display()));
 
         results.push(TestResult::info(
             "FN Presses",
@@ -309,10 +312,7 @@ impl KeyboardTest for OemKeyTest {
         results.push(TestResult::info("", ""));
 
         // OEM key statistics
-        results.push(TestResult::info(
-            "--- OEM Key Statistics ---",
-            "",
-        ));
+        results.push(TestResult::info("--- OEM Key Statistics ---", ""));
 
         results.push(TestResult::info(
             "OEM Keys Detected",
@@ -385,7 +385,10 @@ impl KeyboardTest for OemKeyTest {
         // Unknown keys detected (show scancodes for debugging)
         if !self.detected_unknown.is_empty() {
             results.push(TestResult::info("", ""));
-            results.push(TestResult::warning("--- Unknown Keys ---", "(add to FN scancodes?)"));
+            results.push(TestResult::warning(
+                "--- Unknown Keys ---",
+                "(add to FN scancodes?)",
+            ));
 
             let mut unknown: Vec<_> = self.detected_unknown.iter().collect();
             unknown.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count
@@ -423,27 +426,12 @@ impl KeyboardTest for OemKeyTest {
 
         // Help text
         results.push(TestResult::info("", ""));
-        results.push(TestResult::info(
-            "--- Controls ---",
-            "",
-        ));
-        results.push(TestResult::info(
-            "[a] Add last unknown",
-            "as FN scancode",
-        ));
-        results.push(TestResult::info(
-            "[f] Cycle FN mode",
-            "",
-        ));
-        results.push(TestResult::info(
-            "[c] Clear mappings",
-            "",
-        ));
+        results.push(TestResult::info("--- Controls ---", ""));
+        results.push(TestResult::info("[a] Add last unknown", "as FN scancode"));
+        results.push(TestResult::info("[f] Cycle FN mode", ""));
+        results.push(TestResult::info("[c] Clear mappings", ""));
         results.push(TestResult::info("", ""));
-        results.push(TestResult::info(
-            "--- Tips ---",
-            "",
-        ));
+        results.push(TestResult::info("--- Tips ---", ""));
         results.push(TestResult::info(
             "Press unknown keys to",
             "capture their scancodes",
@@ -478,7 +466,11 @@ mod tests {
     fn make_event(key: u16, pressed: bool) -> KeyEvent {
         KeyEvent::new(
             KeyCode::new(key),
-            if pressed { KeyEventType::Press } else { KeyEventType::Release },
+            if pressed {
+                KeyEventType::Press
+            } else {
+                KeyEventType::Release
+            },
             Instant::now(),
             1000,
         )
@@ -523,8 +515,8 @@ mod tests {
         assert!(test.last_fn_combo.is_some());
 
         let (from, to) = test.last_fn_combo.unwrap();
-        assert_eq!(from.as_u16(), 2);  // Key 1
-        assert_eq!(to.as_u16(), 59);   // F1
+        assert_eq!(from.as_u16(), 2); // Key 1
+        assert_eq!(to.as_u16(), 59); // F1
     }
 
     #[test]

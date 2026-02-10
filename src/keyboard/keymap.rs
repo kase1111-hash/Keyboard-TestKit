@@ -33,10 +33,7 @@ pub const KEY_RSUPER: KeyCode = KeyCode(126);
 
 /// All modifier key codes for easy iteration
 pub const MODIFIER_KEYS: &[KeyCode] = &[
-    KEY_LCTRL, KEY_RCTRL,
-    KEY_LSHIFT, KEY_RSHIFT,
-    KEY_LALT, KEY_RALT,
-    KEY_LSUPER, KEY_RSUPER,
+    KEY_LCTRL, KEY_RCTRL, KEY_LSHIFT, KEY_RSHIFT, KEY_LALT, KEY_RALT, KEY_LSUPER, KEY_RSUPER,
 ];
 
 /// Returns true if the given key code is a modifier key
@@ -53,10 +50,10 @@ pub fn is_modifier(key: KeyCode) -> bool {
 /// Fn key - commonly used scancode (vendor-specific, may vary)
 /// Note: The Fn key often doesn't generate a scancode at the OS level
 /// as it's typically handled in keyboard firmware. These are fallback codes.
-pub const KEY_FN: KeyCode = KeyCode(464);  // KEY_FN in Linux input.h
+pub const KEY_FN: KeyCode = KeyCode(464); // KEY_FN in Linux input.h
 
 /// Alternative Fn key scancode (some vendors use this)
-pub const KEY_FN_ALT: KeyCode = KeyCode(480);  // Alternate FN key code
+pub const KEY_FN_ALT: KeyCode = KeyCode(480); // Alternate FN key code
 
 /// Fn + Esc combination key (some keyboards)
 pub const KEY_FN_ESC: KeyCode = KeyCode(465);
@@ -131,15 +128,43 @@ pub const KEY_PAUSE: KeyCode = KeyCode(119);
 
 /// Collection of all known OEM/special key codes for iteration
 pub const OEM_KEYS: &[KeyCode] = &[
-    KEY_FN, KEY_FN_ALT, KEY_FN_ESC,
-    KEY_FN_F1, KEY_FN_F2, KEY_FN_F3, KEY_FN_F4, KEY_FN_F5, KEY_FN_F6,
-    KEY_FN_F7, KEY_FN_F8, KEY_FN_F9, KEY_FN_F10, KEY_FN_F11, KEY_FN_F12,
-    KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP,
-    KEY_PLAYPAUSE, KEY_STOPCD, KEY_PREVIOUSSONG, KEY_NEXTSONG,
-    KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP, KEY_SWITCHVIDEOMODE,
-    KEY_KBDILLUMTOGGLE, KEY_KBDILLUMDOWN, KEY_KBDILLUMUP,
-    KEY_WLAN, KEY_BLUETOOTH, KEY_TOUCHPAD_TOGGLE, KEY_CAMERA,
-    KEY_SLEEP, KEY_POWER, KEY_PRINT, KEY_SCROLLLOCK, KEY_PAUSE,
+    KEY_FN,
+    KEY_FN_ALT,
+    KEY_FN_ESC,
+    KEY_FN_F1,
+    KEY_FN_F2,
+    KEY_FN_F3,
+    KEY_FN_F4,
+    KEY_FN_F5,
+    KEY_FN_F6,
+    KEY_FN_F7,
+    KEY_FN_F8,
+    KEY_FN_F9,
+    KEY_FN_F10,
+    KEY_FN_F11,
+    KEY_FN_F12,
+    KEY_MUTE,
+    KEY_VOLUMEDOWN,
+    KEY_VOLUMEUP,
+    KEY_PLAYPAUSE,
+    KEY_STOPCD,
+    KEY_PREVIOUSSONG,
+    KEY_NEXTSONG,
+    KEY_BRIGHTNESSDOWN,
+    KEY_BRIGHTNESSUP,
+    KEY_SWITCHVIDEOMODE,
+    KEY_KBDILLUMTOGGLE,
+    KEY_KBDILLUMDOWN,
+    KEY_KBDILLUMUP,
+    KEY_WLAN,
+    KEY_BLUETOOTH,
+    KEY_TOUCHPAD_TOGGLE,
+    KEY_CAMERA,
+    KEY_SLEEP,
+    KEY_POWER,
+    KEY_PRINT,
+    KEY_SCROLLLOCK,
+    KEY_PAUSE,
 ];
 
 /// Returns true if the given key code is an OEM/special function key
@@ -149,10 +174,23 @@ pub fn is_oem_key(key: KeyCode) -> bool {
 
 /// Returns true if the given key code is an Fn-related key
 pub fn is_fn_key(key: KeyCode) -> bool {
-    matches!(key,
-        KEY_FN | KEY_FN_ALT | KEY_FN_ESC |
-        KEY_FN_F1 | KEY_FN_F2 | KEY_FN_F3 | KEY_FN_F4 | KEY_FN_F5 | KEY_FN_F6 |
-        KEY_FN_F7 | KEY_FN_F8 | KEY_FN_F9 | KEY_FN_F10 | KEY_FN_F11 | KEY_FN_F12
+    matches!(
+        key,
+        KEY_FN
+            | KEY_FN_ALT
+            | KEY_FN_ESC
+            | KEY_FN_F1
+            | KEY_FN_F2
+            | KEY_FN_F3
+            | KEY_FN_F4
+            | KEY_FN_F5
+            | KEY_FN_F6
+            | KEY_FN_F7
+            | KEY_FN_F8
+            | KEY_FN_F9
+            | KEY_FN_F10
+            | KEY_FN_F11
+            | KEY_FN_F12
     )
 }
 
@@ -303,7 +341,13 @@ pub struct KeyInfo {
 
 impl KeyInfo {
     const fn new(name: &'static str, label: &'static str, row: u8, col: u8, width: f32) -> Self {
-        Self { name, label, row, col, width }
+        Self {
+            name,
+            label,
+            row,
+            col,
+            width,
+        }
     }
 }
 
@@ -385,7 +429,10 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(51), KeyInfo::new("Comma", ",", 4, 8, 1.0));
     map.insert(KeyCode(52), KeyInfo::new("Period", ".", 4, 9, 1.0));
     map.insert(KeyCode(53), KeyInfo::new("Slash", "/", 4, 10, 1.0));
-    map.insert(KeyCode(54), KeyInfo::new("RightShift", "Shift", 4, 11, 2.75));
+    map.insert(
+        KeyCode(54),
+        KeyInfo::new("RightShift", "Shift", 4, 11, 2.75),
+    );
 
     // Bottom row (modifiers + space)
     map.insert(KeyCode(29), KeyInfo::new("LeftCtrl", "Ctrl", 5, 0, 1.25));
@@ -438,27 +485,54 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(163), KeyInfo::new("Next", "Next", 0, 23, 1.0));
 
     // Brightness keys
-    map.insert(KeyCode(224), KeyInfo::new("BrightnessDown", "Bri-", 0, 24, 1.0));
-    map.insert(KeyCode(225), KeyInfo::new("BrightnessUp", "Bri+", 0, 25, 1.0));
-    map.insert(KeyCode(227), KeyInfo::new("DisplaySwitch", "Disp", 0, 26, 1.0));
+    map.insert(
+        KeyCode(224),
+        KeyInfo::new("BrightnessDown", "Bri-", 0, 24, 1.0),
+    );
+    map.insert(
+        KeyCode(225),
+        KeyInfo::new("BrightnessUp", "Bri+", 0, 25, 1.0),
+    );
+    map.insert(
+        KeyCode(227),
+        KeyInfo::new("DisplaySwitch", "Disp", 0, 26, 1.0),
+    );
 
     // Keyboard backlight
-    map.insert(KeyCode(228), KeyInfo::new("KbdBacklightToggle", "KbdL", 0, 27, 1.0));
-    map.insert(KeyCode(229), KeyInfo::new("KbdBacklightDown", "Kbd-", 0, 28, 1.0));
-    map.insert(KeyCode(230), KeyInfo::new("KbdBacklightUp", "Kbd+", 0, 29, 1.0));
+    map.insert(
+        KeyCode(228),
+        KeyInfo::new("KbdBacklightToggle", "KbdL", 0, 27, 1.0),
+    );
+    map.insert(
+        KeyCode(229),
+        KeyInfo::new("KbdBacklightDown", "Kbd-", 0, 28, 1.0),
+    );
+    map.insert(
+        KeyCode(230),
+        KeyInfo::new("KbdBacklightUp", "Kbd+", 0, 29, 1.0),
+    );
 
     // Connectivity
     map.insert(KeyCode(238), KeyInfo::new("WiFiToggle", "WiFi", 0, 30, 1.0));
-    map.insert(KeyCode(237), KeyInfo::new("BluetoothToggle", "BT", 0, 31, 1.0));
+    map.insert(
+        KeyCode(237),
+        KeyInfo::new("BluetoothToggle", "BT", 0, 31, 1.0),
+    );
 
     // Other laptop keys
-    map.insert(KeyCode(530), KeyInfo::new("TouchpadToggle", "TPad", 0, 32, 1.0));
+    map.insert(
+        KeyCode(530),
+        KeyInfo::new("TouchpadToggle", "TPad", 0, 32, 1.0),
+    );
     map.insert(KeyCode(212), KeyInfo::new("Camera", "Cam", 0, 33, 1.0));
     map.insert(KeyCode(142), KeyInfo::new("Sleep", "Slp", 0, 34, 1.0));
     map.insert(KeyCode(116), KeyInfo::new("Power", "Pwr", 0, 35, 1.0));
 
     // Print, Scroll Lock, Pause
-    map.insert(KeyCode(99), KeyInfo::new("PrintScreen", "PrtSc", 1, 18, 1.0));
+    map.insert(
+        KeyCode(99),
+        KeyInfo::new("PrintScreen", "PrtSc", 1, 18, 1.0),
+    );
     map.insert(KeyCode(70), KeyInfo::new("ScrollLock", "ScrLk", 1, 19, 1.0));
     map.insert(KeyCode(119), KeyInfo::new("Pause", "Pause", 1, 20, 1.0));
 
@@ -472,9 +546,10 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
 
 /// Get key info by code, returns a default if not found
 pub fn get_key_info(code: KeyCode) -> KeyInfo {
-    KEYMAP.get(&code).cloned().unwrap_or_else(|| {
-        KeyInfo::new("Unknown", "?", 0, 0, 1.0)
-    })
+    KEYMAP
+        .get(&code)
+        .cloned()
+        .unwrap_or_else(|| KeyInfo::new("Unknown", "?", 0, 0, 1.0))
 }
 
 #[cfg(test)]
@@ -611,7 +686,7 @@ mod tests {
         assert!(KEYMAP.contains_key(&KeyCode(30))); // A
         assert!(KEYMAP.contains_key(&KeyCode(57))); // Space
         assert!(KEYMAP.contains_key(&KeyCode(28))); // Enter
-        assert!(KEYMAP.contains_key(&KeyCode(1)));  // Escape
+        assert!(KEYMAP.contains_key(&KeyCode(1))); // Escape
     }
 
     #[test]
@@ -705,6 +780,6 @@ mod tests {
         assert!(!is_modifier(KeyCode(30))); // A
         assert!(!is_modifier(KeyCode(57))); // Space
         assert!(!is_modifier(KeyCode(28))); // Enter
-        assert!(!is_modifier(KeyCode(1)));  // Escape
+        assert!(!is_modifier(KeyCode(1))); // Escape
     }
 }

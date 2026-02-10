@@ -8,7 +8,7 @@
 //! - **Stickiness Detection**: Identify stuck or unresponsive keys
 //! - **Bounce Detection**: Test key hold duration and detect mechanical bounce
 //! - **N-Key Rollover (NKRO)**: Measure simultaneous key capability and ghosting
-//! - **Latency Measurement**: Track input-to-system latency per-key and globally
+//! - **Event Timing**: Measure inter-event timing per-key and globally
 //! - **Virtual Keyboard Testing**: Compare physical vs virtual key events
 //!
 //! ## Architecture
@@ -35,12 +35,12 @@
 //! // Process events and track statistics...
 //! ```
 
+pub mod config;
 pub mod keyboard;
+pub mod report;
 pub mod tests;
 pub mod ui;
-pub mod config;
-pub mod report;
 pub mod utils;
 
-pub use config::{Config, ConfigError, config_path};
+pub use config::{config_path, Config, ConfigError};
 pub use report::SessionReport;

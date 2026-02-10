@@ -25,7 +25,7 @@
 //! ```
 
 use crate::keyboard::KeyboardState;
-use crate::tests::{TestResult, ResultStatus};
+use crate::tests::{ResultStatus, TestResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
@@ -76,7 +76,10 @@ pub struct TestResults {
     pub hold_release: Vec<ResultEntry>,
     pub stickiness: Vec<ResultEntry>,
     pub rollover: Vec<ResultEntry>,
-    pub latency: Vec<ResultEntry>,
+    pub event_timing: Vec<ResultEntry>,
+    pub shortcuts: Vec<ResultEntry>,
+    pub virtual_detect: Vec<ResultEntry>,
+    pub oem_keys: Vec<ResultEntry>,
 }
 
 /// Single result entry
@@ -103,34 +106,45 @@ impl From<&TestResult> for ResultEntry {
     }
 }
 
+/// Input to `SessionReport::new` — bundles all test results to avoid long arg lists
+pub struct ReportInput {
+    pub start_time: Instant,
+    pub total_events: u64,
+    pub polling: Vec<TestResult>,
+    pub hold_release: Vec<TestResult>,
+    pub stickiness: Vec<TestResult>,
+    pub rollover: Vec<TestResult>,
+    pub event_timing: Vec<TestResult>,
+    pub shortcuts: Vec<TestResult>,
+    pub virtual_detect: Vec<TestResult>,
+    pub oem_keys: Vec<TestResult>,
+}
+
 impl SessionReport {
-    /// Create a new session report
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        start_time: Instant,
-        total_events: u64,
-        keyboard_state: &KeyboardState,
-        polling_results: Vec<TestResult>,
-        hold_release_results: Vec<TestResult>,
-        stickiness_results: Vec<TestResult>,
-        rollover_results: Vec<TestResult>,
-        latency_results: Vec<TestResult>,
-    ) -> Self {
-        let duration_secs = start_time.elapsed().as_secs_f64();
+    /// Create a new session report from all 8 test results
+    pub fn new(input: ReportInput, keyboard_state: &KeyboardState) -> Self {
+        let duration_secs = input.start_time.elapsed().as_secs_f64();
         let now: DateTime<Utc> = Utc::now();
 
         // Count issues (warnings and errors)
         let count_issues = |results: &[TestResult]| -> u32 {
-            results.iter().filter(|r| {
-                matches!(r.status, ResultStatus::Warning | ResultStatus::Error)
-            }).count() as u32
+            results
+                .iter()
+                .filter(|r| matches!(r.status, ResultStatus::Warning | ResultStatus::Error))
+                .count() as u32
         };
 
-        let issues = count_issues(&polling_results)
-            + count_issues(&hold_release_results)
-            + count_issues(&stickiness_results)
-            + count_issues(&rollover_results)
-            + count_issues(&latency_results);
+        let all_results: [&[TestResult]; 8] = [
+            &input.polling,
+            &input.hold_release,
+            &input.stickiness,
+            &input.rollover,
+            &input.event_timing,
+            &input.shortcuts,
+            &input.virtual_detect,
+            &input.oem_keys,
+        ];
+        let issues: u32 = all_results.iter().map(|r| count_issues(r)).sum();
 
         Self {
             metadata: ReportMetadata {
@@ -139,17 +153,20 @@ impl SessionReport {
                 duration_secs,
             },
             summary: SessionSummary {
-                total_events,
+                total_events: input.total_events,
                 max_rollover: keyboard_state.max_rollover(),
                 estimated_polling_rate_hz: keyboard_state.global_polling_rate_hz(),
                 issues_detected: issues,
             },
             tests: TestResults {
-                polling: polling_results.iter().map(ResultEntry::from).collect(),
-                hold_release: hold_release_results.iter().map(ResultEntry::from).collect(),
-                stickiness: stickiness_results.iter().map(ResultEntry::from).collect(),
-                rollover: rollover_results.iter().map(ResultEntry::from).collect(),
-                latency: latency_results.iter().map(ResultEntry::from).collect(),
+                polling: input.polling.iter().map(ResultEntry::from).collect(),
+                hold_release: input.hold_release.iter().map(ResultEntry::from).collect(),
+                stickiness: input.stickiness.iter().map(ResultEntry::from).collect(),
+                rollover: input.rollover.iter().map(ResultEntry::from).collect(),
+                event_timing: input.event_timing.iter().map(ResultEntry::from).collect(),
+                shortcuts: input.shortcuts.iter().map(ResultEntry::from).collect(),
+                virtual_detect: input.virtual_detect.iter().map(ResultEntry::from).collect(),
+                oem_keys: input.oem_keys.iter().map(ResultEntry::from).collect(),
             },
         }
     }
@@ -203,7 +220,10 @@ impl SessionReport {
         write_results(&mut csv, "Hold/Release", &self.tests.hold_release);
         write_results(&mut csv, "Stickiness", &self.tests.stickiness);
         write_results(&mut csv, "Rollover", &self.tests.rollover);
-        write_results(&mut csv, "Latency", &self.tests.latency);
+        write_results(&mut csv, "Event Timing", &self.tests.event_timing);
+        write_results(&mut csv, "Shortcuts", &self.tests.shortcuts);
+        write_results(&mut csv, "Virtual Detect", &self.tests.virtual_detect);
+        write_results(&mut csv, "OEM Keys", &self.tests.oem_keys);
 
         csv
     }
@@ -262,7 +282,10 @@ impl SessionReport {
         Self::write_markdown_section(&mut md, "Hold/Release", &self.tests.hold_release);
         Self::write_markdown_section(&mut md, "Stickiness", &self.tests.stickiness);
         Self::write_markdown_section(&mut md, "Rollover", &self.tests.rollover);
-        Self::write_markdown_section(&mut md, "Latency", &self.tests.latency);
+        Self::write_markdown_section(&mut md, "Event Timing", &self.tests.event_timing);
+        Self::write_markdown_section(&mut md, "Shortcuts", &self.tests.shortcuts);
+        Self::write_markdown_section(&mut md, "Virtual Detect", &self.tests.virtual_detect);
+        Self::write_markdown_section(&mut md, "OEM Keys", &self.tests.oem_keys);
 
         md
     }
@@ -283,7 +306,12 @@ impl SessionReport {
                 "error" => "❌",
                 _ => "ℹ️",
             };
-            writeln!(md, "| {} | {} | {} |", entry.label, entry.value, status_emoji).unwrap();
+            writeln!(
+                md,
+                "| {} | {} | {} |",
+                entry.label, entry.value, status_emoji
+            )
+            .unwrap();
         }
         writeln!(md).unwrap();
     }
@@ -311,7 +339,12 @@ impl SessionReport {
         // Metadata
         writeln!(text, "Generated: {}", self.metadata.generated_at).unwrap();
         writeln!(text, "Version:   {}", self.metadata.version).unwrap();
-        writeln!(text, "Duration:  {:.1} seconds\n", self.metadata.duration_secs).unwrap();
+        writeln!(
+            text,
+            "Duration:  {:.1} seconds\n",
+            self.metadata.duration_secs
+        )
+        .unwrap();
 
         // Summary
         writeln!(text, "SUMMARY").unwrap();
@@ -328,7 +361,10 @@ impl SessionReport {
         Self::write_text_section(&mut text, "HOLD/RELEASE", &self.tests.hold_release);
         Self::write_text_section(&mut text, "STICKINESS", &self.tests.stickiness);
         Self::write_text_section(&mut text, "ROLLOVER", &self.tests.rollover);
-        Self::write_text_section(&mut text, "LATENCY", &self.tests.latency);
+        Self::write_text_section(&mut text, "EVENT TIMING", &self.tests.event_timing);
+        Self::write_text_section(&mut text, "SHORTCUTS", &self.tests.shortcuts);
+        Self::write_text_section(&mut text, "VIRTUAL DETECT", &self.tests.virtual_detect);
+        Self::write_text_section(&mut text, "OEM KEYS", &self.tests.oem_keys);
 
         text
     }
@@ -348,7 +384,12 @@ impl SessionReport {
                 "error" => "[ERR]",
                 _ => "[INFO]",
             };
-            writeln!(text, "  {:<30} {:>20}  {}", entry.label, entry.value, status).unwrap();
+            writeln!(
+                text,
+                "  {:<30} {:>20}  {}",
+                entry.label, entry.value, status
+            )
+            .unwrap();
         }
         writeln!(text).unwrap();
     }
@@ -386,14 +427,15 @@ mod tests {
                 ],
                 hold_release: vec![],
                 stickiness: vec![],
-                rollover: vec![
-                    ResultEntry {
-                        label: "Max Rollover".to_string(),
-                        value: "6KRO".to_string(),
-                        status: "ok".to_string(),
-                    },
-                ],
-                latency: vec![],
+                rollover: vec![ResultEntry {
+                    label: "Max Rollover".to_string(),
+                    value: "6KRO".to_string(),
+                    status: "ok".to_string(),
+                }],
+                event_timing: vec![],
+                shortcuts: vec![],
+                virtual_detect: vec![],
+                oem_keys: vec![],
             },
         }
     }

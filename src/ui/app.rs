@@ -1,13 +1,13 @@
 //! Main application state and logic
 
 use crate::config::Config;
-use crate::keyboard::{KeyboardState, KeyEvent};
 use crate::keyboard::remap::FnKeyMode;
+use crate::keyboard::{KeyEvent, KeyboardState};
+use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
-    KeyboardTest, PollingRateTest, StickinessTest, RolloverTest, LatencyTest,
-    HoldReleaseTest, ShortcutTest, VirtualKeyboardTest, OemKeyTest, TestResult,
+    EventTimingTest, HoldReleaseTest, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest,
+    ShortcutTest, StickinessTest, TestResult, VirtualKeyboardTest,
 };
-use crate::report::SessionReport;
 use std::path::Path;
 use std::time::Instant;
 
@@ -34,7 +34,7 @@ impl AppView {
             Self::HoldRelease => "Bounce",
             Self::Stickiness => "Sticky",
             Self::Rollover => "NKRO",
-            Self::Latency => "Latency",
+            Self::Latency => "Timing",
             Self::Shortcuts => "Shortcuts",
             Self::Virtual => "Virtual",
             Self::OemKeys => "OEM/FN",
@@ -115,7 +115,7 @@ pub struct App {
     /// Rollover test
     pub rollover_test: RolloverTest,
     /// Latency test
-    pub latency_test: LatencyTest,
+    pub event_timing_test: EventTimingTest,
     /// Shortcut detection test
     pub shortcut_test: ShortcutTest,
     /// Virtual keyboard detection test
@@ -138,14 +138,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         // Set up OEM test with config settings
         let mut oem_test = OemKeyTest::new();
-        let fn_mode = match config.oem_keys.fn_mode {
-            crate::config::FnKeyMode::Disabled => FnKeyMode::Disabled,
-            crate::config::FnKeyMode::CaptureOnly => FnKeyMode::CaptureOnly,
-            crate::config::FnKeyMode::RestoreWithModifier => FnKeyMode::RestoreWithModifier,
-            crate::config::FnKeyMode::MapToFKeys => FnKeyMode::MapToFKeys,
-            crate::config::FnKeyMode::MapToMedia => FnKeyMode::MapToMedia,
-        };
-        oem_test.set_fn_mode(fn_mode);
+        oem_test.set_fn_mode(config.oem_keys.fn_mode);
 
         // Load custom FN scancodes
         for scancode in &config.oem_keys.fn_scancodes {
@@ -171,7 +164,7 @@ impl App {
             hold_release_test: HoldReleaseTest::new(config.hold_release.bounce_window_ms),
             stickiness_test: StickinessTest::new(config.stickiness.stuck_threshold_ms),
             rollover_test: RolloverTest::new(),
-            latency_test: LatencyTest::new(),
+            event_timing_test: EventTimingTest::new(),
             shortcut_test: ShortcutTest::new(),
             virtual_test: VirtualKeyboardTest::new(),
             oem_test,
@@ -197,7 +190,7 @@ impl App {
         self.hold_release_test.process_event(event);
         self.stickiness_test.process_event(event);
         self.rollover_test.process_event(event);
-        self.latency_test.process_event(event);
+        self.event_timing_test.process_event(event);
         self.shortcut_test.process_event(event);
         self.virtual_test.process_event(event);
         self.oem_test.process_event(event);
@@ -264,7 +257,7 @@ impl App {
         self.hold_release_test.reset();
         self.stickiness_test.reset();
         self.rollover_test.reset();
-        self.latency_test.reset();
+        self.event_timing_test.reset();
         self.shortcut_test.reset();
         self.virtual_test.reset();
         self.oem_test.reset();
@@ -292,7 +285,7 @@ impl App {
                 self.set_status("Rollover test reset".to_string());
             }
             AppView::Latency => {
-                self.latency_test.reset();
+                self.event_timing_test.reset();
                 self.set_status("Latency test reset".to_string());
             }
             AppView::Shortcuts => {
@@ -333,7 +326,7 @@ impl App {
             AppView::HoldRelease => self.hold_release_test.get_results(),
             AppView::Stickiness => self.stickiness_test.get_results(),
             AppView::Rollover => self.rollover_test.get_results(),
-            AppView::Latency => self.latency_test.get_results(),
+            AppView::Latency => self.event_timing_test.get_results(),
             AppView::Shortcuts => self.shortcut_test.get_results(),
             AppView::Virtual => self.virtual_test.get_results(),
             AppView::OemKeys => self.oem_test.get_results(),
@@ -386,14 +379,19 @@ impl App {
     /// Generate a session report
     pub fn generate_report(&self) -> SessionReport {
         SessionReport::new(
-            self.start_time,
-            self.total_events,
+            ReportInput {
+                start_time: self.start_time,
+                total_events: self.total_events,
+                polling: self.polling_test.get_results(),
+                hold_release: self.hold_release_test.get_results(),
+                stickiness: self.stickiness_test.get_results(),
+                rollover: self.rollover_test.get_results(),
+                event_timing: self.event_timing_test.get_results(),
+                shortcuts: self.shortcut_test.get_results(),
+                virtual_detect: self.virtual_test.get_results(),
+                oem_keys: self.oem_test.get_results(),
+            },
             &self.keyboard_state,
-            self.polling_test.get_results(),
-            self.hold_release_test.get_results(),
-            self.stickiness_test.get_results(),
-            self.rollover_test.get_results(),
-            self.latency_test.get_results(),
         )
     }
 
@@ -459,5 +457,234 @@ impl App {
 impl Default for App {
     fn default() -> Self {
         Self::new(Config::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard::{KeyCode, KeyEvent, KeyEventType};
+    use crate::tests::KeyboardTest;
+    use std::time::Instant;
+
+    fn press(key: u16, delta_us: u64) -> KeyEvent {
+        KeyEvent::new(KeyCode(key), KeyEventType::Press, Instant::now(), delta_us)
+    }
+
+    fn release(key: u16, delta_us: u64) -> KeyEvent {
+        KeyEvent::new(
+            KeyCode(key),
+            KeyEventType::Release,
+            Instant::now(),
+            delta_us,
+        )
+    }
+
+    #[test]
+    fn app_new_default_state() {
+        let app = App::default();
+        assert_eq!(app.view, AppView::Dashboard);
+        assert_eq!(app.state, AppState::Running);
+        assert_eq!(app.total_events, 0);
+        assert!(app.shortcuts_enabled);
+    }
+
+    #[test]
+    fn app_process_event_distributes_to_all_tests() {
+        let mut app = App::default();
+
+        // Send a key press through the whole pipeline
+        app.process_event(&press(30, 1000)); // Key 'A'
+        assert_eq!(app.total_events, 1);
+
+        // Verify it reached the keyboard state tracker
+        assert_eq!(app.keyboard_state.current_rollover(), 1);
+
+        // Verify it reached the rollover test
+        assert_eq!(app.rollover_test.current_count(), 1);
+
+        // Send release
+        app.process_event(&release(30, 1000));
+        assert_eq!(app.total_events, 2);
+        assert_eq!(app.keyboard_state.current_rollover(), 0);
+    }
+
+    #[test]
+    fn app_paused_ignores_events() {
+        let mut app = App::default();
+        app.toggle_pause();
+        assert_eq!(app.state, AppState::Paused);
+
+        app.process_event(&press(30, 1000));
+        assert_eq!(app.total_events, 0); // Event ignored
+    }
+
+    #[test]
+    fn app_resume_accepts_events() {
+        let mut app = App::default();
+        app.toggle_pause();
+        app.toggle_pause(); // Resume
+        assert_eq!(app.state, AppState::Running);
+
+        app.process_event(&press(30, 1000));
+        assert_eq!(app.total_events, 1);
+    }
+
+    #[test]
+    fn app_reset_all_clears_state() {
+        let mut app = App::default();
+        app.process_event(&press(30, 1000));
+        app.process_event(&press(31, 1000));
+        assert_eq!(app.total_events, 2);
+
+        app.reset_all();
+        assert_eq!(app.total_events, 0);
+        assert_eq!(app.keyboard_state.current_rollover(), 0);
+    }
+
+    #[test]
+    fn app_view_navigation() {
+        let mut app = App::default();
+        assert_eq!(app.view, AppView::Dashboard);
+
+        app.next_view();
+        assert_eq!(app.view, AppView::PollingRate);
+
+        app.next_view();
+        assert_eq!(app.view, AppView::HoldRelease);
+
+        app.prev_view();
+        assert_eq!(app.view, AppView::PollingRate);
+    }
+
+    #[test]
+    fn app_view_navigation_wraps() {
+        let mut app = App::default();
+        app.prev_view(); // Wrap from Dashboard to Help
+        assert_eq!(app.view, AppView::Help);
+
+        app.next_view(); // Wrap from Help to Dashboard
+        assert_eq!(app.view, AppView::Dashboard);
+    }
+
+    #[test]
+    fn app_quit() {
+        let mut app = App::default();
+        app.quit();
+        assert_eq!(app.state, AppState::Quitting);
+    }
+
+    #[test]
+    fn app_multi_key_rollover_tracking() {
+        let mut app = App::default();
+
+        // Press 4 keys simultaneously
+        app.process_event(&press(30, 1000)); // A
+        app.process_event(&press(31, 1000)); // S
+        app.process_event(&press(32, 1000)); // D
+        app.process_event(&press(33, 1000)); // F
+
+        assert_eq!(app.keyboard_state.max_rollover(), 4);
+        assert_eq!(app.rollover_test.max_rollover(), 4);
+
+        // Release all
+        app.process_event(&release(30, 1000));
+        app.process_event(&release(31, 1000));
+        app.process_event(&release(32, 1000));
+        app.process_event(&release(33, 1000));
+
+        assert_eq!(app.keyboard_state.current_rollover(), 0);
+        assert_eq!(app.keyboard_state.max_rollover(), 4); // Max preserved
+    }
+
+    #[test]
+    fn app_event_timing_receives_events() {
+        let mut app = App::default();
+
+        app.process_event(&press(30, 5000)); // 5ms interval
+        app.process_event(&press(31, 3000)); // 3ms interval
+
+        let results = app.event_timing_test.get_results();
+        // Should have results (at least headers + samples)
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn app_generate_report_includes_all_tests() {
+        let mut app = App::default();
+        app.process_event(&press(30, 1000));
+        app.process_event(&release(30, 1000));
+
+        let report = app.generate_report();
+        assert_eq!(report.summary.total_events, 2);
+
+        // Report should have entries for all 8 tests
+        // (they may be empty if no relevant events occurred for that test type)
+        let json = report.to_json().expect("Failed to serialize");
+        assert!(json.contains("\"polling\""));
+        assert!(json.contains("\"hold_release\""));
+        assert!(json.contains("\"stickiness\""));
+        assert!(json.contains("\"rollover\""));
+        assert!(json.contains("\"event_timing\""));
+        assert!(json.contains("\"shortcuts\""));
+        assert!(json.contains("\"virtual_detect\""));
+        assert!(json.contains("\"oem_keys\""));
+    }
+
+    #[test]
+    fn app_reset_current_only_resets_active_view() {
+        let mut app = App::default();
+
+        // Process events
+        app.process_event(&press(30, 1000));
+        app.process_event(&release(30, 1000));
+        assert_eq!(app.total_events, 2);
+
+        // Switch to Rollover view and reset just that test
+        app.view = AppView::Rollover;
+        app.reset_current();
+
+        // Rollover test should be reset
+        assert_eq!(app.rollover_test.max_rollover(), 0);
+
+        // But other tests should retain their state
+        assert_eq!(app.total_events, 2); // Total events unchanged
+    }
+
+    #[test]
+    fn app_toggle_shortcuts() {
+        let mut app = App::default();
+        assert!(app.shortcuts_enabled);
+
+        app.toggle_shortcuts();
+        assert!(!app.shortcuts_enabled);
+
+        app.toggle_shortcuts();
+        assert!(app.shortcuts_enabled);
+    }
+
+    #[test]
+    fn app_status_message() {
+        let mut app = App::default();
+        assert!(app.status_message.is_none());
+
+        app.set_status("Test message".to_string());
+        assert_eq!(app.status_message.as_deref(), Some("Test message"));
+        assert!(app.status_time.is_some());
+    }
+
+    #[test]
+    fn app_shortcut_detection_via_pipeline() {
+        let mut app = App::default();
+
+        // Press Ctrl (scancode 29 = Left Ctrl)
+        app.process_event(&press(29, 1000));
+        // Press C (scancode 46 = C)
+        app.process_event(&press(46, 1000));
+
+        // Shortcut test should have detected Ctrl+C
+        let results = app.shortcut_test.get_results();
+        let labels: Vec<&str> = results.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"Total Shortcuts"));
     }
 }

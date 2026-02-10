@@ -68,14 +68,22 @@ impl<'a> Widget for ResultsPanel<'a> {
                     inner.x + 1,
                     y,
                     text,
-                    Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD),
                 );
             } else if !result.label.is_empty() || !result.value.is_empty() {
                 let (color, sym) = Self::status_style(result.status);
                 let line = Line::from(vec![
                     Span::styled(format!(" {} ", sym), Style::default().fg(color)),
-                    Span::styled(format!("{:<18}", result.label), Style::default().fg(palette::FG)),
-                    Span::styled(&result.value, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:<18}", result.label),
+                        Style::default().fg(palette::FG),
+                    ),
+                    Span::styled(
+                        &result.value,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
                 ]);
                 buf.set_line(inner.x, y, &line, inner.width);
             }
@@ -109,31 +117,83 @@ impl Widget for HelpPanel {
         let mut y = inner.y;
         for (line, color) in &logo {
             if y < inner.y + inner.height {
-                buf.set_string(inner.x, y, line, Style::default().fg(*color).add_modifier(Modifier::BOLD));
+                buf.set_string(
+                    inner.x,
+                    y,
+                    line,
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                );
                 y += 1;
             }
         }
 
         let sections = [
-            ("NAV", &[("Tab", "Switch view"), ("1-0", "Jump to view"), ("m", "Toggle shortcuts"), ("q", "Quit")][..]),
-            ("CTL", &[("Space", "Pause"), ("r/R", "Reset"), ("e", "Export"), ("?", "Help")][..]),
-            ("TESTS", &[
-                ("1", "Dashboard"), ("2", "Polling"), ("3", "Bounce"), ("4", "Sticky"),
-                ("5", "NKRO"), ("6", "Latency"), ("7", "Shortcuts"), ("8", "Virtual"),
-                ("9", "OEM/FN"), ("0", "Help"),
-            ][..]),
-            ("OEM", &[("a", "Add FN scancode"), ("f", "Cycle FN mode"), ("c", "Clear mappings")][..]),
+            (
+                "NAV",
+                &[
+                    ("Tab", "Switch view"),
+                    ("1-0", "Jump to view"),
+                    ("m", "Toggle shortcuts"),
+                    ("q", "Quit"),
+                ][..],
+            ),
+            (
+                "CTL",
+                &[
+                    ("Space", "Pause"),
+                    ("r/R", "Reset"),
+                    ("e", "Export"),
+                    ("?", "Help"),
+                ][..],
+            ),
+            (
+                "TESTS",
+                &[
+                    ("1", "Dashboard"),
+                    ("2", "Polling"),
+                    ("3", "Bounce"),
+                    ("4", "Sticky"),
+                    ("5", "NKRO"),
+                    ("6", "Latency"),
+                    ("7", "Shortcuts"),
+                    ("8", "Virtual"),
+                    ("9", "OEM/FN"),
+                    ("0", "Help"),
+                ][..],
+            ),
+            (
+                "OEM",
+                &[
+                    ("a", "Add FN scancode"),
+                    ("f", "Cycle FN mode"),
+                    ("c", "Clear mappings"),
+                ][..],
+            ),
         ];
 
         for (header, items) in &sections {
-            if y >= inner.y + inner.height { break; }
-            buf.set_string(inner.x + 2, y, *header, Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD));
+            if y >= inner.y + inner.height {
+                break;
+            }
+            buf.set_string(
+                inner.x + 2,
+                y,
+                *header,
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            );
             y += 1;
 
             for (key, desc) in *items {
-                if y >= inner.y + inner.height { break; }
+                if y >= inner.y + inner.height {
+                    break;
+                }
                 let line = Line::from(vec![
-                    Span::styled(format!("  {:<8}", key), Style::default().fg(palette::YELLOW)),
+                    Span::styled(
+                        format!("  {:<8}", key),
+                        Style::default().fg(palette::YELLOW),
+                    ),
                     Span::styled(*desc, Style::default().fg(palette::DIM)),
                 ]);
                 buf.set_line(inner.x, y, &line, inner.width);
@@ -155,7 +215,13 @@ pub struct StatusBar<'a> {
 
 impl<'a> StatusBar<'a> {
     pub fn new(state: &'a str, view: &'a str, elapsed: &'a str, events: u64) -> Self {
-        Self { state, view, elapsed, events, message: None }
+        Self {
+            state,
+            view,
+            elapsed,
+            events,
+            message: None,
+        }
     }
 
     pub fn message(mut self, message: Option<&'a str>) -> Self {
@@ -177,14 +243,24 @@ impl<'a> Widget for StatusBar<'a> {
             ("▪", palette::YELLOW)
         };
 
-        buf.set_string(area.x + 1, area.y, icon, Style::default().bg(palette::BG).fg(color));
+        buf.set_string(
+            area.x + 1,
+            area.y,
+            icon,
+            Style::default().bg(palette::BG).fg(color),
+        );
 
         let left = format!(" {} │ {}", self.state, self.view);
         buf.set_string(area.x + 2, area.y, &left, bg.add_modifier(Modifier::BOLD));
 
         if let Some(msg) = self.message {
             let x = area.x + (area.width / 2).saturating_sub(msg.len() as u16 / 2);
-            buf.set_string(x, area.y, msg, Style::default().bg(palette::BG).fg(palette::YELLOW));
+            buf.set_string(
+                x,
+                area.y,
+                msg,
+                Style::default().bg(palette::BG).fg(palette::YELLOW),
+            );
         }
 
         let right = format!("{} │ {} ", self.elapsed, self.events);
@@ -216,13 +292,19 @@ impl<'a> Widget for TabBar<'a> {
         for (i, tab) in self.tabs.iter().enumerate() {
             let sel = i == self.selected;
             let style = if sel {
-                Style::default().fg(palette::CYAN).bg(palette::BG).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(palette::CYAN)
+                    .bg(palette::BG)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(palette::DIM).bg(palette::BG)
             };
 
             let num_style = if sel {
-                Style::default().fg(palette::YELLOW).bg(palette::BG).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(palette::YELLOW)
+                    .bg(palette::BG)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(palette::DIM).bg(palette::BG)
             };

@@ -1,7 +1,7 @@
 //! N-Key Rollover and Ghosting test module
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -151,10 +151,7 @@ impl KeyboardTest for RolloverTest {
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
+        results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
             "N-Key Rollover = max keys",
             "pressed simultaneously",
@@ -218,14 +215,12 @@ impl KeyboardTest for RolloverTest {
 
         // Currently pressed key names
         if !self.pressed_keys.is_empty() {
-            let key_names: Vec<String> = self.pressed_keys
+            let key_names: Vec<String> = self
+                .pressed_keys
                 .iter()
                 .map(|k| keymap::get_key_info(*k).label.to_string())
                 .collect();
-            results.push(TestResult::info(
-                "Active Keys",
-                key_names.join(" + "),
-            ));
+            results.push(TestResult::info("Active Keys", key_names.join(" + ")));
         }
 
         results.push(TestResult::info(

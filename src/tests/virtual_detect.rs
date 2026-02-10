@@ -7,9 +7,9 @@
 //! Note: Virtual key sending requires the 'virtual-send' feature and
 //! appropriate system libraries (libxdo on Linux, etc.)
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
-use std::collections::{VecDeque, HashMap};
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Thresholds for virtual input detection
@@ -53,11 +53,11 @@ impl InputClassification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticResult {
     NotTested,
-    NotAvailable,         // Virtual sending not compiled in
-    KeyboardOk,           // Physical works + Virtual works
-    HardwareIssue,        // Physical fails + Virtual works
-    SoftwareIssue,        // Physical fails + Virtual fails
-    ApiIssue,             // Physical works + Virtual fails
+    NotAvailable,  // Virtual sending not compiled in
+    KeyboardOk,    // Physical works + Virtual works
+    HardwareIssue, // Physical fails + Virtual works
+    SoftwareIssue, // Physical fails + Virtual fails
+    ApiIssue,      // Physical works + Virtual fails
 }
 
 impl DiagnosticResult {
@@ -135,9 +135,7 @@ pub struct VirtualKeySender {
 #[cfg(feature = "virtual-send")]
 impl VirtualKeySender {
     pub fn new() -> Self {
-        Self {
-            last_error: None,
-        }
+        Self { last_error: None }
     }
 
     /// Send a virtual key press and release
@@ -145,17 +143,19 @@ impl VirtualKeySender {
         use enigo::{Enigo, Keyboard, Settings};
         use std::thread;
 
-        let mut enigo = Enigo::new(&Settings::default())
-            .map_err(|e| format!("Failed to init: {}", e))?;
+        let mut enigo =
+            Enigo::new(&Settings::default()).map_err(|e| format!("Failed to init: {}", e))?;
 
         thread::sleep(Duration::from_millis(10));
 
-        enigo.key(enigo::Key::Unicode(key), enigo::Direction::Press)
+        enigo
+            .key(enigo::Key::Unicode(key), enigo::Direction::Press)
             .map_err(|e| format!("Press failed: {}", e))?;
 
         thread::sleep(Duration::from_millis(20));
 
-        enigo.key(enigo::Key::Unicode(key), enigo::Direction::Release)
+        enigo
+            .key(enigo::Key::Unicode(key), enigo::Direction::Release)
             .map_err(|e| format!("Release failed: {}", e))?;
 
         self.last_error = None;
@@ -225,7 +225,7 @@ pub struct VirtualKeyboardTest {
     /// Keystrokes classified as likely virtual
     virtual_count: u64,
     /// Detected anomalies
-    anomalies: Vec<AnomalyEvent>,
+    anomalies: VecDeque<AnomalyEvent>,
     /// Current session classification
     session_classification: InputClassification,
     /// Timing intervals for statistical analysis
@@ -275,7 +275,7 @@ impl VirtualKeyboardTest {
             last_keystroke: None,
             total_keystrokes: 0,
             virtual_count: 0,
-            anomalies: Vec::new(),
+            anomalies: VecDeque::new(),
             session_classification: InputClassification::Uncertain,
             intervals: VecDeque::with_capacity(ANALYSIS_WINDOW + 1),
             burst_window: VecDeque::new(),
@@ -359,9 +359,12 @@ impl VirtualKeyboardTest {
 
         if self.intervals.len() >= 5 {
             let mean: f64 = self.intervals.iter().sum::<f64>() / self.intervals.len() as f64;
-            let variance: f64 = self.intervals.iter()
+            let variance: f64 = self
+                .intervals
+                .iter()
                 .map(|x| (x - mean).powi(2))
-                .sum::<f64>() / self.intervals.len() as f64;
+                .sum::<f64>()
+                / self.intervals.len() as f64;
 
             self.interval_mean = mean;
             self.interval_variance = variance;
@@ -395,7 +398,11 @@ impl VirtualKeyboardTest {
 
         if self.burst_window.len() >= BURST_COUNT_THRESHOLD {
             self.record_anomaly(
-                format!("{} keys in {}ms window", self.burst_window.len(), BURST_WINDOW_MS),
+                format!(
+                    "{} keys in {}ms window",
+                    self.burst_window.len(),
+                    BURST_WINDOW_MS
+                ),
                 timestamp,
                 AnomalySeverity::High,
             );
@@ -406,21 +413,26 @@ impl VirtualKeyboardTest {
     }
 
     /// Record an anomaly
-    fn record_anomaly(&mut self, description: String, timestamp: Instant, severity: AnomalySeverity) {
-        if let Some(last) = self.anomalies.last() {
+    fn record_anomaly(
+        &mut self,
+        description: String,
+        timestamp: Instant,
+        severity: AnomalySeverity,
+    ) {
+        if let Some(last) = self.anomalies.back() {
             if timestamp.duration_since(last.timestamp) < Duration::from_millis(100) {
                 return;
             }
         }
 
-        self.anomalies.push(AnomalyEvent {
+        self.anomalies.push_back(AnomalyEvent {
             description,
             timestamp,
             severity,
         });
 
         if self.anomalies.len() > 50 {
-            self.anomalies.remove(0);
+            self.anomalies.pop_front();
         }
     }
 
@@ -432,7 +444,9 @@ impl VirtualKeyboardTest {
         }
 
         let virtual_ratio = self.virtual_count as f64 / self.total_keystrokes as f64;
-        let recent_anomalies = self.anomalies.iter()
+        let recent_anomalies = self
+            .anomalies
+            .iter()
             .filter(|a| a.timestamp.elapsed() < Duration::from_secs(5))
             .count();
 
@@ -530,9 +544,9 @@ impl KeyboardTest for VirtualKeyboardTest {
             self.update_diagnostic();
         }
 
-        let interval_ms = self.last_keystroke.map(|last| {
-            event.timestamp.duration_since(last).as_secs_f64() * 1000.0
-        });
+        let interval_ms = self
+            .last_keystroke
+            .map(|last| event.timestamp.duration_since(last).as_secs_f64() * 1000.0);
 
         self.last_interval_ms = interval_ms;
 
@@ -577,11 +591,18 @@ impl KeyboardTest for VirtualKeyboardTest {
             TestResult::info("--- What This Measures ---", ""),
             TestResult::info("Detects virtual/automated", "input vs physical keys"),
             TestResult::info("Diagnoses hardware vs", "software keyboard issues"),
-            TestResult::info("Look for: 'Physical' input,", "low suspicious %, no anomalies"),
+            TestResult::info(
+                "Look for: 'Physical' input,",
+                "low suspicious %, no anomalies",
+            ),
             TestResult::info("", ""),
             // Diagnostic section
             TestResult::info("=== DIAGNOSTIC TEST ===", ""),
-            TestResult::new("Status", self.diagnostic.as_str(), self.diagnostic.to_status()),
+            TestResult::new(
+                "Status",
+                self.diagnostic.as_str(),
+                self.diagnostic.to_status(),
+            ),
             TestResult::info("Info", self.diagnostic.description().to_string()),
         ];
 

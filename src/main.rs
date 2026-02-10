@@ -4,7 +4,9 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,19 +18,16 @@ use ratatui::{
     widgets::{Block, Borders},
     Terminal,
 };
-use std::{
-    io::stdout,
-    sync::mpsc,
-};
+use std::{io::stdout, sync::mpsc};
 
 use keyboard_testkit::{
     config::Config,
-    keyboard::{KeyboardListener, KeyEvent},
-    ui::{App, AppState, AppView, KeyboardVisual, ResultsPanel, StatusBar, TabBar, HelpPanel},
+    keyboard::{KeyEvent, KeyboardListener},
+    ui::{App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, StatusBar, TabBar},
 };
 
 #[cfg(target_os = "linux")]
-use keyboard_testkit::keyboard::{EvdevListener, evdev_status};
+use keyboard_testkit::keyboard::{evdev_status, EvdevListener};
 
 fn main() -> Result<()> {
     // Setup terminal
@@ -57,7 +56,9 @@ fn main() -> Result<()> {
                 Some(evdev)
             }
             None => {
-                app.set_status("Evdev unavailable - using fallback (limited OEM key support)".to_string());
+                app.set_status(
+                    "Evdev unavailable - using fallback (limited OEM key support)".to_string(),
+                );
                 None
             }
         }
@@ -99,10 +100,10 @@ fn main() -> Result<()> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),  // Tab bar
-                    Constraint::Length(7),  // Keyboard visual
-                    Constraint::Min(10),    // Main content
-                    Constraint::Length(1),  // Status bar
+                    Constraint::Length(1), // Tab bar
+                    Constraint::Length(7), // Keyboard visual
+                    Constraint::Min(10),   // Main content
+                    Constraint::Length(1), // Status bar
                 ])
                 .split(size);
 
@@ -141,13 +142,8 @@ fn main() -> Result<()> {
                 AppState::Quitting => "QUITTING",
             };
             let elapsed = app.elapsed_formatted();
-            let status = StatusBar::new(
-                state_str,
-                app.view.name(),
-                &elapsed,
-                app.total_events,
-            )
-            .message(app.get_status());
+            let status = StatusBar::new(state_str, app.view.name(), &elapsed, app.total_events)
+                .message(app.get_status());
             frame.render_widget(status, chunks[3]);
         })?;
 
@@ -166,8 +162,12 @@ fn main() -> Result<()> {
                     }
                     CtKeyCode::Char('m') => app.toggle_shortcuts(),
                     CtKeyCode::Char('1') if app.shortcuts_enabled => app.view = AppView::Dashboard,
-                    CtKeyCode::Char('2') if app.shortcuts_enabled => app.view = AppView::PollingRate,
-                    CtKeyCode::Char('3') if app.shortcuts_enabled => app.view = AppView::HoldRelease,
+                    CtKeyCode::Char('2') if app.shortcuts_enabled => {
+                        app.view = AppView::PollingRate
+                    }
+                    CtKeyCode::Char('3') if app.shortcuts_enabled => {
+                        app.view = AppView::HoldRelease
+                    }
                     CtKeyCode::Char('4') if app.shortcuts_enabled => app.view = AppView::Stickiness,
                     CtKeyCode::Char('5') if app.shortcuts_enabled => app.view = AppView::Rollover,
                     CtKeyCode::Char('6') if app.shortcuts_enabled => app.view = AppView::Latency,
@@ -204,8 +204,10 @@ fn main() -> Result<()> {
                     CtKeyCode::Char('r') => app.reset_current(),
                     CtKeyCode::Char('R') => app.reset_all(),
                     CtKeyCode::Char('e') => {
-                        let filename = format!("keyboard_report_{}.json",
-                            chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+                        let filename = format!(
+                            "keyboard_report_{}.json",
+                            chrono::Utc::now().format("%Y%m%d_%H%M%S")
+                        );
                         let _ = app.export_report(&filename);
                     }
                     _ => {}

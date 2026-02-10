@@ -1,24 +1,29 @@
-//! Latency measurement test module
+//! Event timing measurement test module
+//!
+//! Measures inter-event timing (time between consecutive poll cycles that
+//! detect key events). This reflects the poll-to-poll interval, **not** true
+//! end-to-end input latency from physical switch actuation to application
+//! delivery. True input latency requires external hardware measurement.
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use crate::utils::MinMaxExt;
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Per-key latency statistics
+/// Per-key timing statistics
 #[derive(Debug, Clone, Default)]
-struct KeyLatencyStats {
+struct KeyTimingStats {
     samples: Vec<u64>,
     min_us: Option<u64>,
     max_us: Option<u64>,
 }
 
-impl KeyLatencyStats {
-    fn add_sample(&mut self, latency_us: u64) {
-        self.samples.push(latency_us);
-        self.min_us.update_min(latency_us);
-        self.max_us.update_max(latency_us);
+impl KeyTimingStats {
+    fn add_sample(&mut self, timing_us: u64) {
+        self.samples.push(timing_us);
+        self.min_us.update_min(timing_us);
+        self.max_us.update_max(timing_us);
     }
 
     fn avg_us(&self) -> Option<f64> {
@@ -29,25 +34,29 @@ impl KeyLatencyStats {
     }
 }
 
-/// Test for measuring input latency
-pub struct LatencyTest {
-    /// Per-key latency measurements (based on delta from event)
-    key_stats: HashMap<KeyCode, KeyLatencyStats>,
-    /// Global latency samples
+/// Test for measuring inter-event timing
+///
+/// Measures the time between consecutive keyboard events as observed by the
+/// polling loop. This is the poll-to-detection interval — not true end-to-end
+/// input latency, which would require external hardware measurement.
+pub struct EventTimingTest {
+    /// Per-key timing measurements (based on delta from event)
+    key_stats: HashMap<KeyCode, KeyTimingStats>,
+    /// Global timing samples
     global_samples: Vec<u64>,
-    /// Last event timestamp (for consecutive key latency)
+    /// Last event timestamp (for consecutive key timing)
     last_event_time: Option<Instant>,
     /// Total events processed
     total_events: u64,
     /// Test start time
     start_time: Option<Instant>,
-    /// Global min latency
+    /// Global min timing
     global_min_us: Option<u64>,
-    /// Global max latency
+    /// Global max timing
     global_max_us: Option<u64>,
 }
 
-impl LatencyTest {
+impl EventTimingTest {
     pub fn new() -> Self {
         Self {
             key_stats: HashMap::new(),
@@ -60,7 +69,7 @@ impl LatencyTest {
         }
     }
 
-    /// Get global average latency in microseconds
+    /// Get global average timing in microseconds
     pub fn global_avg_us(&self) -> Option<f64> {
         if self.global_samples.is_empty() {
             return None;
@@ -68,13 +77,13 @@ impl LatencyTest {
         Some(self.global_samples.iter().sum::<u64>() as f64 / self.global_samples.len() as f64)
     }
 
-    /// Get global average latency in milliseconds
+    /// Get global average timing in milliseconds
     pub fn global_avg_ms(&self) -> Option<f64> {
         self.global_avg_us().map(|us| us / 1000.0)
     }
 
-    /// Get latency rating based on average
-    pub fn latency_rating(&self) -> &'static str {
+    /// Get timing rating based on average
+    pub fn timing_rating(&self) -> &'static str {
         match self.global_avg_ms() {
             None => "Not measured",
             Some(ms) if ms < 5.0 => "Excellent (<5ms)",
@@ -85,22 +94,25 @@ impl LatencyTest {
         }
     }
 
-    /// Get standard deviation of latency
+    /// Get standard deviation of timing
     pub fn std_dev_us(&self) -> Option<f64> {
         if self.global_samples.len() < 2 {
             return None;
         }
         let mean = self.global_avg_us()?;
-        let variance = self.global_samples.iter()
+        let variance = self
+            .global_samples
+            .iter()
             .map(|&x| {
                 let diff = x as f64 - mean;
                 diff * diff
             })
-            .sum::<f64>() / self.global_samples.len() as f64;
+            .sum::<f64>()
+            / self.global_samples.len() as f64;
         Some(variance.sqrt())
     }
 
-    /// Get the key with highest latency
+    /// Get the key with highest timing (slowest)
     pub fn slowest_key(&self) -> Option<(KeyCode, f64)> {
         self.key_stats
             .iter()
@@ -108,7 +120,7 @@ impl LatencyTest {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     }
 
-    /// Get the key with lowest latency
+    /// Get the key with lowest timing (fastest)
     pub fn fastest_key(&self) -> Option<(KeyCode, f64)> {
         self.key_stats
             .iter()
@@ -117,19 +129,19 @@ impl LatencyTest {
     }
 }
 
-impl Default for LatencyTest {
+impl Default for EventTimingTest {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl KeyboardTest for LatencyTest {
+impl KeyboardTest for EventTimingTest {
     fn name(&self) -> &'static str {
-        "Latency Test"
+        "Event Timing"
     }
 
     fn description(&self) -> &'static str {
-        "Measures input latency for each key"
+        "Measures inter-event timing (poll-to-detection interval per key)"
     }
 
     fn process_event(&mut self, event: &KeyEvent) {
@@ -137,53 +149,53 @@ impl KeyboardTest for LatencyTest {
             self.start_time = Some(Instant::now());
         }
 
-        // Only measure key presses for latency
+        // Only measure key presses for timing
         if event.event_type != KeyEventType::Press {
             return;
         }
 
         self.total_events += 1;
 
-        // Use delta_us from the event as our latency measurement
-        // This represents the time since the last poll
-        let latency_us = event.delta_us;
+        // Use delta_us from the event as our timing measurement
+        // This represents the time since the last poll cycle
+        let timing_us = event.delta_us;
 
         // Record global sample
-        if latency_us < 1_000_000 { // Ignore >1s gaps
-            self.global_samples.push(latency_us);
-            self.global_min_us.update_min(latency_us);
-            self.global_max_us.update_max(latency_us);
+        if timing_us < 1_000_000 {
+            // Ignore >1s gaps
+            self.global_samples.push(timing_us);
+            self.global_min_us.update_min(timing_us);
+            self.global_max_us.update_max(timing_us);
 
             // Record per-key sample
             self.key_stats
                 .entry(event.key)
                 .or_default()
-                .add_sample(latency_us);
+                .add_sample(timing_us);
         }
 
         self.last_event_time = Some(event.timestamp);
     }
 
     fn is_complete(&self) -> bool {
-        // This test runs continuously
         false
     }
 
     fn get_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
 
-        // Tooltip: Explain what this test measures
+        results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
+            "Inter-event timing = poll",
+            "interval when key detected",
         ));
         results.push(TestResult::info(
-            "Input latency = time from",
-            "keypress to PC detection",
+            "NOT true input latency",
+            "(requires hardware probe)",
         ));
         results.push(TestResult::info(
             "Affected by: polling rate,",
-            "USB, debounce, drivers",
+            "USB interval, CPU load",
         ));
         results.push(TestResult::info(
             "Look for: <10ms excellent,",
@@ -196,7 +208,7 @@ impl KeyboardTest for LatencyTest {
             format!("{}", self.global_samples.len()),
         ));
 
-        // Average latency
+        // Average timing
         if let Some(avg_ms) = self.global_avg_ms() {
             let status = if avg_ms < 10.0 {
                 ResultStatus::Ok
@@ -206,7 +218,7 @@ impl KeyboardTest for LatencyTest {
                 ResultStatus::Error
             };
             results.push(TestResult::new(
-                "Avg Latency",
+                "Avg Event Timing",
                 format!("{:.2} ms", avg_ms),
                 status,
             ));
@@ -215,13 +227,13 @@ impl KeyboardTest for LatencyTest {
         // Min/Max
         if let Some(min) = self.global_min_us {
             results.push(TestResult::info(
-                "Min Latency",
+                "Min Timing",
                 format!("{:.2} ms", min as f64 / 1000.0),
             ));
         }
         if let Some(max) = self.global_max_us {
             results.push(TestResult::info(
-                "Max Latency",
+                "Max Timing",
                 format!("{:.2} ms", max as f64 / 1000.0),
             ));
         }
@@ -235,24 +247,21 @@ impl KeyboardTest for LatencyTest {
         }
 
         // Rating
-        results.push(TestResult::info(
-            "Rating",
-            self.latency_rating().to_string(),
-        ));
+        results.push(TestResult::info("Rating", self.timing_rating().to_string()));
 
         // Fastest/Slowest keys
-        if let Some((key, latency)) = self.fastest_key() {
+        if let Some((key, timing)) = self.fastest_key() {
             let key_info = keymap::get_key_info(key);
             results.push(TestResult::ok(
                 "Fastest Key",
-                format!("{}: {:.2}ms", key_info.name, latency / 1000.0),
+                format!("{}: {:.2}ms", key_info.name, timing / 1000.0),
             ));
         }
-        if let Some((key, latency)) = self.slowest_key() {
+        if let Some((key, timing)) = self.slowest_key() {
             let key_info = keymap::get_key_info(key);
             results.push(TestResult::warning(
                 "Slowest Key",
-                format!("{}: {:.2}ms", key_info.name, latency / 1000.0),
+                format!("{}: {:.2}ms", key_info.name, timing / 1000.0),
             ));
         }
 
@@ -277,7 +286,7 @@ mod tests {
 
     #[test]
     fn new_test_initial_state() {
-        let test = LatencyTest::new();
+        let test = EventTimingTest::new();
         assert!(test.global_avg_us().is_none());
         assert!(test.global_avg_ms().is_none());
         assert!(test.std_dev_us().is_none());
@@ -286,55 +295,50 @@ mod tests {
     }
 
     #[test]
-    fn latency_rating_not_measured() {
-        let test = LatencyTest::new();
-        assert_eq!(test.latency_rating(), "Not measured");
+    fn timing_rating_not_measured() {
+        let test = EventTimingTest::new();
+        assert_eq!(test.timing_rating(), "Not measured");
     }
 
     #[test]
-    fn latency_rating_excellent() {
-        let mut test = LatencyTest::new();
-        // 4ms = 4000us
+    fn timing_rating_excellent() {
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![4000, 4000, 4000];
-        assert_eq!(test.latency_rating(), "Excellent (<5ms)");
+        assert_eq!(test.timing_rating(), "Excellent (<5ms)");
     }
 
     #[test]
-    fn latency_rating_great() {
-        let mut test = LatencyTest::new();
-        // 8ms = 8000us
+    fn timing_rating_great() {
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![8000, 8000, 8000];
-        assert_eq!(test.latency_rating(), "Great (<10ms)");
+        assert_eq!(test.timing_rating(), "Great (<10ms)");
     }
 
     #[test]
-    fn latency_rating_good() {
-        let mut test = LatencyTest::new();
-        // 15ms = 15000us
+    fn timing_rating_good() {
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![15000, 15000, 15000];
-        assert_eq!(test.latency_rating(), "Good (<20ms)");
+        assert_eq!(test.timing_rating(), "Good (<20ms)");
     }
 
     #[test]
-    fn latency_rating_acceptable() {
-        let mut test = LatencyTest::new();
-        // 30ms = 30000us
+    fn timing_rating_acceptable() {
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![30000, 30000, 30000];
-        assert_eq!(test.latency_rating(), "Acceptable (<50ms)");
+        assert_eq!(test.timing_rating(), "Acceptable (<50ms)");
     }
 
     #[test]
-    fn latency_rating_poor() {
-        let mut test = LatencyTest::new();
-        // 60ms = 60000us
+    fn timing_rating_poor() {
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![60000, 60000, 60000];
-        assert_eq!(test.latency_rating(), "Poor (>50ms)");
+        assert_eq!(test.timing_rating(), "Poor (>50ms)");
     }
 
     #[test]
     fn global_avg_calculation() {
-        let mut test = LatencyTest::new();
-        test.global_samples = vec![1000, 2000, 3000]; // avg = 2000us
+        let mut test = EventTimingTest::new();
+        test.global_samples = vec![1000, 2000, 3000];
 
         let avg_us = test.global_avg_us().unwrap();
         assert!((avg_us - 2000.0).abs() < 0.01);
@@ -345,25 +349,23 @@ mod tests {
 
     #[test]
     fn std_dev_calculation() {
-        let mut test = LatencyTest::new();
-        // [1000, 2000, 3000] - mean = 2000, variance = ((1000)^2 + 0 + (1000)^2) / 3
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![1000, 2000, 3000];
 
         let std_dev = test.std_dev_us().unwrap();
-        // Expected: sqrt((1000000 + 0 + 1000000) / 3) ≈ 816.5
         assert!(std_dev > 800.0 && std_dev < 850.0);
     }
 
     #[test]
     fn std_dev_requires_two_samples() {
-        let mut test = LatencyTest::new();
+        let mut test = EventTimingTest::new();
         test.global_samples = vec![1000];
         assert!(test.std_dev_us().is_none());
     }
 
     #[test]
     fn process_event_ignores_release() {
-        let mut test = LatencyTest::new();
+        let mut test = EventTimingTest::new();
         test.process_event(&release(KeyCode(30)));
 
         assert_eq!(test.total_events, 0);
@@ -371,9 +373,9 @@ mod tests {
     }
 
     #[test]
-    fn process_event_records_latency() {
-        let mut test = LatencyTest::new();
-        test.process_event(&make_press(KeyCode(30), 5000)); // 5ms
+    fn process_event_records_timing() {
+        let mut test = EventTimingTest::new();
+        test.process_event(&make_press(KeyCode(30), 5000));
 
         assert_eq!(test.total_events, 1);
         assert_eq!(test.global_samples.len(), 1);
@@ -383,9 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn process_event_filters_large_latency() {
-        let mut test = LatencyTest::new();
-        // >1 second gaps should be filtered
+    fn process_event_filters_large_gaps() {
+        let mut test = EventTimingTest::new();
         test.process_event(&make_press(KeyCode(30), 2_000_000));
 
         assert_eq!(test.total_events, 1);
@@ -394,7 +395,7 @@ mod tests {
 
     #[test]
     fn min_max_tracking() {
-        let mut test = LatencyTest::new();
+        let mut test = EventTimingTest::new();
         test.process_event(&make_press(KeyCode(30), 5000));
         test.process_event(&make_press(KeyCode(31), 2000));
         test.process_event(&make_press(KeyCode(32), 8000));
@@ -405,24 +406,23 @@ mod tests {
 
     #[test]
     fn fastest_slowest_key() {
-        let mut test = LatencyTest::new();
-        // Key 30: 2ms, Key 31: 5ms, Key 32: 3ms
+        let mut test = EventTimingTest::new();
         test.process_event(&make_press(KeyCode(30), 2000));
         test.process_event(&make_press(KeyCode(31), 5000));
         test.process_event(&make_press(KeyCode(32), 3000));
 
-        let (fastest_key, fastest_latency) = test.fastest_key().unwrap();
+        let (fastest_key, fastest_timing) = test.fastest_key().unwrap();
         assert_eq!(fastest_key, KeyCode(30));
-        assert!((fastest_latency - 2000.0).abs() < 0.01);
+        assert!((fastest_timing - 2000.0).abs() < 0.01);
 
-        let (slowest_key, slowest_latency) = test.slowest_key().unwrap();
+        let (slowest_key, slowest_timing) = test.slowest_key().unwrap();
         assert_eq!(slowest_key, KeyCode(31));
-        assert!((slowest_latency - 5000.0).abs() < 0.01);
+        assert!((slowest_timing - 5000.0).abs() < 0.01);
     }
 
     #[test]
     fn reset_clears_all() {
-        let mut test = LatencyTest::new();
+        let mut test = EventTimingTest::new();
         test.process_event(&make_press(KeyCode(30), 5000));
         test.process_event(&make_press(KeyCode(31), 3000));
 
@@ -437,22 +437,21 @@ mod tests {
 
     #[test]
     fn test_name_and_description() {
-        let test = LatencyTest::new();
-        assert_eq!(test.name(), "Latency Test");
-        assert!(!test.description().is_empty());
+        let test = EventTimingTest::new();
+        assert_eq!(test.name(), "Event Timing");
+        assert!(test.description().contains("inter-event"));
     }
 
     #[test]
     fn is_never_complete() {
-        let mut test = LatencyTest::new();
+        let mut test = EventTimingTest::new();
         test.process_event(&make_press(KeyCode(30), 5000));
-        assert!(!test.is_complete()); // Continuous test
+        assert!(!test.is_complete());
     }
 
-    // KeyLatencyStats tests
     #[test]
-    fn key_latency_stats_add_sample() {
-        let mut stats = KeyLatencyStats::default();
+    fn key_timing_stats_add_sample() {
+        let mut stats = KeyTimingStats::default();
         stats.add_sample(1000);
         stats.add_sample(2000);
         stats.add_sample(500);
@@ -463,8 +462,8 @@ mod tests {
     }
 
     #[test]
-    fn key_latency_stats_avg() {
-        let mut stats = KeyLatencyStats::default();
+    fn key_timing_stats_avg() {
+        let mut stats = KeyTimingStats::default();
         stats.add_sample(1000);
         stats.add_sample(2000);
         stats.add_sample(3000);

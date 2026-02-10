@@ -36,16 +36,16 @@
 //! ```
 
 mod event;
-mod state;
 pub mod keymap;
 pub mod remap;
+mod state;
 
 #[cfg(target_os = "linux")]
 pub mod evdev_listener;
 
 pub use event::{KeyEvent, KeyEventType, KeyboardListener};
+pub use keymap::{get_key_info, KeyCode, KeyInfo, KEYMAP};
 pub use state::{KeyState, KeyboardState};
-pub use keymap::{KeyCode, KeyInfo, KEYMAP, get_key_info};
 
 #[cfg(target_os = "linux")]
-pub use evdev_listener::{EvdevListener, is_evdev_available, evdev_status};
+pub use evdev_listener::{evdev_status, is_evdev_available, EvdevListener};
