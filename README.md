@@ -13,15 +13,16 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 | **Stickiness** | Detect stuck or unresponsive keys |
 | **Bounce** | Identify mechanical key bounce and measure hold/release timing |
 | **N-Key Rollover** | Test simultaneous key capability and ghosting |
-| **Latency** | Per-key and global input latency measurement |
+| **Timing** | Per-key and global inter-event timing measurement |
 | **Shortcuts** | Detect system hotkey conflicts intercepting input |
 | **Virtual** | Compare physical vs virtual keys to isolate hardware/software issues |
+| **OEM/FN** | OEM key detection, capture, and FN key remapping |
 
 ## Screenshots
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Dashboard │ Polling │ Bounce │ Sticky │ NKRO │ Latency │ Shortcuts │ Help  │
+│ Dashboard │ Polling │ Bounce │ Sticky │ NKRO │ Timing │ Shortcuts │ ...   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ ⌨ Keyboard                                                                  │
 │ ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───────┐             │
@@ -121,7 +122,7 @@ keyboard-testkit
 |-----|--------|
 | `Tab` | Next test view |
 | `Shift+Tab` | Previous test view |
-| `1-8` | Jump to specific view |
+| `1-9`, `0` | Jump to specific view |
 | `m` | Toggle menu shortcuts (free number keys for testing) |
 | `Space` | Pause/resume testing |
 | `r` | Reset current test |
@@ -138,10 +139,11 @@ keyboard-testkit
 3. **Bounce** - Key bounce detection and hold duration analysis
 4. **Sticky** - Stuck key detection with configurable thresholds
 5. **NKRO** - N-key rollover testing and ghosting detection
-6. **Latency** - Per-key latency measurement in milliseconds
+6. **Timing** - Per-key inter-event timing measurement
 7. **Shortcuts** - System hotkey conflict detection
 8. **Virtual** - Physical vs virtual keyboard comparison
-9. **Help** - In-app help and key reference
+9. **OEM/FN** - OEM key capture and FN key remapping
+0. **Help** - In-app help and key reference
 
 ## Configuration
 
@@ -167,7 +169,7 @@ The Virtual Keyboard test helps isolate issues:
 
 ## Export
 
-Press `e` to export a JSON report with all test results:
+Press `e` to export a JSON report with test results (covers polling, bounce, stickiness, rollover, and timing tests):
 
 ```json
 {
@@ -175,7 +177,7 @@ Press `e` to export a JSON report with all test results:
   "total_events": 1543,
   "polling_rate": { "average_hz": 1000, "min_hz": 995, "max_hz": 1005 },
   "rollover": { "max_keys": 6, "ghosting_detected": false },
-  "latency": { "average_ms": 8.2, "per_key": {...} },
+  "timing": { "average_ms": 8.2, "per_key": {...} },
   ...
 }
 ```
