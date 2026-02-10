@@ -36,7 +36,7 @@ src/
 │   ├── bounce.rs        # Key bounce detection
 │   ├── stickiness.rs    # Stuck key detection
 │   ├── rollover.rs      # NKRO testing
-│   ├── latency.rs       # Latency measurement
+│   ├── latency.rs       # Inter-event timing measurement
 │   ├── shortcuts.rs     # Hotkey conflict detection
 │   ├── virtual_detect.rs # Physical vs virtual comparison
 │   └── oem_keys.rs      # OEM key capture & FN restoration
@@ -96,7 +96,7 @@ trait KeyboardTest {
 1. **PollingRateTest** - Hz measurement + jitter analysis
 2. **StickinessTest** - Stuck key detection
 3. **RolloverTest** - NKRO testing & ghosting detection
-4. **LatencyTest** - Per-key delay measurement
+4. **EventTimingTest** - Per-key inter-event timing (poll interval measurement)
 5. **HoldReleaseTest** - Bounce detection & hold analysis
 6. **ShortcutTest** - System hotkey conflict detection
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison
@@ -121,7 +121,7 @@ Config file locations:
 ### UI Controls
 
 - Tab/Shift+Tab: Navigate views
-- 1-9: Direct view access
+- 1-9, 0: Direct view access (10 views)
 - Space: Pause/Resume
 - r/R: Reset current/all tests
 - e: Export JSON report

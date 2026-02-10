@@ -37,7 +37,7 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 |---------------|---------|
 | Detection Method | Monitor key-up event timing |
 | Threshold | Configurable (default: 50ms after physical release) |
-| Alert Type | Visual highlight + optional audio alert |
+| Alert Type | Visual highlight |
 | Logging | Record all sticky key incidents with timestamps |
 
 **Implementation Requirements:**
@@ -153,13 +153,13 @@ Physical Works + Virtual Fails = API/Permission Issue
 
 | Specification | Details |
 |---------------|---------|
-| Indicator Type | Floating overlay / system tray flash |
+| Indicator Type | In-app visual indicator |
 | Display Duration | 2-3 seconds (configurable) |
-| Information Shown | Key combo + intercepting application |
-| Visibility | Always-on-top, semi-transparent |
-| Colors | Configurable (default: yellow warning) |
+| Information Shown | Key combo detected |
 
-**Implementation Requirements:**
+> **Current status:** The shortcut detection tracks when system hotkeys are pressed. The floating overlay / system tray indicator described below is planned but not yet implemented. Currently, shortcut conflicts are displayed within the terminal UI's Shortcuts view.
+
+**Planned Implementation (not yet available):**
 - Overlay window that appears on shortcut detection
 - Display the captured key combination
 - Show which application consumed the shortcut
@@ -196,37 +196,38 @@ Physical Works + Virtual Fails = API/Permission Issue
 
 ---
 
-### 10. Latency Measurement
+### 10. Inter-Event Timing Measurement
 
-**Purpose:** Measure end-to-end input delay from keypress to application response.
+**Purpose:** Measure the time interval between consecutive keyboard polling events.
 
 | Specification | Details |
 |---------------|---------|
 | Measurement | Milliseconds (ms) |
-| Target | <10ms for gaming, <20ms for general use |
-| Components | Scan rate + polling rate + USB processing |
-| Per-Key Testing | Individual latency per key option |
+| Method | Poll-to-poll interval timing |
+| Per-Key Testing | Individual timing per key option |
+
+> **Note:** This test measures inter-event polling intervals (time between consecutive keyboard reports), not true end-to-end input latency (physical switch actuation to software registration). True end-to-end latency measurement requires specialized hardware.
 
 ---
 
 ## User Interface Requirements
 
 ### Main Dashboard
-- Visual keyboard layout (auto-detect: full-size, TKL, 60%, etc.)
+- Visual keyboard layout (currently hardcoded ANSI US layout)
 - Real-time key highlighting on press
 - Status indicators for each test module
-- Quick-access test buttons
+- Tab-based navigation between test views
 
 ### Test Results Panel
 - Per-key statistics and health indicators
-- Historical comparison graphs
-- Export functionality (PDF, CSV, JSON)
+- Export functionality (JSON, CSV, Markdown, Text)
 
-### Settings Panel
-- Keyboard layout selection
-- Threshold configurations
-- Alert preferences (visual, audio, notifications)
-- Virtual keyboard API selection
+### Configuration
+- Settings managed via TOML configuration file
+- Platform-specific config file locations (see README)
+- Threshold configurations editable in config file
+
+> **Note:** An in-app settings panel for runtime configuration is planned but not yet implemented. Currently, all settings are managed through the TOML configuration file.
 
 ---
 

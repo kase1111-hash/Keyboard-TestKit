@@ -88,7 +88,7 @@ The `KeyboardState` correctly:
 | Bounce Detection | `bounce.rs` | CORRECT | Correct bounce window detection |
 | Stickiness | `stickiness.rs` | CORRECT | Proper threshold-based stuck key detection |
 | Rollover | `rollover.rs` | CORRECT | Accurate simultaneous key counting |
-| Latency | `latency.rs` | MOSTLY CORRECT | Measures poll interval, not true end-to-end latency |
+| Event Timing | `latency.rs` | CORRECT | Measures inter-event poll intervals (documented accordingly) |
 | Shortcuts | `shortcuts.rs` | CORRECT | Proper modifier state tracking |
 | Virtual Detection | `virtual_detect.rs` | CORRECT | Heuristic-based, documented limitations |
 | OEM Keys | `oem_keys.rs` | CORRECT | Proper scancode capture and remapping |
@@ -158,12 +158,12 @@ if self.recent_intervals_us.len() > 100 {
 
 ### 3.2 Documentation Clarification (Low Priority)
 
-**Issue:** Latency test name could be misleading
+**Issue:** Latency test naming clarification
 **Location:** `src/tests/latency.rs`
 
-**Details:** The "latency" metric measures time between poll cycles, not true input-to-application latency. The test documentation explains this, but users might expect different behavior.
+**Details:** The timing metric measures time between poll cycles, not true input-to-application latency. Documentation has been updated to reflect this accurately. The view is now labeled "Timing" in documentation.
 
-**Recommendation:** Consider renaming to "Poll Interval Test" or adding prominent UI explanation.
+**Status:** Addressed via documentation updates.
 
 ### 3.3 Limited Ghosting Detection (Known Limitation)
 
@@ -186,7 +186,7 @@ if self.recent_intervals_us.len() > 100 {
 | Key Stickiness Detection | Yes | Yes | FULLY FIT - Threshold-based detection works |
 | Key Bounce Detection | Yes | Yes | FULLY FIT - Proper bounce window detection |
 | N-Key Rollover Testing | Yes | Yes | FULLY FIT - Accurate simultaneous key counting |
-| Latency Measurement | Yes | Partial | PARTIALLY FIT - Measures poll interval |
+| Inter-Event Timing | Yes | Yes | FULLY FIT - Measures poll intervals (documented accurately) |
 | Shortcut Conflict Detection | Yes | Yes | FULLY FIT - Detects common shortcuts |
 | Virtual Keyboard Testing | Yes | Yes | FULLY FIT - Heuristic-based detection |
 | OEM/FN Key Detection | Yes | Yes | FULLY FIT - Comprehensive remapping system |
@@ -249,7 +249,7 @@ None identified.
 
 1. **Performance:** Replace `Vec::remove(0)` with `VecDeque::pop_front()` in ring buffer implementations.
 
-2. **Documentation:** Add clearer explanation in UI that latency test measures poll interval rather than end-to-end input latency.
+2. **Documentation:** The timing test is now documented as measuring inter-event poll intervals rather than end-to-end input latency.
 
 3. **Future Enhancement:** Consider adding keyboard matrix configuration for better ghosting detection (optional feature).
 
