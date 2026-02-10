@@ -26,6 +26,7 @@
 //! config.save().expect("Failed to save config");
 //! ```
 
+use crate::keyboard::remap::FnKeyMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -136,15 +137,12 @@ impl Default for PollingConfig {
 pub struct StickinessConfig {
     /// Threshold in ms after which a key is considered stuck
     pub stuck_threshold_ms: u64,
-    /// Enable audio alerts for stuck keys
-    pub audio_alert: bool,
 }
 
 impl Default for StickinessConfig {
     fn default() -> Self {
         Self {
             stuck_threshold_ms: 50,
-            audio_alert: false,
         }
     }
 }
@@ -193,22 +191,6 @@ impl Default for UiConfig {
 pub enum Theme {
     Dark,
     Light,
-}
-
-/// FN key handling mode for OEM key restoration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum FnKeyMode {
-    /// Don't modify FN key behavior
-    Disabled,
-    /// Capture FN key presses but don't remap
-    #[default]
-    CaptureOnly,
-    /// Restore FN key as a modifier (like Ctrl/Alt)
-    RestoreWithModifier,
-    /// Map FN+key combinations to F-keys
-    MapToFKeys,
-    /// Map FN+key combinations to media keys
-    MapToMedia,
 }
 
 /// OEM key and remapping configuration
@@ -366,7 +348,6 @@ mod tests {
         assert_eq!(config.polling.test_duration_secs, 10);
         assert_eq!(config.polling.sample_window_ms, 100);
         assert_eq!(config.stickiness.stuck_threshold_ms, 50);
-        assert!(!config.stickiness.audio_alert);
         assert_eq!(config.hold_release.bounce_window_ms, 5);
         assert_eq!(config.hold_release.min_hold_ms, 10);
         assert_eq!(config.ui.refresh_rate_hz, 60);
@@ -396,7 +377,6 @@ mod tests {
         // Create non-default config
         let mut config = Config::default();
         config.polling.test_duration_secs = 30;
-        config.stickiness.audio_alert = true;
         config.ui.theme = Theme::Light;
 
         // Save to temp file
@@ -407,7 +387,6 @@ mod tests {
 
         // Verify values match
         assert_eq!(loaded.polling.test_duration_secs, 30);
-        assert!(loaded.stickiness.audio_alert);
         assert_eq!(loaded.ui.theme, Theme::Light);
 
         // Cleanup
@@ -444,7 +423,6 @@ sample_window_ms = 200
 
 [stickiness]
 stuck_threshold_ms = 100
-audio_alert = true
 
 [hold_release]
 bounce_window_ms = 10
@@ -461,7 +439,6 @@ theme = "Light"
         assert_eq!(config.polling.test_duration_secs, 20);
         assert_eq!(config.polling.sample_window_ms, 200);
         assert_eq!(config.stickiness.stuck_threshold_ms, 100);
-        assert!(config.stickiness.audio_alert);
         assert_eq!(config.hold_release.bounce_window_ms, 10);
         assert_eq!(config.hold_release.min_hold_ms, 20);
         assert_eq!(config.ui.refresh_rate_hz, 144);

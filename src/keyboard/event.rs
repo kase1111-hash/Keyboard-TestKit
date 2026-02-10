@@ -1,9 +1,9 @@
 //! Keyboard event types and listener
 
 use super::KeyCode;
-use std::time::Instant;
-use std::sync::mpsc;
 use device_query::{DeviceQuery, DeviceState};
+use std::sync::mpsc;
+use std::time::Instant;
 
 /// Type of keyboard event
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,12 +70,7 @@ impl KeyboardListener {
         // Check for new key presses
         for key in &current_keys {
             if !self.last_keys.contains(key) {
-                let event = KeyEvent::new(
-                    KeyCode::from(*key),
-                    KeyEventType::Press,
-                    now,
-                    delta_us,
-                );
+                let event = KeyEvent::new(KeyCode::from(*key), KeyEventType::Press, now, delta_us);
                 let _ = self.event_tx.send(event);
                 event_count += 1;
             }
@@ -84,12 +79,8 @@ impl KeyboardListener {
         // Check for key releases
         for key in &self.last_keys {
             if !current_keys.contains(key) {
-                let event = KeyEvent::new(
-                    KeyCode::from(*key),
-                    KeyEventType::Release,
-                    now,
-                    delta_us,
-                );
+                let event =
+                    KeyEvent::new(KeyCode::from(*key), KeyEventType::Release, now, delta_us);
                 let _ = self.event_tx.send(event);
                 event_count += 1;
             }

@@ -21,11 +21,12 @@
 //! ```
 
 use super::KeyCode;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 
 /// Describes how the FN key should be handled
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FnKeyMode {
     /// Don't modify FN key behavior
     Disabled,
@@ -144,18 +145,18 @@ impl KeyRemapper {
     /// Set up default FN+key combinations
     fn setup_default_fn_combos(&mut self) {
         // FN + number row -> F1-F10
-        self.fn_combos.insert(2, 59);   // 1 -> F1
-        self.fn_combos.insert(3, 60);   // 2 -> F2
-        self.fn_combos.insert(4, 61);   // 3 -> F3
-        self.fn_combos.insert(5, 62);   // 4 -> F4
-        self.fn_combos.insert(6, 63);   // 5 -> F5
-        self.fn_combos.insert(7, 64);   // 6 -> F6
-        self.fn_combos.insert(8, 65);   // 7 -> F7
-        self.fn_combos.insert(9, 66);   // 8 -> F8
-        self.fn_combos.insert(10, 67);  // 9 -> F9
-        self.fn_combos.insert(11, 68);  // 0 -> F10
-        self.fn_combos.insert(12, 87);  // - -> F11
-        self.fn_combos.insert(13, 88);  // = -> F12
+        self.fn_combos.insert(2, 59); // 1 -> F1
+        self.fn_combos.insert(3, 60); // 2 -> F2
+        self.fn_combos.insert(4, 61); // 3 -> F3
+        self.fn_combos.insert(5, 62); // 4 -> F4
+        self.fn_combos.insert(6, 63); // 5 -> F5
+        self.fn_combos.insert(7, 64); // 6 -> F6
+        self.fn_combos.insert(8, 65); // 7 -> F7
+        self.fn_combos.insert(9, 66); // 8 -> F8
+        self.fn_combos.insert(10, 67); // 9 -> F9
+        self.fn_combos.insert(11, 68); // 0 -> F10
+        self.fn_combos.insert(12, 87); // - -> F11
+        self.fn_combos.insert(13, 88); // = -> F12
 
         // FN + arrow keys -> media controls (common laptop layout)
         self.fn_combos.insert(105, 165); // Left -> Previous
@@ -164,9 +165,9 @@ impl KeyRemapper {
         self.fn_combos.insert(108, 114); // Down -> Volume Down
 
         // FN + other common mappings
-        self.fn_combos.insert(57, 164);  // Space -> Play/Pause
-        self.fn_combos.insert(14, 111);  // Backspace -> Delete
-        self.fn_combos.insert(1, 142);   // Esc -> Sleep
+        self.fn_combos.insert(57, 164); // Space -> Play/Pause
+        self.fn_combos.insert(14, 111); // Backspace -> Delete
+        self.fn_combos.insert(1, 142); // Esc -> Sleep
     }
 
     /// Enable or disable remapping
@@ -322,10 +323,8 @@ impl KeyRemapper {
                 existing.label = label;
             }
         } else {
-            self.captured_keys.insert(
-                scancode,
-                CapturedKey::new(scancode, pressed, label),
-            );
+            self.captured_keys
+                .insert(scancode, CapturedKey::new(scancode, pressed, label));
         }
     }
 

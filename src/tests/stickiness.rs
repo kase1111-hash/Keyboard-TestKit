@@ -1,7 +1,7 @@
 //! Stickiness detection test module
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -125,10 +125,7 @@ impl KeyboardTest for StickinessTest {
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
+        results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
             "Detects keys that stay",
             "'pressed' after release",

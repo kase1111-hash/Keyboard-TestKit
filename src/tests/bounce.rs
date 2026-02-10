@@ -1,8 +1,8 @@
 //! Hold down and release test with bounce detection
 
 use super::{KeyboardTest, TestResult};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
-use std::collections::HashMap;
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Record of key press/release events for bounce analysis
@@ -16,7 +16,7 @@ struct KeyEventRecord {
 #[derive(Debug, Clone, Default)]
 struct KeyHoldStats {
     /// All events for this key (for bounce detection)
-    events: Vec<KeyEventRecord>,
+    events: VecDeque<KeyEventRecord>,
     /// Number of detected bounces
     bounce_count: u32,
     /// Total press count
@@ -50,7 +50,7 @@ pub struct HoldReleaseTest {
     /// Last event for repeat rate detection
     last_event_time: Option<Instant>,
     /// Repeat events detected (same key pressed rapidly)
-    repeat_intervals: Vec<u64>,
+    repeat_intervals: VecDeque<u64>,
 }
 
 impl HoldReleaseTest {
@@ -63,7 +63,7 @@ impl HoldReleaseTest {
             held_keys: Vec::new(),
             start_time: None,
             last_event_time: None,
-            repeat_intervals: Vec::new(),
+            repeat_intervals: VecDeque::new(),
         }
     }
 
@@ -74,7 +74,11 @@ impl HoldReleaseTest {
         }
 
         // Get the last event of opposite type
-        let last_opposite = stats.events.iter().rev().find(|e| e.event_type != event.event_type);
+        let last_opposite = stats
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.event_type != event.event_type);
 
         if let Some(last) = last_opposite {
             let time_since = event.timestamp.duration_since(last.timestamp);
@@ -99,8 +103,8 @@ impl HoldReleaseTest {
         if self.repeat_intervals.len() < 2 {
             return None;
         }
-        let avg_interval_us = self.repeat_intervals.iter().sum::<u64>() as f64
-            / self.repeat_intervals.len() as f64;
+        let avg_interval_us =
+            self.repeat_intervals.iter().sum::<u64>() as f64 / self.repeat_intervals.len() as f64;
         if avg_interval_us > 0.0 {
             Some(1_000_000.0 / avg_interval_us)
         } else {
@@ -158,14 +162,14 @@ impl KeyboardTest for HoldReleaseTest {
         }
 
         // Record the event
-        stats.events.push(KeyEventRecord {
+        stats.events.push_back(KeyEventRecord {
             event_type: event.event_type,
             timestamp: event.timestamp,
         });
 
         // Keep only last 100 events per key to save memory
         if stats.events.len() > 100 {
-            stats.events.remove(0);
+            stats.events.pop_front();
         }
 
         match event.event_type {
@@ -183,10 +187,11 @@ impl KeyboardTest for HoldReleaseTest {
                 // Track repeat intervals
                 if let Some(last) = self.last_event_time {
                     let interval = event.timestamp.duration_since(last).as_micros() as u64;
-                    if interval < 500_000 { // Only track intervals < 500ms
-                        self.repeat_intervals.push(interval);
+                    if interval < 500_000 {
+                        // Only track intervals < 500ms
+                        self.repeat_intervals.push_back(interval);
                         if self.repeat_intervals.len() > 100 {
-                            self.repeat_intervals.remove(0);
+                            self.repeat_intervals.pop_front();
                         }
                     }
                 }
@@ -200,12 +205,10 @@ impl KeyboardTest for HoldReleaseTest {
                     let hold_ms = event.timestamp.duration_since(start).as_secs_f64() * 1000.0;
                     stats.total_hold_ms += hold_ms;
 
-                    stats.min_hold_ms = Some(
-                        stats.min_hold_ms.map(|m| m.min(hold_ms)).unwrap_or(hold_ms)
-                    );
-                    stats.max_hold_ms = Some(
-                        stats.max_hold_ms.map(|m| m.max(hold_ms)).unwrap_or(hold_ms)
-                    );
+                    stats.min_hold_ms =
+                        Some(stats.min_hold_ms.map(|m| m.min(hold_ms)).unwrap_or(hold_ms));
+                    stats.max_hold_ms =
+                        Some(stats.max_hold_ms.map(|m| m.max(hold_ms)).unwrap_or(hold_ms));
                 }
 
                 // Remove from held keys
@@ -222,10 +225,7 @@ impl KeyboardTest for HoldReleaseTest {
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
-        results.push(TestResult::info(
-            "--- What This Measures ---",
-            "",
-        ));
+        results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
             "Tests key hold/release and",
             "detects switch bounce",
@@ -262,10 +262,7 @@ impl KeyboardTest for HoldReleaseTest {
 
         // Hold duration stats
         if let Some(avg) = self.avg_hold_ms() {
-            results.push(TestResult::info(
-                "Avg Hold Time",
-                format!("{:.1} ms", avg),
-            ));
+            results.push(TestResult::info("Avg Hold Time", format!("{:.1} ms", avg)));
         }
 
         // Repeat rate

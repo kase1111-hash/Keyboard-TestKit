@@ -39,26 +39,26 @@
 //! test.reset();
 //! ```
 
-mod polling;
-mod stickiness;
-mod rollover;
-mod latency;
 mod bounce;
-mod shortcuts;
-mod virtual_detect;
+mod latency;
 mod oem_keys;
+mod polling;
+mod rollover;
+mod shortcuts;
+mod stickiness;
+mod virtual_detect;
 
 #[cfg(test)]
 pub mod test_helpers;
 
-pub use polling::PollingRateTest;
-pub use stickiness::StickinessTest;
-pub use rollover::RolloverTest;
-pub use latency::LatencyTest;
 pub use bounce::HoldReleaseTest;
-pub use shortcuts::ShortcutTest;
-pub use virtual_detect::VirtualKeyboardTest;
+pub use latency::EventTimingTest;
 pub use oem_keys::OemKeyTest;
+pub use polling::PollingRateTest;
+pub use rollover::RolloverTest;
+pub use shortcuts::ShortcutTest;
+pub use stickiness::StickinessTest;
+pub use virtual_detect::VirtualKeyboardTest;
 
 use crate::keyboard::KeyEvent;
 use std::time::Instant;

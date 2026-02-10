@@ -1,8 +1,8 @@
 //! Shortcut detection test module
 
-use super::{KeyboardTest, TestResult, ResultStatus};
-use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, keymap};
-use std::collections::HashSet;
+use super::{KeyboardTest, ResultStatus, TestResult};
+use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 /// Common shortcuts that might cause conflicts
@@ -51,10 +51,18 @@ impl ModifierState {
 
     fn to_prefix(&self) -> String {
         let mut parts = Vec::new();
-        if self.ctrl { parts.push("Ctrl"); }
-        if self.alt { parts.push("Alt"); }
-        if self.shift { parts.push("Shift"); }
-        if self.super_key { parts.push("Super"); }
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.super_key {
+            parts.push("Super");
+        }
         if parts.is_empty() {
             String::new()
         } else {
@@ -70,7 +78,7 @@ pub struct ShortcutTest {
     /// Currently pressed non-modifier keys
     pressed_keys: HashSet<KeyCode>,
     /// History of detected shortcuts
-    shortcut_history: Vec<ShortcutEvent>,
+    shortcut_history: VecDeque<ShortcutEvent>,
     /// Count of shortcuts detected
     total_shortcuts: u32,
     /// Count of known conflicts detected
@@ -86,7 +94,7 @@ impl ShortcutTest {
         Self {
             modifiers: ModifierState::default(),
             pressed_keys: HashSet::new(),
-            shortcut_history: Vec::new(),
+            shortcut_history: VecDeque::new(),
             total_shortcuts: 0,
             conflict_count: 0,
             start_time: None,
@@ -148,11 +156,11 @@ impl ShortcutTest {
         }
 
         self.last_shortcut = Some(event.clone());
-        self.shortcut_history.push(event);
+        self.shortcut_history.push_back(event);
 
         // Keep only last 50 shortcuts
         if self.shortcut_history.len() > 50 {
-            self.shortcut_history.remove(0);
+            self.shortcut_history.pop_front();
         }
     }
 
@@ -250,11 +258,7 @@ impl KeyboardTest for ShortcutTest {
             } else {
                 ResultStatus::Info
             };
-            results.push(TestResult::new(
-                "Last Shortcut",
-                &last.combo,
-                status,
-            ));
+            results.push(TestResult::new("Last Shortcut", &last.combo, status));
             if let Some(desc) = &last.description {
                 results.push(TestResult::warning("  Action", desc.clone()));
             }
