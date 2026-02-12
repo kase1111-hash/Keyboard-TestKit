@@ -37,6 +37,7 @@
 
 mod event;
 pub mod keymap;
+pub mod layout;
 pub mod remap;
 mod state;
 
@@ -45,6 +46,7 @@ pub mod evdev_listener;
 
 pub use event::{KeyEvent, KeyEventType, KeyboardListener};
 pub use keymap::{get_key_info, KeyCode, KeyInfo, KEYMAP};
+pub use layout::KeyboardLayout;
 pub use state::{KeyState, KeyboardState};
 
 #[cfg(target_os = "linux")]

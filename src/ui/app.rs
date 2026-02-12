@@ -1,6 +1,7 @@
 //! Main application state and logic
 
 use crate::config::{Config, Theme};
+use crate::keyboard::layout::KeyboardLayout;
 use crate::keyboard::remap::FnKeyMode;
 use crate::keyboard::{KeyEvent, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
@@ -152,6 +153,8 @@ pub struct App {
     pub last_shortcut_desc: Option<String>,
     /// When the last shortcut was detected (for overlay timeout)
     pub last_shortcut_time: Option<Instant>,
+    /// Detected keyboard layout
+    pub keyboard_layout: KeyboardLayout,
 }
 
 impl App {
@@ -176,6 +179,7 @@ impl App {
         }
 
         let theme_colors = ThemeColors::from_theme(config.ui.theme);
+        let keyboard_layout = KeyboardLayout::detect();
 
         Self {
             view: AppView::Dashboard,
@@ -200,6 +204,50 @@ impl App {
             last_shortcut_combo: None,
             last_shortcut_desc: None,
             last_shortcut_time: None,
+            keyboard_layout,
+        }
+    }
+
+    /// Returns mutable references to all 8 test modules for batch operations.
+    fn all_tests_mut(&mut self) -> [&mut dyn KeyboardTest; 8] {
+        [
+            &mut self.polling_test,
+            &mut self.hold_release_test,
+            &mut self.stickiness_test,
+            &mut self.rollover_test,
+            &mut self.event_timing_test,
+            &mut self.shortcut_test,
+            &mut self.virtual_test,
+            &mut self.oem_test,
+        ]
+    }
+
+    /// Returns immutable references to all 8 test modules.
+    fn all_tests(&self) -> [&dyn KeyboardTest; 8] {
+        [
+            &self.polling_test,
+            &self.hold_release_test,
+            &self.stickiness_test,
+            &self.rollover_test,
+            &self.event_timing_test,
+            &self.shortcut_test,
+            &self.virtual_test,
+            &self.oem_test,
+        ]
+    }
+
+    /// Map an AppView (for test views 1-8) to the corresponding test index.
+    fn test_index_for_view(view: AppView) -> Option<usize> {
+        match view {
+            AppView::PollingRate => Some(0),
+            AppView::HoldRelease => Some(1),
+            AppView::Stickiness => Some(2),
+            AppView::Rollover => Some(3),
+            AppView::Latency => Some(4),
+            AppView::Shortcuts => Some(5),
+            AppView::Virtual => Some(6),
+            AppView::OemKeys => Some(7),
+            _ => None,
         }
     }
 
@@ -212,23 +260,14 @@ impl App {
         self.total_events += 1;
         self.keyboard_state.process_event(event);
 
-        // Track shortcuts before processing (for overlay)
-        let shortcuts_before = self.shortcut_test.recent_shortcuts(1).len();
+        // Dispatch to all tests
+        for test in self.all_tests_mut() {
+            test.process_event(event);
+        }
 
-        // Process through all tests
-        self.polling_test.process_event(event);
-        self.hold_release_test.process_event(event);
-        self.stickiness_test.process_event(event);
-        self.rollover_test.process_event(event);
-        self.event_timing_test.process_event(event);
-        self.shortcut_test.process_event(event);
-        self.virtual_test.process_event(event);
-        self.oem_test.process_event(event);
-
-        // Check if a new shortcut was detected (for overlay)
-        let shortcuts_after = self.shortcut_test.recent_shortcuts(1);
-        if shortcuts_after.len() > shortcuts_before || shortcuts_before == 0 {
-            if let Some(last) = shortcuts_after.first() {
+        // Update shortcut overlay if a new shortcut was just detected
+        if let Some(last) = self.shortcut_test.recent_shortcuts(1).first() {
+            if last.timestamp.elapsed().as_millis() < 100 {
                 self.last_shortcut_combo = Some(last.combo.clone());
                 self.last_shortcut_desc = last.description.clone();
                 self.last_shortcut_time = Some(Instant::now());
@@ -295,54 +334,19 @@ impl App {
     /// Reset all tests
     pub fn reset_all(&mut self) {
         self.keyboard_state.reset();
-        self.polling_test.reset();
-        self.hold_release_test.reset();
-        self.stickiness_test.reset();
-        self.rollover_test.reset();
-        self.event_timing_test.reset();
-        self.shortcut_test.reset();
-        self.virtual_test.reset();
-        self.oem_test.reset();
+        for test in self.all_tests_mut() {
+            test.reset();
+        }
         self.total_events = 0;
         self.set_status("All tests reset".to_string());
     }
 
     /// Reset current test
     pub fn reset_current(&mut self) {
-        match self.view {
-            AppView::PollingRate => {
-                self.polling_test.reset();
-                self.set_status("Polling rate test reset".to_string());
-            }
-            AppView::HoldRelease => {
-                self.hold_release_test.reset();
-                self.set_status("Hold/release test reset".to_string());
-            }
-            AppView::Stickiness => {
-                self.stickiness_test.reset();
-                self.set_status("Stickiness test reset".to_string());
-            }
-            AppView::Rollover => {
-                self.rollover_test.reset();
-                self.set_status("Rollover test reset".to_string());
-            }
-            AppView::Latency => {
-                self.event_timing_test.reset();
-                self.set_status("Latency test reset".to_string());
-            }
-            AppView::Shortcuts => {
-                self.shortcut_test.reset();
-                self.set_status("Shortcut test reset".to_string());
-            }
-            AppView::Virtual => {
-                self.virtual_test.reset();
-                self.set_status("Virtual detection test reset".to_string());
-            }
-            AppView::OemKeys => {
-                self.oem_test.reset();
-                self.set_status("OEM key test reset".to_string());
-            }
-            _ => {}
+        if let Some(idx) = Self::test_index_for_view(self.view) {
+            let name = self.all_tests()[idx].name().to_string();
+            self.all_tests_mut()[idx].reset();
+            self.set_status(format!("{} reset", name));
         }
     }
 
@@ -364,15 +368,14 @@ impl App {
     pub fn current_results(&self) -> Vec<TestResult> {
         match self.view {
             AppView::Dashboard => self.dashboard_results(),
-            AppView::PollingRate => self.polling_test.get_results(),
-            AppView::HoldRelease => self.hold_release_test.get_results(),
-            AppView::Stickiness => self.stickiness_test.get_results(),
-            AppView::Rollover => self.rollover_test.get_results(),
-            AppView::Latency => self.event_timing_test.get_results(),
-            AppView::Shortcuts => self.shortcut_test.get_results(),
-            AppView::Virtual => self.virtual_test.get_results(),
-            AppView::OemKeys => self.oem_test.get_results(),
             AppView::Help | AppView::Settings => Vec::new(),
+            other => {
+                if let Some(idx) = Self::test_index_for_view(other) {
+                    self.all_tests()[idx].get_results()
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -406,6 +409,11 @@ impl App {
                 format!("{:.0} Hz", rate),
             ));
         }
+
+        results.push(TestResult::info(
+            "Layout",
+            self.keyboard_layout.name().to_string(),
+        ));
 
         results
     }
