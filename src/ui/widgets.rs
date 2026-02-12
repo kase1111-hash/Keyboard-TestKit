@@ -1,5 +1,6 @@
 //! Custom TUI widgets
 
+use super::theme::ThemeColors;
 use crate::tests::{ResultStatus, TestResult};
 use ratatui::{
     buffer::Buffer,
@@ -10,35 +11,33 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
-/// Sleek color palette - minimal, high contrast
-mod palette {
-    use ratatui::style::Color;
-    pub const BG: Color = Color::Rgb(22, 22, 30);
-    pub const FG: Color = Color::Rgb(200, 200, 210);
-    pub const DIM: Color = Color::Rgb(90, 90, 110);
-    pub const CYAN: Color = Color::Rgb(80, 200, 220);
-    pub const GREEN: Color = Color::Rgb(80, 200, 120);
-    pub const YELLOW: Color = Color::Rgb(240, 180, 80);
-    pub const RED: Color = Color::Rgb(240, 90, 100);
-}
-
 /// Widget for displaying test results
 pub struct ResultsPanel<'a> {
     results: &'a [TestResult],
     title: &'a str,
+    colors: ThemeColors,
 }
 
 impl<'a> ResultsPanel<'a> {
     pub fn new(results: &'a [TestResult], title: &'a str) -> Self {
-        Self { results, title }
+        Self {
+            results,
+            title,
+            colors: ThemeColors::dark(),
+        }
     }
 
-    fn status_style(status: ResultStatus) -> (Color, &'static str) {
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
+    }
+
+    fn status_style(&self, status: ResultStatus) -> (Color, &'static str) {
         match status {
-            ResultStatus::Ok => (palette::GREEN, "✓"),
-            ResultStatus::Warning => (palette::YELLOW, "!"),
-            ResultStatus::Error => (palette::RED, "✗"),
-            ResultStatus::Info => (palette::DIM, "·"),
+            ResultStatus::Ok => (self.colors.green, "✓"),
+            ResultStatus::Warning => (self.colors.yellow, "!"),
+            ResultStatus::Error => (self.colors.red, "✗"),
+            ResultStatus::Info => (self.colors.dim, "·"),
         }
     }
 }
@@ -49,7 +48,7 @@ impl<'a> Widget for ResultsPanel<'a> {
             .title(format!(" {} ", self.title))
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(palette::DIM));
+            .border_style(Style::default().fg(self.colors.dim));
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -69,16 +68,16 @@ impl<'a> Widget for ResultsPanel<'a> {
                     y,
                     text,
                     Style::default()
-                        .fg(palette::CYAN)
+                        .fg(self.colors.cyan)
                         .add_modifier(Modifier::BOLD),
                 );
             } else if !result.label.is_empty() || !result.value.is_empty() {
-                let (color, sym) = Self::status_style(result.status);
+                let (color, sym) = self.status_style(result.status);
                 let line = Line::from(vec![
                     Span::styled(format!(" {} ", sym), Style::default().fg(color)),
                     Span::styled(
                         format!("{:<18}", result.label),
-                        Style::default().fg(palette::FG),
+                        Style::default().fg(self.colors.fg),
                     ),
                     Span::styled(
                         &result.value,
@@ -93,7 +92,28 @@ impl<'a> Widget for ResultsPanel<'a> {
 }
 
 /// Widget for the help screen
-pub struct HelpPanel;
+pub struct HelpPanel {
+    colors: ThemeColors,
+}
+
+impl HelpPanel {
+    pub fn new() -> Self {
+        Self {
+            colors: ThemeColors::dark(),
+        }
+    }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
+    }
+}
+
+impl Default for HelpPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Widget for HelpPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -101,17 +121,17 @@ impl Widget for HelpPanel {
             .title(" ⌨ Help ")
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(palette::CYAN));
+            .border_style(Style::default().fg(self.colors.cyan));
 
         let inner = block.inner(area);
         block.render(area, buf);
 
         let logo = [
-            ("", palette::CYAN),
-            ("  ╭───────────────────────────────╮", palette::CYAN),
-            ("  │  ⌨  KEYBOARD TESTKIT  v0.1   │", palette::CYAN),
-            ("  ╰───────────────────────────────╯", palette::CYAN),
-            ("", palette::DIM),
+            ("", self.colors.cyan),
+            ("  ╭───────────────────────────────╮", self.colors.cyan),
+            ("  │  ⌨  KEYBOARD TESTKIT  v0.1   │", self.colors.cyan),
+            ("  ╰───────────────────────────────╯", self.colors.cyan),
+            ("", self.colors.dim),
         ];
 
         let mut y = inner.y;
@@ -143,6 +163,7 @@ impl Widget for HelpPanel {
                     ("Space", "Pause"),
                     ("r/R", "Reset"),
                     ("e", "Export"),
+                    ("t", "Toggle theme"),
                     ("?", "Help"),
                 ][..],
             ),
@@ -180,7 +201,7 @@ impl Widget for HelpPanel {
                 y,
                 *header,
                 Style::default()
-                    .fg(palette::CYAN)
+                    .fg(self.colors.cyan)
                     .add_modifier(Modifier::BOLD),
             );
             y += 1;
@@ -192,9 +213,9 @@ impl Widget for HelpPanel {
                 let line = Line::from(vec![
                     Span::styled(
                         format!("  {:<8}", key),
-                        Style::default().fg(palette::YELLOW),
+                        Style::default().fg(self.colors.yellow),
                     ),
-                    Span::styled(*desc, Style::default().fg(palette::DIM)),
+                    Span::styled(*desc, Style::default().fg(self.colors.dim)),
                 ]);
                 buf.set_line(inner.x, y, &line, inner.width);
                 y += 1;
@@ -211,6 +232,7 @@ pub struct StatusBar<'a> {
     elapsed: &'a str,
     events: u64,
     message: Option<&'a str>,
+    colors: ThemeColors,
 }
 
 impl<'a> StatusBar<'a> {
@@ -221,6 +243,7 @@ impl<'a> StatusBar<'a> {
             elapsed,
             events,
             message: None,
+            colors: ThemeColors::dark(),
         }
     }
 
@@ -228,26 +251,31 @@ impl<'a> StatusBar<'a> {
         self.message = message;
         self
     }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
+    }
 }
 
 impl<'a> Widget for StatusBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let bg = Style::default().bg(palette::BG).fg(palette::FG);
+        let bg = Style::default().bg(self.colors.bg).fg(self.colors.fg);
         for x in area.x..area.x + area.width {
             buf.set_string(x, area.y, " ", bg);
         }
 
         let (icon, color) = if self.state == "RUNNING" {
-            ("▶", palette::GREEN)
+            ("▶", self.colors.green)
         } else {
-            ("▪", palette::YELLOW)
+            ("▪", self.colors.yellow)
         };
 
         buf.set_string(
             area.x + 1,
             area.y,
             icon,
-            Style::default().bg(palette::BG).fg(color),
+            Style::default().bg(self.colors.bg).fg(color),
         );
 
         let left = format!(" {} │ {}", self.state, self.view);
@@ -259,7 +287,7 @@ impl<'a> Widget for StatusBar<'a> {
                 x,
                 area.y,
                 msg,
-                Style::default().bg(palette::BG).fg(palette::YELLOW),
+                Style::default().bg(self.colors.bg).fg(self.colors.yellow),
             );
         }
 
@@ -273,17 +301,27 @@ impl<'a> Widget for StatusBar<'a> {
 pub struct TabBar<'a> {
     tabs: &'a [&'a str],
     selected: usize,
+    colors: ThemeColors,
 }
 
 impl<'a> TabBar<'a> {
     pub fn new(tabs: &'a [&'a str], selected: usize) -> Self {
-        Self { tabs, selected }
+        Self {
+            tabs,
+            selected,
+            colors: ThemeColors::dark(),
+        }
+    }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
     }
 }
 
 impl<'a> Widget for TabBar<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let bg = Style::default().bg(palette::BG);
+        let bg = Style::default().bg(self.colors.bg);
         for x in area.x..area.x + area.width {
             buf.set_string(x, area.y, " ", bg);
         }
@@ -293,20 +331,20 @@ impl<'a> Widget for TabBar<'a> {
             let sel = i == self.selected;
             let style = if sel {
                 Style::default()
-                    .fg(palette::CYAN)
-                    .bg(palette::BG)
+                    .fg(self.colors.cyan)
+                    .bg(self.colors.bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(palette::DIM).bg(palette::BG)
+                Style::default().fg(self.colors.dim).bg(self.colors.bg)
             };
 
             let num_style = if sel {
                 Style::default()
-                    .fg(palette::YELLOW)
-                    .bg(palette::BG)
+                    .fg(self.colors.yellow)
+                    .bg(self.colors.bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(palette::DIM).bg(palette::BG)
+                Style::default().fg(self.colors.dim).bg(self.colors.bg)
             };
 
             let label = format!("{}.{}", i + 1, tab);
@@ -315,6 +353,186 @@ impl<'a> Widget for TabBar<'a> {
                 buf.set_string(x + 1, area.y, format!(".{} ", tab), style);
                 x += label.len() as u16 + 2;
             }
+        }
+    }
+}
+
+/// Settings panel widget for in-app configuration
+pub struct SettingsPanel<'a> {
+    items: &'a [SettingsItem],
+    selected: usize,
+    colors: ThemeColors,
+}
+
+/// A single setting in the settings panel
+pub struct SettingsItem {
+    pub label: String,
+    pub value: String,
+    pub editable: bool,
+}
+
+impl<'a> SettingsPanel<'a> {
+    pub fn new(items: &'a [SettingsItem], selected: usize) -> Self {
+        Self {
+            items,
+            selected,
+            colors: ThemeColors::dark(),
+        }
+    }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
+    }
+}
+
+impl<'a> Widget for SettingsPanel<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title(" ⚙ Settings ")
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(self.colors.cyan));
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        // Header
+        let mut y = inner.y;
+        buf.set_string(
+            inner.x + 2,
+            y,
+            "Use ↑↓ to select, ←→ to adjust, s to save",
+            Style::default().fg(self.colors.dim),
+        );
+        y += 2;
+
+        for (i, item) in self.items.iter().enumerate() {
+            if y >= inner.y + inner.height {
+                break;
+            }
+
+            let is_selected = i == self.selected;
+            let (label_style, value_style) = if is_selected {
+                (
+                    Style::default()
+                        .fg(self.colors.cyan)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(self.colors.yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    Style::default().fg(self.colors.fg),
+                    Style::default().fg(self.colors.dim),
+                )
+            };
+
+            let cursor = if is_selected { "▸ " } else { "  " };
+            let cursor_style = Style::default().fg(self.colors.cyan);
+
+            let line = Line::from(vec![
+                Span::styled(cursor, cursor_style),
+                Span::styled(format!("{:<30}", item.label), label_style),
+                Span::styled(&item.value, value_style),
+            ]);
+            buf.set_line(inner.x, y, &line, inner.width);
+            y += 1;
+        }
+
+        // Footer
+        if y + 2 < inner.y + inner.height {
+            y += 1;
+            buf.set_string(
+                inner.x + 2,
+                y,
+                "s = Save to config file",
+                Style::default().fg(self.colors.dim),
+            );
+        }
+    }
+}
+
+/// Shortcut warning overlay - displayed in any view when a shortcut is detected
+pub struct ShortcutOverlay<'a> {
+    combo: &'a str,
+    description: Option<&'a str>,
+    colors: ThemeColors,
+}
+
+impl<'a> ShortcutOverlay<'a> {
+    pub fn new(combo: &'a str) -> Self {
+        Self {
+            combo,
+            description: None,
+            colors: ThemeColors::dark(),
+        }
+    }
+
+    pub fn description(mut self, desc: Option<&'a str>) -> Self {
+        self.description = desc;
+        self
+    }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
+    }
+}
+
+impl<'a> Widget for ShortcutOverlay<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // Render as a floating box in the top-right
+        let width = (self.combo.len() as u16 + 8).max(20).min(area.width);
+        let height = if self.description.is_some() { 3 } else { 2 };
+
+        if area.width < width + 2 || area.height < height {
+            return;
+        }
+
+        let x = area.x + area.width - width - 1;
+        let y = area.y;
+
+        // Background
+        let bg_style = Style::default()
+            .bg(self.colors.bg)
+            .fg(self.colors.yellow);
+        for dy in 0..height {
+            for dx in 0..width {
+                if x + dx < area.x + area.width && y + dy < area.y + area.height {
+                    buf.set_string(x + dx, y + dy, " ", bg_style);
+                }
+            }
+        }
+
+        // Border top
+        buf.set_string(
+            x,
+            y,
+            format!("╭{}╮", "─".repeat((width - 2) as usize)),
+            Style::default().fg(self.colors.yellow).bg(self.colors.bg),
+        );
+
+        // Content
+        let content = format!(" ⚡ {} ", self.combo);
+        buf.set_string(
+            x + 1,
+            y + 1,
+            &content,
+            Style::default()
+                .fg(self.colors.yellow)
+                .bg(self.colors.bg)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        if let Some(desc) = self.description {
+            buf.set_string(
+                x + 1,
+                y + 2,
+                format!(" {} ", desc),
+                Style::default().fg(self.colors.dim).bg(self.colors.bg),
+            );
         }
     }
 }

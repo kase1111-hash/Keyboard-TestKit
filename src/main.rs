@@ -13,17 +13,21 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::Style,
     symbols::border,
     widgets::{Block, Borders},
     Terminal,
 };
-use std::{io::stdout, sync::mpsc};
+use std::io::stdout;
+use std::sync::mpsc;
 
 use keyboard_testkit::{
     config::Config,
     keyboard::{KeyEvent, KeyboardListener},
-    ui::{App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, StatusBar, TabBar},
+    ui::{
+        App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, SettingsPanel,
+        ShortcutOverlay, StatusBar, TabBar,
+    },
 };
 
 #[cfg(target_os = "linux")]
@@ -92,6 +96,9 @@ fn main() -> Result<()> {
             app.process_event(&key_event);
         }
 
+        // Get current theme
+        let colors = app.theme_colors;
+
         // Draw UI
         terminal.draw(|frame| {
             let size = frame.area();
@@ -109,7 +116,7 @@ fn main() -> Result<()> {
 
             // Tab bar
             let tab_names: Vec<&str> = AppView::all().iter().map(|v| v.name()).collect();
-            let tab_bar = TabBar::new(&tab_names, app.view.index());
+            let tab_bar = TabBar::new(&tab_names, app.view.index()).theme(colors);
             frame.render_widget(tab_bar, chunks[0]);
 
             // Keyboard visual
@@ -117,22 +124,37 @@ fn main() -> Result<()> {
                 .title(" ⌨ Keyboard ")
                 .borders(Borders::ALL)
                 .border_set(border::ROUNDED)
-                .border_style(Style::default().fg(Color::Rgb(90, 90, 110)));
+                .border_style(Style::default().fg(colors.dim));
             let kb_inner = kb_block.inner(chunks[1]);
             frame.render_widget(kb_block, chunks[1]);
-            let kb_visual = KeyboardVisual::new(&app.keyboard_state);
+            let kb_visual = KeyboardVisual::new(&app.keyboard_state).theme(colors);
             frame.render_widget(kb_visual, kb_inner);
 
             // Main content area
             match app.view {
                 AppView::Help => {
-                    frame.render_widget(HelpPanel, chunks[2]);
+                    frame.render_widget(HelpPanel::new().theme(colors), chunks[2]);
+                }
+                AppView::Settings => {
+                    let items = app.settings_items();
+                    let panel =
+                        SettingsPanel::new(&items, app.settings_selected).theme(colors);
+                    frame.render_widget(panel, chunks[2]);
                 }
                 _ => {
                     let results = app.current_results();
-                    let panel = ResultsPanel::new(&results, app.view.name());
+                    let panel =
+                        ResultsPanel::new(&results, app.view.name()).theme(colors);
                     frame.render_widget(panel, chunks[2]);
                 }
+            }
+
+            // Shortcut overlay (shown in any view)
+            if let Some((combo, desc)) = app.shortcut_overlay() {
+                let overlay = ShortcutOverlay::new(combo)
+                    .description(desc)
+                    .theme(colors);
+                frame.render_widget(overlay, chunks[2]);
             }
 
             // Status bar
@@ -143,74 +165,124 @@ fn main() -> Result<()> {
             };
             let elapsed = app.elapsed_formatted();
             let status = StatusBar::new(state_str, app.view.name(), &elapsed, app.total_events)
-                .message(app.get_status());
+                .message(app.get_status())
+                .theme(colors);
             frame.render_widget(status, chunks[3]);
         })?;
 
         // Handle terminal events (for navigation/control)
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
-                match key.code {
-                    CtKeyCode::Char('q') | CtKeyCode::Esc => {
-                        app.quit();
-                    }
-                    CtKeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.prev_view();
-                    }
-                    CtKeyCode::Tab => {
-                        app.next_view();
-                    }
-                    CtKeyCode::Char('m') => app.toggle_shortcuts(),
-                    CtKeyCode::Char('1') if app.shortcuts_enabled => app.view = AppView::Dashboard,
-                    CtKeyCode::Char('2') if app.shortcuts_enabled => {
-                        app.view = AppView::PollingRate
-                    }
-                    CtKeyCode::Char('3') if app.shortcuts_enabled => {
-                        app.view = AppView::HoldRelease
-                    }
-                    CtKeyCode::Char('4') if app.shortcuts_enabled => app.view = AppView::Stickiness,
-                    CtKeyCode::Char('5') if app.shortcuts_enabled => app.view = AppView::Rollover,
-                    CtKeyCode::Char('6') if app.shortcuts_enabled => app.view = AppView::Latency,
-                    CtKeyCode::Char('7') if app.shortcuts_enabled => app.view = AppView::Shortcuts,
-                    CtKeyCode::Char('8') if app.shortcuts_enabled => app.view = AppView::Virtual,
-                    CtKeyCode::Char('9') if app.shortcuts_enabled => app.view = AppView::OemKeys,
-                    CtKeyCode::Char('0') if app.shortcuts_enabled => app.view = AppView::Help,
-                    CtKeyCode::Char('v') => {
-                        // Trigger virtual key test when on Virtual view
-                        if app.view == AppView::Virtual {
-                            app.virtual_test.request_virtual_test();
+                // Settings view has its own key handling
+                if app.view == AppView::Settings {
+                    match key.code {
+                        CtKeyCode::Char('q') | CtKeyCode::Esc => {
+                            app.view = AppView::Dashboard; // Back to dashboard
                         }
-                    }
-                    CtKeyCode::Char('a') => {
-                        // Add mapping for last detected unknown key when on OEM view
-                        if app.view == AppView::OemKeys {
-                            app.add_oem_mapping_for_last_unknown();
+                        CtKeyCode::Up => {
+                            if app.settings_selected > 0 {
+                                app.settings_selected -= 1;
+                            }
                         }
-                    }
-                    CtKeyCode::Char('f') => {
-                        // Cycle FN mode when on OEM view
-                        if app.view == AppView::OemKeys {
-                            app.cycle_fn_mode();
+                        CtKeyCode::Down => {
+                            let item_count = app.settings_items().len();
+                            if app.settings_selected + 1 < item_count {
+                                app.settings_selected += 1;
+                            }
                         }
-                    }
-                    CtKeyCode::Char('c') => {
-                        // Clear OEM mappings when on OEM view
-                        if app.view == AppView::OemKeys {
-                            app.clear_oem_mappings();
+                        CtKeyCode::Right => {
+                            app.adjust_setting(true);
                         }
+                        CtKeyCode::Left => {
+                            app.adjust_setting(false);
+                        }
+                        CtKeyCode::Char('s') => {
+                            app.save_config();
+                        }
+                        CtKeyCode::Tab => {
+                            app.next_view();
+                        }
+                        _ => {}
                     }
-                    CtKeyCode::Char('?') => app.view = AppView::Help,
-                    CtKeyCode::Char(' ') => app.toggle_pause(),
-                    CtKeyCode::Char('r') => app.reset_current(),
-                    CtKeyCode::Char('R') => app.reset_all(),
-                    CtKeyCode::Char('e') => {
-                        let filename = format!(
-                            "keyboard_report_{}.json",
-                            chrono::Utc::now().format("%Y%m%d_%H%M%S")
-                        );
-                        let _ = app.export_report(&filename);
+                } else {
+                    match key.code {
+                        CtKeyCode::Char('q') | CtKeyCode::Esc => {
+                            app.quit();
+                        }
+                        CtKeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            app.prev_view();
+                        }
+                        CtKeyCode::Tab => {
+                            app.next_view();
+                        }
+                        CtKeyCode::Char('m') => app.toggle_shortcuts(),
+                        CtKeyCode::Char('t') => app.toggle_theme(),
+                        CtKeyCode::Char('S') => {
+                            app.view = AppView::Settings;
+                        }
+                        CtKeyCode::Char('1') if app.shortcuts_enabled => {
+                            app.view = AppView::Dashboard
+                        }
+                        CtKeyCode::Char('2') if app.shortcuts_enabled => {
+                            app.view = AppView::PollingRate
+                        }
+                        CtKeyCode::Char('3') if app.shortcuts_enabled => {
+                            app.view = AppView::HoldRelease
+                        }
+                        CtKeyCode::Char('4') if app.shortcuts_enabled => {
+                            app.view = AppView::Stickiness
+                        }
+                        CtKeyCode::Char('5') if app.shortcuts_enabled => {
+                            app.view = AppView::Rollover
+                        }
+                        CtKeyCode::Char('6') if app.shortcuts_enabled => {
+                            app.view = AppView::Latency
+                        }
+                        CtKeyCode::Char('7') if app.shortcuts_enabled => {
+                            app.view = AppView::Shortcuts
+                        }
+                        CtKeyCode::Char('8') if app.shortcuts_enabled => {
+                            app.view = AppView::Virtual
+                        }
+                        CtKeyCode::Char('9') if app.shortcuts_enabled => {
+                            app.view = AppView::OemKeys
+                        }
+                        CtKeyCode::Char('0') if app.shortcuts_enabled => {
+                            app.view = AppView::Help
+                        }
+                        CtKeyCode::Char('v') => {
+                            if app.view == AppView::Virtual {
+                                app.virtual_test.request_virtual_test();
+                            }
+                        }
+                        CtKeyCode::Char('a') => {
+                            if app.view == AppView::OemKeys {
+                                app.add_oem_mapping_for_last_unknown();
+                            }
+                        }
+                        CtKeyCode::Char('f') => {
+                            if app.view == AppView::OemKeys {
+                                app.cycle_fn_mode();
+                            }
+                        }
+                        CtKeyCode::Char('c') => {
+                            if app.view == AppView::OemKeys {
+                                app.clear_oem_mappings();
+                            }
+                        }
+                        CtKeyCode::Char('?') => app.view = AppView::Help,
+                        CtKeyCode::Char(' ') => app.toggle_pause(),
+                        CtKeyCode::Char('r') => app.reset_current(),
+                        CtKeyCode::Char('R') => app.reset_all(),
+                        CtKeyCode::Char('e') => {
+                            let filename = format!(
+                                "keyboard_report_{}.json",
+                                chrono::Utc::now().format("%Y%m%d_%H%M%S")
+                            );
+                            let _ = app.export_report(&filename);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }

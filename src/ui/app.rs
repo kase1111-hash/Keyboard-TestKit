@@ -1,6 +1,6 @@
 //! Main application state and logic
 
-use crate::config::Config;
+use crate::config::{Config, Theme};
 use crate::keyboard::remap::FnKeyMode;
 use crate::keyboard::{KeyEvent, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
@@ -8,6 +8,8 @@ use crate::tests::{
     EventTimingTest, HoldReleaseTest, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest,
     ShortcutTest, StickinessTest, TestResult, VirtualKeyboardTest,
 };
+use crate::ui::theme::ThemeColors;
+use crate::ui::widgets::SettingsItem;
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,6 +26,7 @@ pub enum AppView {
     Virtual,
     OemKeys,
     Help,
+    Settings,
 }
 
 impl AppView {
@@ -39,10 +42,12 @@ impl AppView {
             Self::Virtual => "Virtual",
             Self::OemKeys => "OEM/FN",
             Self::Help => "Help",
+            Self::Settings => "Settings",
         }
     }
 
-    pub fn all() -> &'static [AppView] {
+    /// Views shown in the tab bar (excludes Settings which is accessed via 's')
+    pub fn tab_views() -> &'static [AppView] {
         &[
             Self::Dashboard,
             Self::PollingRate,
@@ -57,6 +62,10 @@ impl AppView {
         ]
     }
 
+    pub fn all() -> &'static [AppView] {
+        Self::tab_views()
+    }
+
     pub fn index(&self) -> usize {
         match self {
             Self::Dashboard => 0,
@@ -69,6 +78,7 @@ impl AppView {
             Self::Virtual => 7,
             Self::OemKeys => 8,
             Self::Help => 9,
+            Self::Settings => 10,
         }
     }
 
@@ -132,6 +142,16 @@ pub struct App {
     pub status_time: Option<Instant>,
     /// Whether number key shortcuts are enabled
     pub shortcuts_enabled: bool,
+    /// Current theme colors
+    pub theme_colors: ThemeColors,
+    /// Selected setting index in Settings view
+    pub settings_selected: usize,
+    /// Last detected shortcut for overlay display
+    pub last_shortcut_combo: Option<String>,
+    /// Last shortcut description for overlay
+    pub last_shortcut_desc: Option<String>,
+    /// When the last shortcut was detected (for overlay timeout)
+    pub last_shortcut_time: Option<Instant>,
 }
 
 impl App {
@@ -155,6 +175,8 @@ impl App {
             oem_test.remapper_mut().add_fn_combo(*key, *result);
         }
 
+        let theme_colors = ThemeColors::from_theme(config.ui.theme);
+
         Self {
             view: AppView::Dashboard,
             state: AppState::Running,
@@ -173,6 +195,11 @@ impl App {
             status_message: None,
             status_time: None,
             shortcuts_enabled: true,
+            theme_colors,
+            settings_selected: 0,
+            last_shortcut_combo: None,
+            last_shortcut_desc: None,
+            last_shortcut_time: None,
         }
     }
 
@@ -185,6 +212,9 @@ impl App {
         self.total_events += 1;
         self.keyboard_state.process_event(event);
 
+        // Track shortcuts before processing (for overlay)
+        let shortcuts_before = self.shortcut_test.recent_shortcuts(1).len();
+
         // Process through all tests
         self.polling_test.process_event(event);
         self.hold_release_test.process_event(event);
@@ -195,6 +225,16 @@ impl App {
         self.virtual_test.process_event(event);
         self.oem_test.process_event(event);
 
+        // Check if a new shortcut was detected (for overlay)
+        let shortcuts_after = self.shortcut_test.recent_shortcuts(1);
+        if shortcuts_after.len() > shortcuts_before || shortcuts_before == 0 {
+            if let Some(last) = shortcuts_after.first() {
+                self.last_shortcut_combo = Some(last.combo.clone());
+                self.last_shortcut_desc = last.description.clone();
+                self.last_shortcut_time = Some(Instant::now());
+            }
+        }
+
         // Check for stuck keys periodically
         let stuck = self.stickiness_test.check_stuck_keys();
         if !stuck.is_empty() {
@@ -204,16 +244,18 @@ impl App {
 
     /// Switch to the next view
     pub fn next_view(&mut self) {
+        let views = AppView::tab_views();
         let current = self.view.index();
-        let next = (current + 1) % AppView::all().len();
+        let next = (current + 1) % views.len();
         self.view = AppView::from_index(next);
     }
 
     /// Switch to the previous view
     pub fn prev_view(&mut self) {
+        let views = AppView::tab_views();
         let current = self.view.index();
         let prev = if current == 0 {
-            AppView::all().len() - 1
+            views.len() - 1
         } else {
             current - 1
         };
@@ -330,7 +372,7 @@ impl App {
             AppView::Shortcuts => self.shortcut_test.get_results(),
             AppView::Virtual => self.virtual_test.get_results(),
             AppView::OemKeys => self.oem_test.get_results(),
-            AppView::Help => Vec::new(),
+            AppView::Help | AppView::Settings => Vec::new(),
         }
     }
 
@@ -451,6 +493,162 @@ impl App {
     pub fn clear_oem_mappings(&mut self) {
         self.oem_test.remapper_mut().clear_mappings();
         self.set_status("OEM key mappings cleared".to_string());
+    }
+
+    /// Toggle between dark and light theme
+    pub fn toggle_theme(&mut self) {
+        self.config.ui.theme = match self.config.ui.theme {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::Dark,
+        };
+        self.theme_colors = ThemeColors::from_theme(self.config.ui.theme);
+        let name = match self.config.ui.theme {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+        };
+        self.set_status(format!("Theme: {}", name));
+    }
+
+    /// Build settings items for display in Settings view
+    pub fn settings_items(&self) -> Vec<SettingsItem> {
+        vec![
+            SettingsItem {
+                label: "Polling Test Duration (sec)".to_string(),
+                value: format!("{}", self.config.polling.test_duration_secs),
+                editable: true,
+            },
+            SettingsItem {
+                label: "Stuck Key Threshold (ms)".to_string(),
+                value: format!("{}", self.config.stickiness.stuck_threshold_ms),
+                editable: true,
+            },
+            SettingsItem {
+                label: "Bounce Window (ms)".to_string(),
+                value: format!("{}", self.config.hold_release.bounce_window_ms),
+                editable: true,
+            },
+            SettingsItem {
+                label: "UI Refresh Rate (Hz)".to_string(),
+                value: format!("{}", self.config.ui.refresh_rate_hz),
+                editable: true,
+            },
+            SettingsItem {
+                label: "Theme".to_string(),
+                value: match self.config.ui.theme {
+                    Theme::Dark => "Dark".to_string(),
+                    Theme::Light => "Light".to_string(),
+                },
+                editable: true,
+            },
+            SettingsItem {
+                label: "FN Key Mode".to_string(),
+                value: match self.oem_test.fn_mode() {
+                    FnKeyMode::Disabled => "Disabled".to_string(),
+                    FnKeyMode::CaptureOnly => "Capture Only".to_string(),
+                    FnKeyMode::MapToFKeys => "Map to F-Keys".to_string(),
+                    FnKeyMode::MapToMedia => "Map to Media".to_string(),
+                    FnKeyMode::RestoreWithModifier => "Restore+Modifier".to_string(),
+                },
+                editable: true,
+            },
+            SettingsItem {
+                label: "Warning Duration (sec)".to_string(),
+                value: format!("{}", self.config.ui.warning_duration_secs),
+                editable: true,
+            },
+        ]
+    }
+
+    /// Adjust the currently selected setting up or down
+    pub fn adjust_setting(&mut self, increase: bool) {
+        match self.settings_selected {
+            0 => {
+                // Polling duration
+                if increase {
+                    self.config.polling.test_duration_secs =
+                        self.config.polling.test_duration_secs.saturating_add(5);
+                } else {
+                    self.config.polling.test_duration_secs =
+                        self.config.polling.test_duration_secs.saturating_sub(5).max(5);
+                }
+            }
+            1 => {
+                // Stuck threshold
+                if increase {
+                    self.config.stickiness.stuck_threshold_ms =
+                        self.config.stickiness.stuck_threshold_ms.saturating_add(10);
+                } else {
+                    self.config.stickiness.stuck_threshold_ms = self
+                        .config
+                        .stickiness
+                        .stuck_threshold_ms
+                        .saturating_sub(10)
+                        .max(10);
+                }
+            }
+            2 => {
+                // Bounce window
+                if increase {
+                    self.config.hold_release.bounce_window_ms =
+                        self.config.hold_release.bounce_window_ms.saturating_add(1);
+                } else {
+                    self.config.hold_release.bounce_window_ms = self
+                        .config
+                        .hold_release
+                        .bounce_window_ms
+                        .saturating_sub(1)
+                        .max(1);
+                }
+            }
+            3 => {
+                // Refresh rate
+                if increase {
+                    self.config.ui.refresh_rate_hz =
+                        self.config.ui.refresh_rate_hz.saturating_add(10).min(240);
+                } else {
+                    self.config.ui.refresh_rate_hz =
+                        self.config.ui.refresh_rate_hz.saturating_sub(10).max(10);
+                }
+            }
+            4 => {
+                // Theme toggle
+                self.toggle_theme();
+            }
+            5 => {
+                // FN mode cycle
+                self.cycle_fn_mode();
+            }
+            6 => {
+                // Warning duration
+                if increase {
+                    self.config.ui.warning_duration_secs =
+                        self.config.ui.warning_duration_secs.saturating_add(1).min(30);
+                } else {
+                    self.config.ui.warning_duration_secs =
+                        self.config.ui.warning_duration_secs.saturating_sub(1).max(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Save current config to disk
+    pub fn save_config(&mut self) {
+        match self.config.save() {
+            Ok(()) => self.set_status("Config saved".to_string()),
+            Err(e) => self.set_status(format!("Save failed: {}", e)),
+        }
+    }
+
+    /// Get shortcut overlay info if one should be displayed
+    pub fn shortcut_overlay(&self) -> Option<(&str, Option<&str>)> {
+        if let (Some(combo), Some(time)) = (&self.last_shortcut_combo, self.last_shortcut_time) {
+            let duration = self.config.ui.warning_duration_secs as u64;
+            if time.elapsed().as_secs() < duration {
+                return Some((combo.as_str(), self.last_shortcut_desc.as_deref()));
+            }
+        }
+        None
     }
 }
 
@@ -686,5 +884,59 @@ mod tests {
         let results = app.shortcut_test.get_results();
         let labels: Vec<&str> = results.iter().map(|r| r.label.as_str()).collect();
         assert!(labels.contains(&"Total Shortcuts"));
+    }
+
+    #[test]
+    fn app_toggle_theme() {
+        let mut app = App::default();
+        assert_eq!(app.config.ui.theme, Theme::Dark);
+
+        app.toggle_theme();
+        assert_eq!(app.config.ui.theme, Theme::Light);
+
+        app.toggle_theme();
+        assert_eq!(app.config.ui.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn app_settings_items() {
+        let app = App::default();
+        let items = app.settings_items();
+        assert!(items.len() >= 6);
+        assert_eq!(items[0].label, "Polling Test Duration (sec)");
+        assert_eq!(items[4].label, "Theme");
+    }
+
+    #[test]
+    fn app_adjust_setting() {
+        let mut app = App::default();
+        let original = app.config.polling.test_duration_secs;
+
+        app.settings_selected = 0;
+        app.adjust_setting(true);
+        assert_eq!(
+            app.config.polling.test_duration_secs,
+            original + 5
+        );
+
+        app.adjust_setting(false);
+        assert_eq!(app.config.polling.test_duration_secs, original);
+    }
+
+    #[test]
+    fn app_settings_view() {
+        let app = App {
+            view: AppView::Settings,
+            ..App::default()
+        };
+        let results = app.current_results();
+        assert!(results.is_empty()); // Settings returns empty results (uses settings_items instead)
+    }
+
+    #[test]
+    fn app_shortcut_overlay_timeout() {
+        let app = App::default();
+        // No shortcut detected yet
+        assert!(app.shortcut_overlay().is_none());
     }
 }
