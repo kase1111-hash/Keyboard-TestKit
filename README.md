@@ -129,6 +129,9 @@ keyboard-testkit
 | `R` | Reset all tests |
 | `e` | Export report to JSON |
 | `v` | Send virtual keys (on Virtual view) |
+| `a` | Add last unknown key as FN scancode (on OEM/FN view) |
+| `f` | Cycle FN key mode (on OEM/FN view) |
+| `c` | Clear OEM key mappings (on OEM/FN view) |
 | `?` | Show help |
 | `q` / `Esc` | Quit |
 
@@ -169,7 +172,7 @@ The Virtual Keyboard test helps isolate issues:
 
 ## Export
 
-Press `e` to export a JSON report with test results (covers polling, bounce, stickiness, rollover, and timing tests):
+Press `e` to export a JSON report with results from all 8 tests (polling, bounce, stickiness, rollover, timing, shortcuts, virtual, and OEM/FN):
 
 ```json
 {

@@ -19,7 +19,7 @@
 //! - [`tests`]: Test implementations for various keyboard diagnostics
 //! - [`ui`]: Terminal UI components using ratatui
 //! - [`config`]: Configuration structures for all test parameters
-//! - [`report`]: Session report generation and JSON export
+//! - [`report`]: Session report generation and export (JSON, CSV, Markdown, Text)
 //!
 //! ## Example
 //!

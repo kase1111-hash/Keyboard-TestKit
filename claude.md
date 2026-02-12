@@ -22,7 +22,7 @@ src/
 ├── main.rs              # Entry point & event loop
 ├── lib.rs               # Library exports
 ├── config.rs            # Configuration management (TOML)
-├── report.rs            # JSON report generation
+├── report.rs            # Report generation (JSON, CSV, Markdown, Text)
 ├── utils.rs             # Utility functions
 ├── keyboard/            # Keyboard input handling
 │   ├── event.rs         # KeyEvent types & KeyboardListener
