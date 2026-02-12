@@ -17,8 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Documentation now accurately describes the timing test as measuring inter-event intervals
-- Export section clarifies which tests are included in JSON reports
-- SPEC.md now notes unimplemented features (layout auto-detection, settings panel, shortcut overlay)
+- README export section updated to reflect all 8 tests included in JSON reports
+- README keyboard controls table now documents OEM/FN view keys (a, f, c)
+- SPEC.md now notes unimplemented features (shortcut listing, layout auto-detection, settings panel, shortcut overlay)
+- SPEC.md dependencies list corrected to remove unused capabilities (USB enumeration, window overlay)
+- Source code doc comments fixed: `LatencyTest` renamed to `EventTimingTest` with accurate description
+- `lib.rs` and `claude.md` updated to reflect multi-format report export (JSON, CSV, Markdown, Text)
+- EVALUATION.md updated to reflect resolved issues (report export, FnKeyMode duplication, timing labeling)
 - View count updated to reflect all 10 views including OEM/FN
 
 ## [0.1.0] - 2026-01-23

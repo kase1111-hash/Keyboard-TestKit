@@ -9,7 +9,7 @@
 //! | [`PollingRateTest`] | Measures keyboard polling frequency (Hz) and jitter |
 //! | [`StickinessTest`] | Detects stuck keys that fail to release properly |
 //! | [`RolloverTest`] | Tests N-Key Rollover (NKRO) and ghosting detection |
-//! | [`LatencyTest`] | Measures input-to-system latency per-key and globally |
+//! | [`EventTimingTest`] | Measures inter-event timing intervals per-key and globally |
 //! | [`HoldReleaseTest`] | Analyzes key hold duration and mechanical bounce |
 //! | [`ShortcutTest`] | Validates keyboard shortcut combinations |
 //! | [`VirtualKeyboardTest`] | Compares physical vs virtual key events |

@@ -119,6 +119,8 @@ Physical Works + Virtual Fails = API/Permission Issue
 
 ### 6. Program Shortcut Listing
 
+> **Current status:** This feature is planned but not yet implemented. The current Shortcuts test detects when system hotkeys are pressed during testing, but does not enumerate registered global hotkeys or identify owning processes.
+
 **Purpose:** Display all currently registered global hotkeys on the system.
 
 | Specification | Details |
@@ -242,9 +244,7 @@ Physical Works + Virtual Fails = API/Permission Issue
 
 ### Dependencies
 - Low-level keyboard hook access (admin/root may be required)
-- USB device enumeration
 - High-resolution timer access (sub-millisecond)
-- Window overlay capabilities
 
 ### Performance Targets
 | Metric | Target |
