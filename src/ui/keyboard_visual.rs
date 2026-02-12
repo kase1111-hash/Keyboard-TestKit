@@ -1,6 +1,7 @@
 //! Visual keyboard layout rendering
 
 use super::theme::ThemeColors;
+use crate::keyboard::layout::{layout_rows, KeyboardLayout};
 use crate::keyboard::{KeyCode, KeyboardState};
 use ratatui::{
     buffer::Buffer,
@@ -13,6 +14,7 @@ use ratatui::{
 pub struct KeyboardVisual<'a> {
     keyboard_state: &'a KeyboardState,
     colors: ThemeColors,
+    layout: KeyboardLayout,
 }
 
 impl<'a> KeyboardVisual<'a> {
@@ -20,11 +22,17 @@ impl<'a> KeyboardVisual<'a> {
         Self {
             keyboard_state,
             colors: ThemeColors::dark(),
+            layout: KeyboardLayout::Ansi,
         }
     }
 
     pub fn theme(mut self, colors: ThemeColors) -> Self {
         self.colors = colors;
+        self
+    }
+
+    pub fn layout(mut self, layout: KeyboardLayout) -> Self {
+        self.layout = layout;
         self
     }
 
@@ -61,123 +69,35 @@ impl<'a> Widget for KeyboardVisual<'a> {
             buf.set_string(
                 area.x,
                 area.y,
-                "⌨ Window too small",
+                "\u{2328} Window too small",
                 Style::default().fg(self.colors.key_text),
             );
             return;
         }
 
-        let w = 4u16;
+        let rows = layout_rows(self.layout);
         let x0 = area.x + 1;
         let y0 = area.y;
 
-        // Row 0: Numbers
-        let row0 = [
-            ("`", 41),
-            ("1", 2),
-            ("2", 3),
-            ("3", 4),
-            ("4", 5),
-            ("5", 6),
-            ("6", 7),
-            ("7", 8),
-            ("8", 9),
-            ("9", 10),
-            ("0", 11),
-            ("-", 12),
-            ("=", 13),
-        ];
-        let mut x = x0;
-        for (l, c) in row0 {
-            self.render_key(buf, x, y0, l, KeyCode(c), w);
-            x += w + 1;
-        }
-        self.render_key(buf, x, y0, "←", KeyCode(14), w + 2);
+        for (row_idx, row) in rows.iter().enumerate() {
+            let y = y0 + row_idx as u16;
+            let mut x = x0;
 
-        // Row 1: QWERTY
-        let row1 = [
-            ("Q", 16),
-            ("W", 17),
-            ("E", 18),
-            ("R", 19),
-            ("T", 20),
-            ("Y", 21),
-            ("U", 22),
-            ("I", 23),
-            ("O", 24),
-            ("P", 25),
-            ("[", 26),
-            ("]", 27),
-            ("\\", 43),
-        ];
-        self.render_key(buf, x0, y0 + 1, "⇥", KeyCode(15), w);
-        x = x0 + w + 1;
-        for (l, c) in row1 {
-            self.render_key(buf, x, y0 + 1, l, KeyCode(c), w);
-            x += w + 1;
+            for key in row {
+                self.render_key(buf, x, y, key.label, KeyCode(key.code), key.width);
+                x += key.width + 1;
+            }
         }
 
-        // Row 2: Home
-        let row2 = [
-            ("A", 30),
-            ("S", 31),
-            ("D", 32),
-            ("F", 33),
-            ("G", 34),
-            ("H", 35),
-            ("J", 36),
-            ("K", 37),
-            ("L", 38),
-            (";", 39),
-            ("'", 40),
-        ];
-        self.render_key(buf, x0, y0 + 2, "⇪", KeyCode(58), w + 1);
-        x = x0 + w + 2;
-        for (l, c) in row2 {
-            self.render_key(buf, x, y0 + 2, l, KeyCode(c), w);
-            x += w + 1;
-        }
-        self.render_key(buf, x, y0 + 2, "↵", KeyCode(28), w + 2);
-
-        // Row 3: Shift
-        let row3 = [
-            ("Z", 44),
-            ("X", 45),
-            ("C", 46),
-            ("V", 47),
-            ("B", 48),
-            ("N", 49),
-            ("M", 50),
-            (",", 51),
-            (".", 52),
-            ("/", 53),
-        ];
-        self.render_key(buf, x0, y0 + 3, "⇧", KeyCode(42), w + 2);
-        x = x0 + w + 3;
-        for (l, c) in row3 {
-            self.render_key(buf, x, y0 + 3, l, KeyCode(c), w);
-            x += w + 1;
-        }
-        self.render_key(buf, x, y0 + 3, "⇧", KeyCode(54), w + 3);
-
-        // Row 4: Bottom
-        self.render_key(buf, x0, y0 + 4, "Ctl", KeyCode(29), w);
-        self.render_key(buf, x0 + w + 1, y0 + 4, "◆", KeyCode(125), w);
-        self.render_key(buf, x0 + (w + 1) * 2, y0 + 4, "Alt", KeyCode(56), w);
-        let sp_x = x0 + (w + 1) * 3;
-        let sp_w = (w + 1) * 6;
-        self.render_key(buf, sp_x, y0 + 4, "────", KeyCode(57), sp_w);
-        let rx = sp_x + sp_w + 1;
-        self.render_key(buf, rx, y0 + 4, "Alt", KeyCode(100), w);
-        self.render_key(buf, rx + w + 1, y0 + 4, "Ctl", KeyCode(97), w);
-
-        // Arrows
+        // Arrow keys (rendered separately, offset from main block)
         if area.width > 70 {
-            let ax = rx + (w + 1) * 3;
-            self.render_key(buf, ax + w + 1, y0 + 3, "▲", KeyCode(103), w);
-            self.render_key(buf, ax, y0 + 4, "◀", KeyCode(105), w);
-            self.render_key(buf, ax + w + 1, y0 + 4, "▼", KeyCode(108), w);
-            self.render_key(buf, ax + (w + 1) * 2, y0 + 4, "▶", KeyCode(106), w);
+            let w = 4u16;
+            // Position arrows after the bottom row
+            let ax = x0 + 68;
+            self.render_key(buf, ax + w + 1, y0 + 3, "\u{25B2}", KeyCode(103), w); // ▲
+            self.render_key(buf, ax, y0 + 4, "\u{25C0}", KeyCode(105), w); // ◀
+            self.render_key(buf, ax + w + 1, y0 + 4, "\u{25BC}", KeyCode(108), w); // ▼
+            self.render_key(buf, ax + (w + 1) * 2, y0 + 4, "\u{25B6}", KeyCode(106), w); // ▶
         }
     }
 }

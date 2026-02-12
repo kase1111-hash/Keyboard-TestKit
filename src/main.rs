@@ -127,7 +127,9 @@ fn main() -> Result<()> {
                 .border_style(Style::default().fg(colors.dim));
             let kb_inner = kb_block.inner(chunks[1]);
             frame.render_widget(kb_block, chunks[1]);
-            let kb_visual = KeyboardVisual::new(&app.keyboard_state).theme(colors);
+            let kb_visual = KeyboardVisual::new(&app.keyboard_state)
+                .theme(colors)
+                .layout(app.keyboard_layout);
             frame.render_widget(kb_visual, kb_inner);
 
             // Main content area
