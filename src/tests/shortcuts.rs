@@ -1,4 +1,7 @@
-//! Shortcut detection test module
+//! Shortcut detection and system shortcut enumeration
+//!
+//! Detects modifier key combos in real-time and enumerates known
+//! system-registered hotkeys (desktop environment shortcuts on Linux).
 
 use super::{KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
@@ -21,6 +24,137 @@ const COMMON_CONFLICTS: &[(&str, &[&str])] = &[
     ("Ctrl+Shift+Esc", &["Task manager"]),
     ("PrtSc", &["Screenshot"]),
 ];
+
+/// A system-registered shortcut discovered by enumeration
+#[derive(Debug, Clone)]
+pub struct SystemShortcut {
+    /// The key combination (e.g., "Super+L")
+    pub combo: String,
+    /// The application or DE component that owns it
+    pub application: String,
+    /// What the shortcut does
+    pub action: String,
+}
+
+/// Enumerate system-registered shortcuts on the current platform.
+///
+/// On Linux, queries gsettings for GNOME/GTK shortcuts and parses
+/// common window manager configs. Returns an empty list on unsupported
+/// platforms or if no desktop shortcuts are discoverable.
+pub fn enumerate_system_shortcuts() -> Vec<SystemShortcut> {
+    #[cfg(target_os = "linux")]
+    {
+        enumerate_linux_shortcuts()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_linux_shortcuts() -> Vec<SystemShortcut> {
+    let mut shortcuts = Vec::new();
+
+    // Try gsettings for GNOME/GTK desktop shortcuts
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["list-recursively", "org.gnome.desktop.wm.keybindings"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(shortcut) = parse_gsettings_line(line, "Window Manager") {
+                    shortcuts.push(shortcut);
+                }
+            }
+        }
+    }
+
+    // Try GNOME media keys
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args([
+            "list-recursively",
+            "org.gnome.settings-daemon.plugins.media-keys",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(shortcut) = parse_gsettings_line(line, "Media Keys") {
+                    shortcuts.push(shortcut);
+                }
+            }
+        }
+    }
+
+    // Try GNOME shell keybindings
+    if let Ok(output) = std::process::Command::new("gsettings")
+        .args(["list-recursively", "org.gnome.shell.keybindings"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(shortcut) = parse_gsettings_line(line, "GNOME Shell") {
+                    shortcuts.push(shortcut);
+                }
+            }
+        }
+    }
+
+    shortcuts
+}
+
+#[cfg(target_os = "linux")]
+fn parse_gsettings_line(line: &str, application: &str) -> Option<SystemShortcut> {
+    // Format: "org.gnome.desktop.wm.keybindings close ['<Alt>F4']"
+    let parts: Vec<&str> = line.splitn(3, ' ').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let action = parts[1].to_string();
+    let value = parts[2].trim();
+
+    // Skip disabled shortcuts (empty arrays or ['disabled'])
+    if value == "@as []" || value.contains("disabled") || value == "['']" {
+        return None;
+    }
+
+    // Extract key combo from gsettings array format ['<Super>l', '<Super>L']
+    let combo = value
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .next()?
+        .trim()
+        .trim_matches('\'')
+        .to_string();
+
+    if combo.is_empty() {
+        return None;
+    }
+
+    // Convert gsettings format (<Super>l) to display format (Super+L)
+    let display_combo = combo
+        .replace("<Super>", "Super+")
+        .replace("<Primary>", "Ctrl+")
+        .replace("<Control>", "Ctrl+")
+        .replace("<Alt>", "Alt+")
+        .replace("<Shift>", "Shift+")
+        .replace("<Meta>", "Meta+");
+
+    // Make the action name human-readable
+    let display_action = action.replace(['-', '_'], " ");
+
+    Some(SystemShortcut {
+        combo: display_combo,
+        application: application.to_string(),
+        action: display_action,
+    })
+}
 
 /// A detected shortcut combination
 #[derive(Debug, Clone)]
@@ -87,10 +221,13 @@ pub struct ShortcutTest {
     start_time: Option<Instant>,
     /// Last shortcut for display
     last_shortcut: Option<ShortcutEvent>,
+    /// System-registered shortcuts discovered at startup
+    system_shortcuts: Vec<SystemShortcut>,
 }
 
 impl ShortcutTest {
     pub fn new() -> Self {
+        let system_shortcuts = enumerate_system_shortcuts();
         Self {
             modifiers: ModifierState::default(),
             pressed_keys: HashSet::new(),
@@ -99,7 +236,13 @@ impl ShortcutTest {
             conflict_count: 0,
             start_time: None,
             last_shortcut: None,
+            system_shortcuts,
         }
+    }
+
+    /// Get system-registered shortcuts
+    pub fn system_shortcuts(&self) -> &[SystemShortcut] {
+        &self.system_shortcuts
     }
 
     /// Update modifier state based on key event
@@ -283,6 +426,33 @@ impl KeyboardTest for ShortcutTest {
             }
         }
 
+        // System-registered shortcuts (if discovered)
+        if !self.system_shortcuts.is_empty() {
+            results.push(TestResult::info("--- System Shortcuts ---", ""));
+            results.push(TestResult::info(
+                "Discovered",
+                format!("{} registered", self.system_shortcuts.len()),
+            ));
+            for shortcut in self.system_shortcuts.iter().take(10) {
+                results.push(TestResult::info(
+                    format!("  {}", shortcut.combo),
+                    format!("{} ({})", shortcut.action, shortcut.application),
+                ));
+            }
+            if self.system_shortcuts.len() > 10 {
+                results.push(TestResult::info(
+                    "  ...",
+                    format!("{} more", self.system_shortcuts.len() - 10),
+                ));
+            }
+        } else {
+            results.push(TestResult::info("--- System Shortcuts ---", ""));
+            results.push(TestResult::info(
+                "  Not available",
+                "gsettings not found",
+            ));
+        }
+
         // Known conflicts reference
         results.push(TestResult::info("--- Common Conflicts ---", ""));
         for (combo, _) in COMMON_CONFLICTS.iter().take(5) {
@@ -300,5 +470,6 @@ impl KeyboardTest for ShortcutTest {
         self.conflict_count = 0;
         self.start_time = None;
         self.last_shortcut = None;
+        // system_shortcuts preserved — they don't change during a session
     }
 }

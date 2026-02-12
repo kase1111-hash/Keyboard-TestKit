@@ -1,5 +1,6 @@
 //! Visual keyboard layout rendering
 
+use super::theme::ThemeColors;
 use crate::keyboard::{KeyCode, KeyboardState};
 use ratatui::{
     buffer::Buffer,
@@ -8,38 +9,37 @@ use ratatui::{
     widgets::Widget,
 };
 
-/// Sleek keyboard colors
-mod palette {
-    use ratatui::style::Color;
-    pub const KEY_OFF: Color = Color::Rgb(40, 40, 50);
-    pub const KEY_ON: Color = Color::Rgb(80, 200, 120);
-    pub const KEY_USED: Color = Color::Rgb(55, 55, 70);
-    pub const TEXT: Color = Color::Rgb(180, 180, 190);
-    pub const TEXT_ON: Color = Color::Rgb(20, 20, 25);
-}
-
 /// Visual representation of a keyboard
 pub struct KeyboardVisual<'a> {
     keyboard_state: &'a KeyboardState,
+    colors: ThemeColors,
 }
 
 impl<'a> KeyboardVisual<'a> {
     pub fn new(keyboard_state: &'a KeyboardState) -> Self {
-        Self { keyboard_state }
+        Self {
+            keyboard_state,
+            colors: ThemeColors::dark(),
+        }
+    }
+
+    pub fn theme(mut self, colors: ThemeColors) -> Self {
+        self.colors = colors;
+        self
     }
 
     fn key_style(&self, code: KeyCode) -> (Color, Color, bool) {
         let pressed = self.keyboard_state.pressed_keys().contains(&code);
         if pressed {
-            (palette::KEY_ON, palette::TEXT_ON, true)
+            (self.colors.key_on, self.colors.key_text_on, true)
         } else if self
             .keyboard_state
             .get_key_state(code)
             .is_some_and(|s| s.press_count > 0)
         {
-            (palette::KEY_USED, palette::TEXT, false)
+            (self.colors.key_used, self.colors.key_text, false)
         } else {
-            (palette::KEY_OFF, palette::TEXT, false)
+            (self.colors.key_off, self.colors.key_text, false)
         }
     }
 
@@ -62,7 +62,7 @@ impl<'a> Widget for KeyboardVisual<'a> {
                 area.x,
                 area.y,
                 "⌨ Window too small",
-                Style::default().fg(palette::TEXT),
+                Style::default().fg(self.colors.key_text),
             );
             return;
         }
