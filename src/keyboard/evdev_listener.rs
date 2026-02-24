@@ -154,6 +154,7 @@ impl EvdevListener {
         for path in &device_paths {
             match File::open(path) {
                 Ok(file) => {
+                    log::debug!("Opened evdev device: {}", path.display());
                     // Set non-blocking mode
                     let fd = file.as_raw_fd();
                     // SAFETY: fcntl F_GETFL/F_SETFL are safe operations on valid file descriptors.
@@ -166,7 +167,7 @@ impl EvdevListener {
                     devices.push(file);
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    // Skip devices we can't access
+                    log::debug!("Permission denied for {}, skipping", path.display());
                     continue;
                 }
                 Err(e) => return Err(EvdevError::Io(e)),
@@ -284,14 +285,20 @@ impl EvdevListener {
                                     now,
                                     delta_us,
                                 );
-                                let _ = self.event_tx.send(event);
+                                if self.event_tx.send(event).is_err() {
+                                    log::warn!("Event channel disconnected, disabling evdev listener");
+                                    self.enabled = false;
+                                    return event_count;
+                                }
                                 event_count += 1;
                             }
                         }
                     }
                     Ok(_) => break, // Not enough bytes for a complete event
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break, // Other error, stop reading from this device
+                    // FIXME: Other read errors are silently swallowed. Should distinguish
+                    // between transient errors (retry) and fatal ones (disable device).
+                    Err(_) => break,
                 }
             }
         }

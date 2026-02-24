@@ -229,6 +229,8 @@ impl SessionReport {
     }
 
     /// Escape a value for CSV format
+    // FIXME: CSV escaping doesn't handle all RFC 4180 edge cases (e.g.,
+    // leading/trailing whitespace, embedded newlines in multi-line values).
     fn csv_escape(value: &str) -> String {
         if value.contains(',') || value.contains('"') || value.contains('\n') {
             format!("\"{}\"", value.replace('"', "\"\""))
@@ -592,5 +594,33 @@ mod tests {
 
         assert!(text.contains("POLLING RATE"));
         assert!(text.contains("ROLLOVER"));
+    }
+
+    #[test]
+    fn export_json_to_invalid_path_returns_error() {
+        let report = create_test_report();
+        let result = report.export_json(Path::new("/nonexistent/dir/report.json"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_csv_to_invalid_path_returns_error() {
+        let report = create_test_report();
+        let result = report.export_csv(Path::new("/nonexistent/dir/report.csv"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_markdown_to_invalid_path_returns_error() {
+        let report = create_test_report();
+        let result = report.export_markdown(Path::new("/nonexistent/dir/report.md"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn export_text_to_invalid_path_returns_error() {
+        let report = create_test_report();
+        let result = report.export_text(Path::new("/nonexistent/dir/report.txt"));
+        assert!(result.is_err());
     }
 }

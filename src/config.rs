@@ -93,6 +93,7 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
     // Create directory if it doesn't exist
     if !app_dir.exists() {
         fs::create_dir_all(&app_dir)?;
+        log::debug!("Created config directory: {}", app_dir.display());
     }
 
     Ok(app_dir.join("config.toml"))
@@ -283,11 +284,13 @@ impl Config {
         let path = config_path()?;
 
         if !path.exists() {
+            log::debug!("No config file at {}, using defaults", path.display());
             return Ok(Self::default());
         }
 
         let contents = fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&contents)?;
+        log::info!("Config loaded from {}", path.display());
         Ok(config)
     }
 
@@ -323,7 +326,8 @@ impl Config {
     /// Useful for testing or using custom config locations.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
-        fs::write(path, contents)?;
+        fs::write(path, &contents)?;
+        log::info!("Config saved to {}", path.display());
         Ok(())
     }
 
@@ -486,5 +490,28 @@ theme = "Light"
         config.ui.theme = Theme::Dark;
         let toml_str = toml::to_string_pretty(&config).expect("Failed to serialize");
         assert!(toml_str.contains("theme = \"Dark\""));
+    }
+
+    #[test]
+    fn config_load_malformed_toml_returns_parse_error() {
+        let path = temp_config_path();
+        fs::write(&path, "this is not [valid toml").unwrap();
+        let result = Config::load_from(&path);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_save_to_readonly_dir_returns_io_error() {
+        let path = PathBuf::from("/proc/nonexistent/config.toml");
+        let config = Config::default();
+        let result = config.save_to(&path);
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn config_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(ConfigError::NoConfigDir);
+        assert!(!err.to_string().is_empty());
     }
 }

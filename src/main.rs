@@ -3,6 +3,7 @@
 //! A single-executable keyboard diagnostic tool for USB portability.
 
 use anyhow::Result;
+use log::{debug, error, info, warn};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers,
@@ -19,7 +20,9 @@ use ratatui::{
     Terminal,
 };
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use keyboard_testkit::{
     config::Config,
@@ -33,7 +36,34 @@ use keyboard_testkit::{
 #[cfg(target_os = "linux")]
 use keyboard_testkit::keyboard::{evdev_status, EvdevListener};
 
+/// Restore the terminal to its original state.
+///
+/// Called from the panic hook, signal handler cleanup, and normal exit.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+}
+
 fn main() -> Result<()> {
+    // Initialize logging — output goes to stderr, hidden by the alternate screen.
+    // Use `RUST_LOG=debug ./keyboard-testkit 2>debug.log` to capture.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    info!("Keyboard TestKit v{}", env!("CARGO_PKG_VERSION"));
+
+    // Install panic hook so a panic always restores the terminal first
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        original_hook(info);
+    }));
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -41,8 +71,50 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create application
-    let config = Config::default();
+    // Install Ctrl+C handler so the terminal is restored on SIGINT
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    // Run the application; cleanup runs regardless of success or failure
+    let result = run_app(&mut terminal, running);
+
+    // Cleanup terminal — always runs, even after signal or error
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    if let Ok(Some((total_events, elapsed))) = &result {
+        println!("\nKeyboard TestKit session complete.");
+        println!("Total events processed: {}", total_events);
+        println!("Session duration: {}", elapsed);
+    }
+
+    result.map(|_| ())
+}
+
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    running: Arc<AtomicBool>,
+) -> Result<Option<(u64, String)>> {
+    // TODO: Support --config <path> CLI argument for custom config locations.
+    let config = Config::load().unwrap_or_else(|e| {
+        warn!("Failed to load config: {}. Using defaults.", e);
+        Config::default()
+    });
+    debug!(
+        "Config: polling={}s/{}ms, refresh={}Hz, theme={:?}",
+        config.polling.test_duration_secs,
+        config.polling.sample_window_ms,
+        config.ui.refresh_rate_hz,
+        config.ui.theme,
+    );
     let mut app = App::new(config.clone());
 
     // Create keyboard event channel
@@ -56,10 +128,13 @@ fn main() -> Result<()> {
     let mut evdev_listener = {
         match EvdevListener::try_new(event_tx) {
             Some(evdev) => {
-                app.set_status(format!("Evdev: {}", evdev_status()));
+                let status = evdev_status();
+                info!("Evdev backend active: {}", status);
+                app.set_status(format!("Evdev: {}", status));
                 Some(evdev)
             }
             None => {
+                warn!("Evdev unavailable — falling back to device_query (limited OEM key support)");
                 app.set_status(
                     "Evdev unavailable - using fallback (limited OEM key support)".to_string(),
                 );
@@ -78,6 +153,11 @@ fn main() -> Result<()> {
     let tick_rate = config.refresh_interval();
 
     loop {
+        // Check if Ctrl+C was pressed
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
         // Poll keyboard state - use evdev on Linux if available, otherwise fallback
         #[cfg(target_os = "linux")]
         {
@@ -281,7 +361,13 @@ fn main() -> Result<()> {
                                 "keyboard_report_{}.json",
                                 chrono::Utc::now().format("%Y%m%d_%H%M%S")
                             );
-                            let _ = app.export_report(&filename);
+                            match app.export_report(&filename) {
+                                Ok(_) => info!("Report exported to {}", filename),
+                                Err(e) => {
+                                    error!("Export failed: {}", e);
+                                    app.set_status(format!("Export failed: {}", e));
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -292,8 +378,14 @@ fn main() -> Result<()> {
         // Execute pending virtual key sends
         if app.virtual_test.has_pending_send() {
             match app.virtual_test.execute_virtual_send() {
-                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
-                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
+                Ok(()) => {
+                    debug!("Virtual keys sent (z, x, c)");
+                    app.set_status("Virtual keys sent (z, x, c)".to_string());
+                }
+                Err(e) => {
+                    error!("Virtual send failed: {}", e);
+                    app.set_status(format!("Virtual send failed: {}", e));
+                }
             }
         }
 
@@ -303,18 +395,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Cleanup terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    println!("\nKeyboard TestKit session complete.");
-    println!("Total events processed: {}", app.total_events);
-    println!("Session duration: {}", app.elapsed_formatted());
-
-    Ok(())
+    info!(
+        "Session ended: {} events in {}",
+        app.total_events,
+        app.elapsed_formatted()
+    );
+    Ok(Some((app.total_events, app.elapsed_formatted())))
 }
