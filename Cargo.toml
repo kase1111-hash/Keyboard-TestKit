@@ -29,6 +29,9 @@ dirs = "5.0"
 anyhow = "1.0"
 thiserror = "2.0"
 
+# Signal handling for clean terminal restoration
+ctrlc = "3.4"
+
 # Cross-platform keyboard simulation (optional, requires system libs)
 [target.'cfg(target_os = "windows")'.dependencies]
 enigo = { version = "0.2", optional = true }

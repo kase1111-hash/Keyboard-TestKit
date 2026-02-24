@@ -19,7 +19,9 @@ use ratatui::{
     Terminal,
 };
 use std::io::stdout;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use keyboard_testkit::{
     config::Config,
@@ -33,7 +35,26 @@ use keyboard_testkit::{
 #[cfg(target_os = "linux")]
 use keyboard_testkit::keyboard::{evdev_status, EvdevListener};
 
+/// Restore the terminal to its original state.
+///
+/// Called from the panic hook, signal handler cleanup, and normal exit.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+}
+
 fn main() -> Result<()> {
+    // Install panic hook so a panic always restores the terminal first
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        original_hook(info);
+    }));
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -41,6 +62,38 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Install Ctrl+C handler so the terminal is restored on SIGINT
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    // Run the application; cleanup runs regardless of success or failure
+    let result = run_app(&mut terminal, running);
+
+    // Cleanup terminal — always runs, even after signal or error
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    if let Ok(Some((total_events, elapsed))) = &result {
+        println!("\nKeyboard TestKit session complete.");
+        println!("Total events processed: {}", total_events);
+        println!("Session duration: {}", elapsed);
+    }
+
+    result.map(|_| ())
+}
+
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    running: Arc<AtomicBool>,
+) -> Result<Option<(u64, String)>> {
     // Load persistent config, fall back to defaults
     let config = Config::load().unwrap_or_else(|e| {
         eprintln!("Warning: failed to load config: {}. Using defaults.", e);
@@ -81,6 +134,11 @@ fn main() -> Result<()> {
     let tick_rate = config.refresh_interval();
 
     loop {
+        // Check if Ctrl+C was pressed
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
         // Poll keyboard state - use evdev on Linux if available, otherwise fallback
         #[cfg(target_os = "linux")]
         {
@@ -308,18 +366,5 @@ fn main() -> Result<()> {
         }
     }
 
-    // Cleanup terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    println!("\nKeyboard TestKit session complete.");
-    println!("Total events processed: {}", app.total_events);
-    println!("Session duration: {}", app.elapsed_formatted());
-
-    Ok(())
+    Ok(Some((app.total_events, app.elapsed_formatted())))
 }

@@ -284,7 +284,11 @@ impl EvdevListener {
                                     now,
                                     delta_us,
                                 );
-                                let _ = self.event_tx.send(event);
+                                if self.event_tx.send(event).is_err() {
+                                    // Receiver dropped — disable to avoid busy-looping
+                                    self.enabled = false;
+                                    return event_count;
+                                }
                                 event_count += 1;
                             }
                         }

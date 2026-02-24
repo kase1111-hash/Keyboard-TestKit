@@ -44,6 +44,8 @@ pub struct KeyboardListener {
     last_keys: Vec<device_query::Keycode>,
     last_poll: Instant,
     event_tx: mpsc::Sender<KeyEvent>,
+    /// Whether the event channel is still connected
+    channel_alive: bool,
 }
 
 impl KeyboardListener {
@@ -54,12 +56,17 @@ impl KeyboardListener {
             last_keys: Vec::new(),
             last_poll: Instant::now(),
             event_tx,
+            channel_alive: true,
         }
     }
 
     /// Poll for keyboard state changes
     /// Returns the number of events generated
     pub fn poll(&mut self) -> usize {
+        if !self.channel_alive {
+            return 0;
+        }
+
         let now = Instant::now();
         let delta_us = now.duration_since(self.last_poll).as_micros() as u64;
         self.last_poll = now;
@@ -71,7 +78,10 @@ impl KeyboardListener {
         for key in &current_keys {
             if !self.last_keys.contains(key) {
                 let event = KeyEvent::new(KeyCode::from(*key), KeyEventType::Press, now, delta_us);
-                let _ = self.event_tx.send(event);
+                if self.event_tx.send(event).is_err() {
+                    self.channel_alive = false;
+                    return event_count;
+                }
                 event_count += 1;
             }
         }
@@ -81,7 +91,10 @@ impl KeyboardListener {
             if !current_keys.contains(key) {
                 let event =
                     KeyEvent::new(KeyCode::from(*key), KeyEventType::Release, now, delta_us);
-                let _ = self.event_tx.send(event);
+                if self.event_tx.send(event).is_err() {
+                    self.channel_alive = false;
+                    return event_count;
+                }
                 event_count += 1;
             }
         }
