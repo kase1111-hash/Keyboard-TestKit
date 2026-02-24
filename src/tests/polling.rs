@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub struct PollingRateTest {
     /// Test duration
     duration: Duration,
+    /// Sample window for windowed average (in microseconds)
+    sample_window_us: u64,
     /// Start time of the test
     start_time: Option<Instant>,
     /// Recorded intervals between events (in microseconds)
@@ -24,9 +26,10 @@ pub struct PollingRateTest {
 }
 
 impl PollingRateTest {
-    pub fn new(duration_secs: u64) -> Self {
+    pub fn new(duration_secs: u64, sample_window_ms: u64) -> Self {
         Self {
             duration: Duration::from_secs(duration_secs),
+            sample_window_us: sample_window_ms * 1000,
             start_time: None,
             intervals_us: Vec::with_capacity(10000),
             last_event: None,
@@ -36,7 +39,7 @@ impl PollingRateTest {
         }
     }
 
-    /// Calculate average polling rate in Hz
+    /// Calculate average polling rate in Hz (over all samples)
     pub fn avg_rate_hz(&self) -> Option<f64> {
         if self.intervals_us.is_empty() {
             return None;
@@ -48,6 +51,35 @@ impl PollingRateTest {
         } else {
             None
         }
+    }
+
+    /// Calculate windowed average polling rate in Hz.
+    ///
+    /// Only considers the most recent samples that fit within
+    /// `sample_window_us`. Falls back to the global average if
+    /// no samples fall within the window.
+    pub fn windowed_rate_hz(&self) -> Option<f64> {
+        if self.intervals_us.is_empty() || self.sample_window_us == 0 {
+            return self.avg_rate_hz();
+        }
+
+        // Walk backwards, summing intervals until we exceed the window
+        let mut sum: u64 = 0;
+        let mut count: usize = 0;
+        for &interval in self.intervals_us.iter().rev() {
+            if sum + interval > self.sample_window_us && count > 0 {
+                break;
+            }
+            sum += interval;
+            count += 1;
+        }
+
+        if count == 0 || sum == 0 {
+            return self.avg_rate_hz();
+        }
+
+        let avg_us = sum as f64 / count as f64;
+        Some(1_000_000.0 / avg_us)
     }
 
     /// Calculate minimum polling rate
@@ -158,18 +190,27 @@ impl KeyboardTest for PollingRateTest {
             format!("{}", self.event_count),
         ));
 
-        if let Some(avg) = self.avg_rate_hz() {
-            let status = if avg >= 900.0 {
+        // Windowed rate is the primary display metric (more responsive)
+        let display_rate = self.windowed_rate_hz().or_else(|| self.avg_rate_hz());
+        if let Some(rate) = display_rate {
+            let status = if rate >= 900.0 {
                 ResultStatus::Ok
-            } else if avg >= 450.0 {
+            } else if rate >= 450.0 {
                 ResultStatus::Warning
             } else {
                 ResultStatus::Error
             };
             results.push(TestResult::new(
-                "Average Rate",
-                format!("{:.1} Hz", avg),
+                "Current Rate",
+                format!("{:.1} Hz", rate),
                 status,
+            ));
+        }
+
+        if let Some(avg) = self.avg_rate_hz() {
+            results.push(TestResult::info(
+                "Session Average",
+                format!("{:.1} Hz", avg),
             ));
         }
 
@@ -221,7 +262,7 @@ mod tests {
 
     #[test]
     fn new_test_has_no_data() {
-        let test = PollingRateTest::new(10);
+        let test = PollingRateTest::new(10, 100);
         assert!(test.avg_rate_hz().is_none());
         assert!(test.min_rate_hz().is_none());
         assert!(test.max_rate_hz().is_none());
@@ -231,7 +272,7 @@ mod tests {
 
     #[test]
     fn avg_rate_hz_1000hz() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         // Manually set intervals of 1000us each = 1000 Hz
         test.intervals_us = vec![1000, 1000, 1000, 1000, 1000];
 
@@ -241,7 +282,7 @@ mod tests {
 
     #[test]
     fn avg_rate_hz_125hz() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         // 8000us intervals = 125 Hz
         test.intervals_us = vec![8000, 8000, 8000, 8000];
 
@@ -251,7 +292,7 @@ mod tests {
 
     #[test]
     fn min_max_rate_calculation() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         test.min_interval_us = Some(500); // 2000 Hz
         test.max_interval_us = Some(2000); // 500 Hz
 
@@ -264,7 +305,7 @@ mod tests {
 
     #[test]
     fn jitter_calculation_uniform() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         // All same intervals = 0 jitter
         test.intervals_us = vec![1000, 1000, 1000, 1000, 1000];
 
@@ -274,7 +315,7 @@ mod tests {
 
     #[test]
     fn jitter_calculation_varied() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         // Varied intervals should have non-zero jitter
         test.intervals_us = vec![500, 1500, 500, 1500, 500, 1500];
 
@@ -286,14 +327,14 @@ mod tests {
 
     #[test]
     fn jitter_requires_two_samples() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         test.intervals_us = vec![1000];
         assert!(test.jitter_us().is_none());
     }
 
     #[test]
     fn process_event_ignores_release() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         let now = Instant::now();
 
         test.process_event(&release_at(DEFAULT_KEY, now));
@@ -304,7 +345,7 @@ mod tests {
 
     #[test]
     fn process_event_starts_test() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         let now = Instant::now();
 
         test.process_event(&press_at(DEFAULT_KEY, now, 0));
@@ -315,7 +356,7 @@ mod tests {
 
     #[test]
     fn process_event_filters_large_intervals() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         let now = Instant::now();
 
         // First event
@@ -331,7 +372,7 @@ mod tests {
 
     #[test]
     fn reset_clears_all() {
-        let mut test = PollingRateTest::new(10);
+        let mut test = PollingRateTest::new(10, 100);
         test.start_time = Some(Instant::now());
         test.intervals_us = vec![1000, 2000];
         test.event_count = 5;
@@ -349,13 +390,13 @@ mod tests {
 
     #[test]
     fn is_complete_before_start() {
-        let test = PollingRateTest::new(10);
+        let test = PollingRateTest::new(10, 100);
         assert!(!test.is_complete());
     }
 
     #[test]
     fn test_name_and_description() {
-        let test = PollingRateTest::new(10);
+        let test = PollingRateTest::new(10, 100);
         assert_eq!(test.name(), "Polling Rate Test");
         assert!(!test.description().is_empty());
     }

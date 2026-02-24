@@ -24,7 +24,7 @@
 //! use keyboard_testkit::keyboard::{KeyEvent, KeyEventType, KeyCode};
 //! use std::time::Instant;
 //!
-//! let mut test = PollingRateTest::new(10); // 10 second test duration
+//! let mut test = PollingRateTest::new(10, 100); // 10s duration, 100ms sample window
 //!
 //! // Process events as they arrive
 //! // test.process_event(&event);

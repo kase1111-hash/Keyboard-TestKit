@@ -41,8 +41,11 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create application
-    let config = Config::default();
+    // Load persistent config, fall back to defaults
+    let config = Config::load().unwrap_or_else(|e| {
+        eprintln!("Warning: failed to load config: {}. Using defaults.", e);
+        Config::default()
+    });
     let mut app = App::new(config.clone());
 
     // Create keyboard event channel
@@ -281,7 +284,9 @@ fn main() -> Result<()> {
                                 "keyboard_report_{}.json",
                                 chrono::Utc::now().format("%Y%m%d_%H%M%S")
                             );
-                            let _ = app.export_report(&filename);
+                            if let Err(e) = app.export_report(&filename) {
+                                app.set_status(format!("Export failed: {}", e));
+                            }
                         }
                         _ => {}
                     }

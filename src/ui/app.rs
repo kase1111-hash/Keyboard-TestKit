@@ -186,7 +186,10 @@ impl App {
             state: AppState::Running,
             config: config.clone(),
             keyboard_state: KeyboardState::new(),
-            polling_test: PollingRateTest::new(config.polling.test_duration_secs),
+            polling_test: PollingRateTest::new(
+                config.polling.test_duration_secs,
+                config.polling.sample_window_ms,
+            ),
             hold_release_test: HoldReleaseTest::new(config.hold_release.bounce_window_ms),
             stickiness_test: StickinessTest::new(config.stickiness.stuck_threshold_ms),
             rollover_test: RolloverTest::new(),
