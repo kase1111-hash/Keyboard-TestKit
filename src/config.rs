@@ -491,4 +491,27 @@ theme = "Light"
         let toml_str = toml::to_string_pretty(&config).expect("Failed to serialize");
         assert!(toml_str.contains("theme = \"Dark\""));
     }
+
+    #[test]
+    fn config_load_malformed_toml_returns_parse_error() {
+        let path = temp_config_path();
+        fs::write(&path, "this is not [valid toml").unwrap();
+        let result = Config::load_from(&path);
+        assert!(matches!(result, Err(ConfigError::Parse(_))));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_save_to_readonly_dir_returns_io_error() {
+        let path = PathBuf::from("/proc/nonexistent/config.toml");
+        let config = Config::default();
+        let result = config.save_to(&path);
+        assert!(matches!(result, Err(ConfigError::Io(_))));
+    }
+
+    #[test]
+    fn config_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(ConfigError::NoConfigDir);
+        assert!(!err.to_string().is_empty());
+    }
 }

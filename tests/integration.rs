@@ -420,6 +420,38 @@ fn toggle_shortcuts() {
 }
 
 #[test]
+fn export_to_invalid_path_returns_error() {
+    let mut app = App::default();
+    tap(&mut app, 30, 1000);
+    let result = app.export_report("/nonexistent/dir/report.json");
+    assert!(result.is_err());
+}
+
+#[test]
+fn process_event_after_pause_is_noop() {
+    let mut app = App::default();
+    tap(&mut app, 30, 1000);
+    assert_eq!(app.total_events, 2);
+
+    app.toggle_pause();
+    tap(&mut app, 31, 1000);
+    assert_eq!(app.total_events, 2); // unchanged — paused
+}
+
+#[test]
+fn reset_current_on_dashboard_is_noop() {
+    let mut app = App::default();
+    type_keys(&mut app, &[30, 31, 32], 1000);
+    let events_before = app.total_events;
+
+    app.view = AppView::Dashboard;
+    app.reset_current();
+
+    // Dashboard has no resettable test, so total_events should persist
+    assert_eq!(app.total_events, events_before);
+}
+
+#[test]
 fn current_results_returns_correct_test_results() {
     let mut app = App::default();
     tap(&mut app, 30, 1000);
