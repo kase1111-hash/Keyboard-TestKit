@@ -93,6 +93,7 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
     // Create directory if it doesn't exist
     if !app_dir.exists() {
         fs::create_dir_all(&app_dir)?;
+        log::debug!("Created config directory: {}", app_dir.display());
     }
 
     Ok(app_dir.join("config.toml"))
@@ -283,11 +284,13 @@ impl Config {
         let path = config_path()?;
 
         if !path.exists() {
+            log::debug!("No config file at {}, using defaults", path.display());
             return Ok(Self::default());
         }
 
         let contents = fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&contents)?;
+        log::info!("Config loaded from {}", path.display());
         Ok(config)
     }
 
@@ -323,7 +326,8 @@ impl Config {
     /// Useful for testing or using custom config locations.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
-        fs::write(path, contents)?;
+        fs::write(path, &contents)?;
+        log::info!("Config saved to {}", path.display());
         Ok(())
     }
 

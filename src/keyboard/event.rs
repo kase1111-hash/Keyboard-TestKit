@@ -79,6 +79,7 @@ impl KeyboardListener {
             if !self.last_keys.contains(key) {
                 let event = KeyEvent::new(KeyCode::from(*key), KeyEventType::Press, now, delta_us);
                 if self.event_tx.send(event).is_err() {
+                    log::warn!("Event channel disconnected, disabling keyboard listener");
                     self.channel_alive = false;
                     return event_count;
                 }
@@ -92,6 +93,7 @@ impl KeyboardListener {
                 let event =
                     KeyEvent::new(KeyCode::from(*key), KeyEventType::Release, now, delta_us);
                 if self.event_tx.send(event).is_err() {
+                    log::warn!("Event channel disconnected, disabling keyboard listener");
                     self.channel_alive = false;
                     return event_count;
                 }

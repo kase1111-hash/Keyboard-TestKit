@@ -3,6 +3,7 @@
 //! A single-executable keyboard diagnostic tool for USB portability.
 
 use anyhow::Result;
+use log::{debug, error, info, warn};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers,
@@ -48,6 +49,14 @@ fn restore_terminal() {
 }
 
 fn main() -> Result<()> {
+    // Initialize logging — output goes to stderr, hidden by the alternate screen.
+    // Use `RUST_LOG=debug ./keyboard-testkit 2>debug.log` to capture.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    info!("Keyboard TestKit v{}", env!("CARGO_PKG_VERSION"));
+
     // Install panic hook so a panic always restores the terminal first
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -96,9 +105,16 @@ fn run_app(
 ) -> Result<Option<(u64, String)>> {
     // Load persistent config, fall back to defaults
     let config = Config::load().unwrap_or_else(|e| {
-        eprintln!("Warning: failed to load config: {}. Using defaults.", e);
+        warn!("Failed to load config: {}. Using defaults.", e);
         Config::default()
     });
+    debug!(
+        "Config: polling={}s/{}ms, refresh={}Hz, theme={:?}",
+        config.polling.test_duration_secs,
+        config.polling.sample_window_ms,
+        config.ui.refresh_rate_hz,
+        config.ui.theme,
+    );
     let mut app = App::new(config.clone());
 
     // Create keyboard event channel
@@ -112,10 +128,13 @@ fn run_app(
     let mut evdev_listener = {
         match EvdevListener::try_new(event_tx) {
             Some(evdev) => {
-                app.set_status(format!("Evdev: {}", evdev_status()));
+                let status = evdev_status();
+                info!("Evdev backend active: {}", status);
+                app.set_status(format!("Evdev: {}", status));
                 Some(evdev)
             }
             None => {
+                warn!("Evdev unavailable — falling back to device_query (limited OEM key support)");
                 app.set_status(
                     "Evdev unavailable - using fallback (limited OEM key support)".to_string(),
                 );
@@ -342,8 +361,12 @@ fn run_app(
                                 "keyboard_report_{}.json",
                                 chrono::Utc::now().format("%Y%m%d_%H%M%S")
                             );
-                            if let Err(e) = app.export_report(&filename) {
-                                app.set_status(format!("Export failed: {}", e));
+                            match app.export_report(&filename) {
+                                Ok(_) => info!("Report exported to {}", filename),
+                                Err(e) => {
+                                    error!("Export failed: {}", e);
+                                    app.set_status(format!("Export failed: {}", e));
+                                }
                             }
                         }
                         _ => {}
@@ -355,8 +378,14 @@ fn run_app(
         // Execute pending virtual key sends
         if app.virtual_test.has_pending_send() {
             match app.virtual_test.execute_virtual_send() {
-                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
-                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
+                Ok(()) => {
+                    debug!("Virtual keys sent (z, x, c)");
+                    app.set_status("Virtual keys sent (z, x, c)".to_string());
+                }
+                Err(e) => {
+                    error!("Virtual send failed: {}", e);
+                    app.set_status(format!("Virtual send failed: {}", e));
+                }
             }
         }
 
@@ -366,5 +395,10 @@ fn run_app(
         }
     }
 
+    info!(
+        "Session ended: {} events in {}",
+        app.total_events,
+        app.elapsed_formatted()
+    );
     Ok(Some((app.total_events, app.elapsed_formatted())))
 }
