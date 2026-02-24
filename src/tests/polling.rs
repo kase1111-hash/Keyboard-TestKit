@@ -146,7 +146,8 @@ impl KeyboardTest for PollingRateTest {
         if let Some(last) = self.last_event {
             let interval_us = event.timestamp.duration_since(last).as_micros() as u64;
 
-            // Filter out unreasonably large intervals (likely pauses in typing)
+            // NOTE: 100ms threshold is arbitrary. Should be configurable or derived
+            // from the keyboard's expected polling rate.
             if interval_us < 100_000 {
                 // Less than 100ms
                 self.intervals_us.push(interval_us);

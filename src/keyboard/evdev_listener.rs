@@ -296,7 +296,9 @@ impl EvdevListener {
                     }
                     Ok(_) => break, // Not enough bytes for a complete event
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => break, // Other error, stop reading from this device
+                    // FIXME: Other read errors are silently swallowed. Should distinguish
+                    // between transient errors (retry) and fatal ones (disable device).
+                    Err(_) => break,
                 }
             }
         }

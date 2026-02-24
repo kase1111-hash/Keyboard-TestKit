@@ -103,7 +103,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     running: Arc<AtomicBool>,
 ) -> Result<Option<(u64, String)>> {
-    // Load persistent config, fall back to defaults
+    // TODO: Support --config <path> CLI argument for custom config locations.
     let config = Config::load().unwrap_or_else(|e| {
         warn!("Failed to load config: {}. Using defaults.", e);
         Config::default()

@@ -229,6 +229,8 @@ impl SessionReport {
     }
 
     /// Escape a value for CSV format
+    // FIXME: CSV escaping doesn't handle all RFC 4180 edge cases (e.g.,
+    // leading/trailing whitespace, embedded newlines in multi-line values).
     fn csv_escape(value: &str) -> String {
         if value.contains(',') || value.contains('"') || value.contains('\n') {
             format!("\"{}\"", value.replace('"', "\"\""))

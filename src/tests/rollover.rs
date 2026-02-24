@@ -69,6 +69,8 @@ impl RolloverTest {
 
     /// Check for potential ghosting
     /// Returns true if ghosting was detected
+    // TODO: Real ghosting detection needs keyboard matrix layout knowledge.
+    // This heuristic only works when expected_keys is pre-populated.
     fn check_ghosting(&mut self, new_key: KeyCode) -> bool {
         // Simple ghosting detection: if we have 3+ keys and this key wasn't expected
         // Note: This is a simplified heuristic. Real ghosting detection would need
