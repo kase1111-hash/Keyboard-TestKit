@@ -13,8 +13,15 @@
 //! sudo keyboard-testkit --list-presets               # Show available presets
 //! ```
 
-use anyhow::Result;
-use log::{debug, error, info, warn};
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// Lightweight logging macros to replace log + env_logger crates.
+// info!/warn!/error! print to stderr; debug! is no-op in release builds.
+macro_rules! info    { ($($arg:tt)*) => { eprintln!("[INFO]  {}", format_args!($($arg)*)) } }
+macro_rules! warn    { ($($arg:tt)*) => { eprintln!("[WARN]  {}", format_args!($($arg)*)) } }
+macro_rules! error   { ($($arg:tt)*) => { eprintln!("[ERROR] {}", format_args!($($arg)*)) } }
+macro_rules! debug   { ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!("[DEBUG] {}", format_args!($($arg)*)); } } }
+
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyModifiers,
@@ -60,6 +67,36 @@ fn restore_terminal() {
         LeaveAlternateScreen,
         DisableMouseCapture
     );
+}
+
+/// Global flag for signal handler to indicate shutdown.
+static SIGNAL_RUNNING: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+
+/// Install a signal handler that sets the running flag to false on SIGINT/SIGTERM.
+fn install_signal_handler(running: Arc<AtomicBool>) {
+    SIGNAL_RUNNING.get_or_init(|| running.clone());
+
+    #[cfg(unix)]
+    {
+        // SAFETY: The handler only performs an atomic store, which is
+        // async-signal-safe. SIGNAL_RUNNING is initialized above before
+        // signal() is called.
+        unsafe {
+            extern "C" fn handler(_sig: libc::c_int) {
+                if let Some(flag) = SIGNAL_RUNNING.get() {
+                    flag.store(false, Ordering::SeqCst);
+                }
+            }
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        }
+    }
+
+    // On non-Unix platforms, Ctrl+C is handled by crossterm's raw mode event loop.
+    #[cfg(not(unix))]
+    {
+        let _ = running;
+    }
 }
 
 /// Parse CLI arguments and return the mode to run
@@ -132,16 +169,6 @@ enum CliMode {
 fn main() -> Result<()> {
     let mode = parse_args();
 
-    // For mapper modes, use a visible logger (not hidden by alternate screen)
-    let log_filter = match &mode {
-        CliMode::Tui => "info",
-        _ => "info",
-    };
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_filter))
-        .format_timestamp_millis()
-        .init();
-
     match mode {
         CliMode::Help => {
             print_help();
@@ -181,17 +208,13 @@ fn main() -> Result<()> {
             info!("Keyboard TestKit v{} — Mapper Daemon", env!("CARGO_PKG_VERSION"));
 
             let running = Arc::new(AtomicBool::new(true));
-            let r = running.clone();
-            ctrlc::set_handler(move || {
-                info!("Received shutdown signal");
-                r.store(false, Ordering::SeqCst);
-            })?;
+            install_signal_handler(running.clone());
 
             if let Err(e) =
                 mapper::run_mapper(preset.as_deref(), device, &[], running)
             {
                 error!("Mapper error: {}", e);
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(e.into());
             }
             return Ok(());
         }
@@ -201,7 +224,7 @@ fn main() -> Result<()> {
             info!("Installing key mapper service...");
             if let Err(e) = mapper::install_service(preset.as_deref()) {
                 error!("Install error: {}", e);
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(e.into());
             }
             return Ok(());
         }
@@ -211,7 +234,7 @@ fn main() -> Result<()> {
             info!("Uninstalling key mapper service...");
             if let Err(e) = mapper::uninstall_service() {
                 error!("Uninstall error: {}", e);
-                return Err(anyhow::anyhow!("{}", e));
+                return Err(e.into());
             }
             return Ok(());
         }
@@ -248,12 +271,10 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Install Ctrl+C handler so the terminal is restored on SIGINT
+    // Ctrl+C is handled via crossterm key events in raw mode.
+    // The `running` flag is set to false when the user presses q/Esc.
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })?;
+    install_signal_handler(running.clone());
 
     // Run the application; cleanup runs regardless of success or failure
     let result = run_app(&mut terminal, running);
@@ -339,7 +360,7 @@ fn run_app(
     // Create keyboard event channel
     let (event_tx, event_rx) = mpsc::channel::<KeyEvent>();
 
-    // Create keyboard listener (device_query based - fallback)
+    // Create keyboard listener (crossterm-based fallback for non-Linux)
     let mut listener = KeyboardListener::new(event_tx.clone());
 
     // On Linux, try to use evdev for better OEM key detection
@@ -348,14 +369,12 @@ fn run_app(
         match EvdevListener::try_new(event_tx) {
             Some(evdev) => {
                 let status = evdev_status();
-                info!("Evdev backend active: {}", status);
                 app.set_status(format!("Evdev: {}", status));
                 Some(evdev)
             }
             None => {
-                warn!("Evdev unavailable — falling back to device_query (limited OEM key support)");
                 app.set_status(
-                    "Evdev unavailable - using fallback (limited OEM key support)".to_string(),
+                    "Evdev unavailable - using crossterm fallback (limited OEM key support)".to_string(),
                 );
                 None
             }
@@ -363,10 +382,10 @@ fn run_app(
     };
 
     #[cfg(target_os = "linux")]
-    let _use_evdev = evdev_listener.is_some();
+    let use_evdev = evdev_listener.is_some();
 
     #[cfg(not(target_os = "linux"))]
-    let _use_evdev = false;
+    let use_evdev = false;
 
     // Main loop
     let tick_rate = config.refresh_interval();
@@ -474,6 +493,12 @@ fn run_app(
         // Handle terminal events (for navigation/control)
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
+                // When evdev is not in use, feed crossterm key events to the
+                // listener for test processing (polling rate, rollover, etc.)
+                if !use_evdev {
+                    listener.send_press(key.code);
+                }
+
                 // Settings view has its own key handling
                 if app.view == AppView::Settings {
                     match key.code {
@@ -576,10 +601,14 @@ fn run_app(
                         CtKeyCode::Char('r') => app.reset_current(),
                         CtKeyCode::Char('R') => app.reset_all(),
                         CtKeyCode::Char('e') => {
-                            let filename = format!(
-                                "keyboard_report_{}.json",
-                                chrono::Utc::now().format("%Y%m%d_%H%M%S")
-                            );
+                            let filename = {
+                                use std::time::SystemTime;
+                                let secs = SystemTime::now()
+                                    .duration_since(SystemTime::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                format!("keyboard_report_{}.json", secs)
+                            };
                             match app.export_report(&filename) {
                                 Ok(_) => info!("Report exported to {}", filename),
                                 Err(e) => {

@@ -26,7 +26,7 @@
 
 use crate::keyboard::KeyboardState;
 use crate::tests::{ResultStatus, TestResult};
-use chrono::{DateTime, Utc};
+use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -124,7 +124,10 @@ impl SessionReport {
     /// Create a new session report from all 8 test results
     pub fn new(input: ReportInput, keyboard_state: &KeyboardState) -> Self {
         let duration_secs = input.start_time.elapsed().as_secs_f64();
-        let now: DateTime<Utc> = Utc::now();
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         // Count issues (warnings and errors)
         let count_issues = |results: &[TestResult]| -> u32 {
@@ -148,7 +151,7 @@ impl SessionReport {
 
         Self {
             metadata: ReportMetadata {
-                generated_at: now.to_rfc3339(),
+                generated_at: format!("{}Z", now_secs),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 duration_secs,
             },

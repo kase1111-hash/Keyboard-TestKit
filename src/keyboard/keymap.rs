@@ -1,6 +1,6 @@
 //! Key code definitions and keyboard layout mapping
 //!
-//! This module provides key code mapping between device_query and Linux evdev scancodes,
+//! This module provides key code definitions using Linux evdev scancodes,
 //! as well as key metadata like display names and labels.
 
 use std::collections::HashMap;
@@ -265,116 +265,6 @@ impl KeyCode {
 
 impl From<u16> for KeyCode {
     fn from(code: u16) -> Self {
-        Self(code)
-    }
-}
-
-impl From<device_query::Keycode> for KeyCode {
-    fn from(keycode: device_query::Keycode) -> Self {
-        use device_query::Keycode as DK;
-        // Map device_query keycodes to Linux evdev scancodes
-        let code = match keycode {
-            DK::Escape => 1,
-            DK::Key1 => 2,
-            DK::Key2 => 3,
-            DK::Key3 => 4,
-            DK::Key4 => 5,
-            DK::Key5 => 6,
-            DK::Key6 => 7,
-            DK::Key7 => 8,
-            DK::Key8 => 9,
-            DK::Key9 => 10,
-            DK::Key0 => 11,
-            DK::Minus => 12,
-            DK::Equal => 13,
-            DK::Backspace => 14,
-            DK::Tab => 15,
-            DK::Q => 16,
-            DK::W => 17,
-            DK::E => 18,
-            DK::R => 19,
-            DK::T => 20,
-            DK::Y => 21,
-            DK::U => 22,
-            DK::I => 23,
-            DK::O => 24,
-            DK::P => 25,
-            DK::LeftBracket => 26,
-            DK::RightBracket => 27,
-            DK::Enter => 28,
-            DK::LControl => 29,
-            DK::A => 30,
-            DK::S => 31,
-            DK::D => 32,
-            DK::F => 33,
-            DK::G => 34,
-            DK::H => 35,
-            DK::J => 36,
-            DK::K => 37,
-            DK::L => 38,
-            DK::Semicolon => 39,
-            DK::Apostrophe => 40,
-            DK::Grave => 41,
-            DK::LShift => 42,
-            DK::BackSlash => 43,
-            DK::Z => 44,
-            DK::X => 45,
-            DK::C => 46,
-            DK::V => 47,
-            DK::B => 48,
-            DK::N => 49,
-            DK::M => 50,
-            DK::Comma => 51,
-            DK::Dot => 52,
-            DK::Slash => 53,
-            DK::RShift => 54,
-            DK::LAlt => 56,
-            DK::Space => 57,
-            DK::CapsLock => 58,
-            DK::F1 => 59,
-            DK::F2 => 60,
-            DK::F3 => 61,
-            DK::F4 => 62,
-            DK::F5 => 63,
-            DK::F6 => 64,
-            DK::F7 => 65,
-            DK::F8 => 66,
-            DK::F9 => 67,
-            DK::F10 => 68,
-            DK::F11 => 87,
-            DK::F12 => 88,
-            DK::RControl => 97,
-            DK::RAlt => 100,
-            DK::Home => 102,
-            DK::Up => 103,
-            DK::PageUp => 104,
-            DK::Left => 105,
-            DK::Right => 106,
-            DK::End => 107,
-            DK::Down => 108,
-            DK::PageDown => 109,
-            DK::Insert => 110,
-            DK::Delete => 111,
-            DK::LMeta => 125,
-            DK::RMeta => 126,
-            // Numpad keys
-            DK::Numpad0 => 82,
-            DK::Numpad1 => 79,
-            DK::Numpad2 => 80,
-            DK::Numpad3 => 81,
-            DK::Numpad4 => 75,
-            DK::Numpad5 => 76,
-            DK::Numpad6 => 77,
-            DK::Numpad7 => 71,
-            DK::Numpad8 => 72,
-            DK::Numpad9 => 73,
-            DK::NumpadSubtract => 74,
-            DK::NumpadAdd => 78,
-            DK::NumpadDivide => 98,
-            DK::NumpadMultiply => 55,
-            // Fallback for any unmapped keys
-            _ => 0,
-        };
         Self(code)
     }
 }
@@ -662,80 +552,6 @@ mod tests {
         set.insert(KeyCode(31));
 
         assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn keycode_from_device_query_letters() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::A).0, 30);
-        assert_eq!(KeyCode::from(DK::S).0, 31);
-        assert_eq!(KeyCode::from(DK::D).0, 32);
-        assert_eq!(KeyCode::from(DK::W).0, 17);
-        assert_eq!(KeyCode::from(DK::Z).0, 44);
-    }
-
-    #[test]
-    fn keycode_from_device_query_numbers() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::Key1).0, 2);
-        assert_eq!(KeyCode::from(DK::Key2).0, 3);
-        assert_eq!(KeyCode::from(DK::Key0).0, 11);
-    }
-
-    #[test]
-    fn keycode_from_device_query_modifiers() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::LShift).0, 42);
-        assert_eq!(KeyCode::from(DK::RShift).0, 54);
-        assert_eq!(KeyCode::from(DK::LControl).0, 29);
-        assert_eq!(KeyCode::from(DK::RControl).0, 97);
-        assert_eq!(KeyCode::from(DK::LAlt).0, 56);
-        assert_eq!(KeyCode::from(DK::RAlt).0, 100);
-    }
-
-    #[test]
-    fn keycode_from_device_query_special() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::Escape).0, 1);
-        assert_eq!(KeyCode::from(DK::Space).0, 57);
-        assert_eq!(KeyCode::from(DK::Enter).0, 28);
-        assert_eq!(KeyCode::from(DK::Tab).0, 15);
-        assert_eq!(KeyCode::from(DK::Backspace).0, 14);
-    }
-
-    #[test]
-    fn keycode_from_device_query_function_keys() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::F1).0, 59);
-        assert_eq!(KeyCode::from(DK::F5).0, 63);
-        assert_eq!(KeyCode::from(DK::F10).0, 68);
-        assert_eq!(KeyCode::from(DK::F11).0, 87);
-        assert_eq!(KeyCode::from(DK::F12).0, 88);
-    }
-
-    #[test]
-    fn keycode_from_device_query_arrows() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::Up).0, 103);
-        assert_eq!(KeyCode::from(DK::Down).0, 108);
-        assert_eq!(KeyCode::from(DK::Left).0, 105);
-        assert_eq!(KeyCode::from(DK::Right).0, 106);
-    }
-
-    #[test]
-    fn keycode_from_device_query_numpad() {
-        use device_query::Keycode as DK;
-
-        assert_eq!(KeyCode::from(DK::Numpad0).0, 82);
-        assert_eq!(KeyCode::from(DK::Numpad5).0, 76);
-        assert_eq!(KeyCode::from(DK::NumpadAdd).0, 78);
-        assert_eq!(KeyCode::from(DK::NumpadSubtract).0, 74);
     }
 
     // KeyInfo tests
