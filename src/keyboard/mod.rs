@@ -6,7 +6,7 @@
 //!
 //! - [`KeyEvent`] - Represents a single keyboard event with timing data
 //! - [`KeyEventType`] - Press or Release event types
-//! - [`KeyboardListener`] - Polls for keyboard state changes via device_query
+//! - [`KeyboardListener`] - Converts crossterm key events for test processing
 //! - [`KeyboardState`] - Tracks per-key and global state statistics
 //! - [`KeyState`] - Per-key metrics (press count, durations, polling intervals)
 //! - [`KeyCode`] - Platform-independent key identifier (Linux evdev scancodes)

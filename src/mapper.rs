@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use nix::libc;
+use libc;
 
 /// Error type for mapper operations
 #[derive(Debug)]
@@ -259,7 +259,7 @@ impl KeyMapper {
             )));
         }
 
-        log::info!(
+        eprintln!(
             "Key mapper active on {} with {} mapping(s)",
             device_path.display(),
             mappings.len()
@@ -376,7 +376,7 @@ impl KeyMapper {
             ));
         }
 
-        log::info!("Created virtual keyboard device");
+        eprintln!("Created virtual keyboard device");
         Ok(fd)
     }
 
@@ -409,7 +409,7 @@ impl KeyMapper {
 
     /// Run the mapper loop — blocks until stopped
     pub fn run(&mut self) -> Result<(), MapperError> {
-        log::info!("Key mapper daemon running on {}", self.input_path.display());
+        eprintln!("Key mapper daemon running on {}", self.input_path.display());
 
         while self.running.load(Ordering::SeqCst) {
             match self.input_device.read(&mut self.buffer) {
@@ -434,12 +434,7 @@ impl KeyMapper {
                                 .unwrap_or(event.code);
 
                             if output_code != event.code {
-                                log::debug!(
-                                    "Remapped key {} → {} (value={})",
-                                    event.code,
-                                    output_code,
-                                    event.value
-                                );
+                                // Key remapped
                             }
 
                             self.emit_event(EV_KEY, output_code, event.value);
@@ -460,13 +455,13 @@ impl KeyMapper {
                     continue;
                 }
                 Err(e) => {
-                    log::error!("Read error on {}: {}", self.input_path.display(), e);
+                    eprintln!("Read error on {}: {}", self.input_path.display(), e);
                     return Err(MapperError::Io(e));
                 }
             }
         }
 
-        log::info!("Key mapper daemon stopped");
+        eprintln!("Key mapper daemon stopped");
         Ok(())
     }
 }
@@ -482,7 +477,7 @@ impl Drop for KeyMapper {
             libc::ioctl(self.uinput_fd, UI_DEV_DESTROY);
             libc::close(self.uinput_fd);
         }
-        log::info!("Key mapper cleaned up for {}", self.input_path.display());
+        eprintln!("Key mapper cleaned up for {}", self.input_path.display());
     }
 }
 
@@ -560,12 +555,12 @@ pub fn run_mapper(
 
     if let Some(name) = preset_name {
         if let Some(preset) = MapperPreset::by_name(name) {
-            log::info!("Loaded preset: {} - {}", preset.name, preset.description);
+            eprintln!("Loaded preset: {} - {}", preset.name, preset.description);
             mappings.extend(preset.mappings);
         } else {
-            log::warn!("Unknown preset '{}'. Available presets:", name);
+            eprintln!("Unknown preset '{}'. Available presets:", name);
             for (pname, desc) in MapperPreset::available() {
-                log::warn!("  {} - {}", pname, desc);
+                eprintln!("  {} - {}", pname, desc);
             }
         }
     }
@@ -583,10 +578,10 @@ pub fn run_mapper(
     }
 
     if mappings.is_empty() {
-        log::warn!("No key mappings configured. Use --preset or configure mappings in config.toml");
-        log::info!("Available presets:");
+        eprintln!("No key mappings configured. Use --preset or configure mappings in config.toml");
+        eprintln!("Available presets:");
         for (name, desc) in MapperPreset::available() {
-            log::info!("  --preset {} : {}", name, desc);
+            eprintln!("  --preset {} : {}", name, desc);
         }
         return Ok(());
     }
@@ -610,9 +605,9 @@ pub fn run_mapper(
             devices
         };
 
-        log::info!("Found {} input device(s):", devices.len());
+        eprintln!("Found {} input device(s):", devices.len());
         for (path, name) in &devices {
-            log::info!("  {} - {}", path.display(), name);
+            eprintln!("  {} - {}", path.display(), name);
         }
 
         // Use the first matching device
@@ -623,12 +618,12 @@ pub fn run_mapper(
             .ok_or(MapperError::NoDevices)?
     };
 
-    log::info!("Using device: {}", target_path.display());
-    log::info!("Active mappings:");
+    eprintln!("Using device: {}", target_path.display());
+    eprintln!("Active mappings:");
     for (from, to) in &mappings {
         let from_info = crate::keyboard::keymap::get_key_info(KeyCode::new(*from));
         let to_info = crate::keyboard::keymap::get_key_info(KeyCode::new(*to));
-        log::info!(
+        eprintln!(
             "  {} (0x{:03X}) → {} (0x{:03X})",
             from_info.name,
             from,
@@ -736,18 +731,18 @@ pub fn install_service(preset: Option<&str>) -> Result<(), MapperError> {
         fs::set_permissions(target_bin, perms).map_err(MapperError::Io)?;
     }
 
-    log::info!("Service installed to {}", service_path);
-    log::info!("Udev rule installed to {}", udev_path);
-    log::info!("Binary installed to {}", target_bin);
-    log::info!("");
-    log::info!("To enable and start the service:");
-    log::info!("  sudo systemctl daemon-reload");
-    log::info!("  sudo systemctl enable keyboard-testkit-mapper");
-    log::info!("  sudo systemctl start keyboard-testkit-mapper");
-    log::info!("");
-    log::info!("To check status:");
-    log::info!("  sudo systemctl status keyboard-testkit-mapper");
-    log::info!("  journalctl -u keyboard-testkit-mapper -f");
+    eprintln!("Service installed to {}", service_path);
+    eprintln!("Udev rule installed to {}", udev_path);
+    eprintln!("Binary installed to {}", target_bin);
+    eprintln!("");
+    eprintln!("To enable and start the service:");
+    eprintln!("  sudo systemctl daemon-reload");
+    eprintln!("  sudo systemctl enable keyboard-testkit-mapper");
+    eprintln!("  sudo systemctl start keyboard-testkit-mapper");
+    eprintln!("");
+    eprintln!("To check status:");
+    eprintln!("  sudo systemctl status keyboard-testkit-mapper");
+    eprintln!("  journalctl -u keyboard-testkit-mapper -f");
 
     Ok(())
 }
@@ -768,11 +763,11 @@ pub fn uninstall_service() -> Result<(), MapperError> {
     // Remove files
     if std::path::Path::new(service_path).exists() {
         fs::remove_file(service_path).map_err(MapperError::Io)?;
-        log::info!("Removed {}", service_path);
+        eprintln!("Removed {}", service_path);
     }
     if std::path::Path::new(udev_path).exists() {
         fs::remove_file(udev_path).map_err(MapperError::Io)?;
-        log::info!("Removed {}", udev_path);
+        eprintln!("Removed {}", udev_path);
     }
 
     // Reload systemd
@@ -780,7 +775,7 @@ pub fn uninstall_service() -> Result<(), MapperError> {
         .arg("daemon-reload")
         .status();
 
-    log::info!("Service uninstalled successfully");
+    eprintln!("Service uninstalled successfully");
     Ok(())
 }
 

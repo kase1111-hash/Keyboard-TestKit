@@ -87,16 +87,43 @@ impl From<toml::ser::Error> for ConfigError {
 /// - macOS: `~/Library/Application Support/keyboard-testkit/config.toml`
 /// - Windows: `%APPDATA%\keyboard-testkit\config.toml`
 pub fn config_path() -> Result<PathBuf, ConfigError> {
-    let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
+    let config_dir = platform_config_dir().ok_or(ConfigError::NoConfigDir)?;
     let app_dir = config_dir.join("keyboard-testkit");
 
     // Create directory if it doesn't exist
     if !app_dir.exists() {
         fs::create_dir_all(&app_dir)?;
-        log::debug!("Created config directory: {}", app_dir.display());
     }
 
     Ok(app_dir.join("config.toml"))
+}
+
+/// Get the platform-specific config directory without the `dirs` crate.
+fn platform_config_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // $XDG_CONFIG_HOME or ~/.config
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg));
+            }
+        }
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA").ok().map(PathBuf::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+    }
 }
 
 /// Main application configuration
@@ -284,13 +311,13 @@ impl Config {
         let path = config_path()?;
 
         if !path.exists() {
-            log::debug!("No config file at {}, using defaults", path.display());
+            // config dir created
+            // debug:("No config file at {}, using defaults", path.display());
             return Ok(Self::default());
         }
 
         let contents = fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&contents)?;
-        log::info!("Config loaded from {}", path.display());
         Ok(config)
     }
 
@@ -327,7 +354,6 @@ impl Config {
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
         fs::write(path, &contents)?;
-        log::info!("Config saved to {}", path.display());
         Ok(())
     }
 

@@ -4,7 +4,7 @@
 //! OEM keys and other special keys that device_query cannot handle.
 
 use super::{KeyCode, KeyEvent, KeyEventType};
-use nix::libc;
+use libc;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -154,7 +154,7 @@ impl EvdevListener {
         for path in &device_paths {
             match File::open(path) {
                 Ok(file) => {
-                    log::debug!("Opened evdev device: {}", path.display());
+                    // Opened evdev device
                     // Set non-blocking mode
                     let fd = file.as_raw_fd();
                     // SAFETY: fcntl F_GETFL/F_SETFL are safe operations on valid file descriptors.
@@ -167,7 +167,7 @@ impl EvdevListener {
                     devices.push(file);
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    log::debug!("Permission denied for {}, skipping", path.display());
+                    // Permission denied, skipping device
                     continue;
                 }
                 Err(e) => return Err(EvdevError::Io(e)),
@@ -286,7 +286,7 @@ impl EvdevListener {
                                     delta_us,
                                 );
                                 if self.event_tx.send(event).is_err() {
-                                    log::warn!("Event channel disconnected, disabling evdev listener");
+                                    eprintln!("[WARN]  Event channel disconnected, disabling evdev listener");
                                     self.enabled = false;
                                     return event_count;
                                 }
