@@ -126,6 +126,45 @@ pub const KEY_SCROLLLOCK: KeyCode = KeyCode(70);
 /// Pause/Break (evdev scancode 119)
 pub const KEY_PAUSE: KeyCode = KeyCode(119);
 
+// ============================================================================
+// ASUS Laptop / ROG-Specific Key Constants
+// ============================================================================
+// These scancodes are emitted by ASUS laptop keyboards (G14, G15, etc.)
+// via the asus-nb-wmi and asus-wmi kernel drivers.
+
+/// Microphone mute key (evdev scancode 248)
+pub const KEY_MICMUTE: KeyCode = KeyCode(248);
+/// RF kill / Airplane mode toggle (evdev scancode 247)
+pub const KEY_RFKILL: KeyCode = KeyCode(247);
+/// Programmable key 1 / ROG key / Launch key (evdev scancode 148)
+pub const KEY_PROG1: KeyCode = KeyCode(148);
+/// Programmable key 2 / AURA lighting key (evdev scancode 149)
+pub const KEY_PROG2: KeyCode = KeyCode(149);
+/// Programmable key 3 / Fan profile key (evdev scancode 202)
+pub const KEY_PROG3: KeyCode = KeyCode(202);
+/// Programmable key 4 (evdev scancode 203)
+pub const KEY_PROG4: KeyCode = KeyCode(203);
+/// Screen lock key (evdev scancode 152)
+pub const KEY_SCREENLOCK: KeyCode = KeyCode(152);
+/// Battery info key (evdev scancode 236)
+pub const KEY_BATTERY: KeyCode = KeyCode(236);
+/// Suspend key (evdev scancode 205)
+pub const KEY_SUSPEND: KeyCode = KeyCode(205);
+/// Config/Settings key (evdev scancode 171)
+pub const KEY_CONFIG: KeyCode = KeyCode(171);
+/// Screenshot/Snipping key (evdev scancode 212 variant or 0x19e = 414)
+pub const KEY_SELECTIVE_SCREENSHOT: KeyCode = KeyCode(414);
+/// Calculator key (evdev scancode 140)
+pub const KEY_CALC: KeyCode = KeyCode(140);
+/// File manager/explorer key (evdev scancode 144)
+pub const KEY_FILE: KeyCode = KeyCode(144);
+/// Mail key (evdev scancode 155)
+pub const KEY_MAIL: KeyCode = KeyCode(155);
+/// WWW/Browser key (evdev scancode 150)
+pub const KEY_WWW: KeyCode = KeyCode(150);
+/// NumLock key (evdev scancode 69) — needed for compact laptop layouts
+pub const KEY_NUMLOCK: KeyCode = KeyCode(69);
+
 /// Collection of all known OEM/special key codes for iteration
 pub const OEM_KEYS: &[KeyCode] = &[
     KEY_FN,
@@ -165,6 +204,22 @@ pub const OEM_KEYS: &[KeyCode] = &[
     KEY_PRINT,
     KEY_SCROLLLOCK,
     KEY_PAUSE,
+    // ASUS / ROG laptop keys
+    KEY_MICMUTE,
+    KEY_RFKILL,
+    KEY_PROG1,
+    KEY_PROG2,
+    KEY_PROG3,
+    KEY_PROG4,
+    KEY_SCREENLOCK,
+    KEY_BATTERY,
+    KEY_SUSPEND,
+    KEY_CONFIG,
+    KEY_SELECTIVE_SCREENSHOT,
+    KEY_CALC,
+    KEY_FILE,
+    KEY_MAIL,
+    KEY_WWW,
 ];
 
 /// Returns true if the given key code is an OEM/special function key
@@ -540,6 +595,23 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(69), KeyInfo::new("NumLock", "NumLk", 1, 21, 1.0));
     map.insert(KeyCode(96), KeyInfo::new("NumpadEnter", "Ent", 4, 18, 1.0));
     map.insert(KeyCode(83), KeyInfo::new("NumpadDelete", "Del", 6, 17, 1.0));
+
+    // ASUS / ROG laptop keys
+    map.insert(KeyCode(248), KeyInfo::new("MicMute", "Mic", 0, 36, 1.0));
+    map.insert(KeyCode(247), KeyInfo::new("AirplaneMode", "Air", 0, 37, 1.0));
+    map.insert(KeyCode(148), KeyInfo::new("ROG/Launch", "ROG", 0, 38, 1.0));
+    map.insert(KeyCode(149), KeyInfo::new("AURA/Backlight", "AURA", 0, 39, 1.0));
+    map.insert(KeyCode(202), KeyInfo::new("FanProfile", "Fan", 0, 40, 1.0));
+    map.insert(KeyCode(203), KeyInfo::new("Prog4", "Prg4", 0, 41, 1.0));
+    map.insert(KeyCode(152), KeyInfo::new("ScreenLock", "SLck", 0, 42, 1.0));
+    map.insert(KeyCode(236), KeyInfo::new("Battery", "Batt", 0, 43, 1.0));
+    map.insert(KeyCode(205), KeyInfo::new("Suspend", "Susp", 0, 44, 1.0));
+    map.insert(KeyCode(171), KeyInfo::new("Config", "Conf", 0, 45, 1.0));
+    map.insert(KeyCode(414), KeyInfo::new("Screenshot", "Snip", 0, 46, 1.0));
+    map.insert(KeyCode(140), KeyInfo::new("Calculator", "Calc", 0, 47, 1.0));
+    map.insert(KeyCode(144), KeyInfo::new("FileManager", "File", 0, 48, 1.0));
+    map.insert(KeyCode(155), KeyInfo::new("Mail", "Mail", 0, 49, 1.0));
+    map.insert(KeyCode(150), KeyInfo::new("Browser", "Web", 0, 50, 1.0));
 
     map
 });

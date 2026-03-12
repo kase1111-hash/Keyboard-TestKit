@@ -1,6 +1,17 @@
 //! Keyboard TestKit - Portable keyboard testing utility
 //!
 //! A single-executable keyboard diagnostic tool for USB portability.
+//!
+//! ## Mapper Daemon Mode (Linux)
+//!
+//! Run as a key mapping daemon for special keyboard keys:
+//! ```bash
+//! sudo keyboard-testkit --mapper                    # Use config file mappings
+//! sudo keyboard-testkit --mapper --preset asus-g14  # Use ASUS G14 preset
+//! sudo keyboard-testkit --mapper-install             # Install as systemd service
+//! sudo keyboard-testkit --mapper-uninstall           # Remove systemd service
+//! sudo keyboard-testkit --list-presets               # Show available presets
+//! ```
 
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -36,6 +47,9 @@ use keyboard_testkit::{
 #[cfg(target_os = "linux")]
 use keyboard_testkit::keyboard::{evdev_status, EvdevListener};
 
+#[cfg(target_os = "linux")]
+use keyboard_testkit::mapper;
+
 /// Restore the terminal to its original state.
 ///
 /// Called from the panic hook, signal handler cleanup, and normal exit.
@@ -48,13 +62,176 @@ fn restore_terminal() {
     );
 }
 
+/// Parse CLI arguments and return the mode to run
+fn parse_args() -> CliMode {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check for mapper-related flags
+    if args.iter().any(|a| a == "--mapper") {
+        let preset = args
+            .windows(2)
+            .find(|w| w[0] == "--preset")
+            .map(|w| w[1].clone());
+
+        let device = args
+            .windows(2)
+            .find(|w| w[0] == "--device")
+            .map(|w| std::path::PathBuf::from(&w[1]));
+
+        return CliMode::Mapper { preset, device };
+    }
+
+    if args.iter().any(|a| a == "--mapper-install") {
+        let preset = args
+            .windows(2)
+            .find(|w| w[0] == "--preset")
+            .map(|w| w[1].clone());
+        return CliMode::MapperInstall { preset };
+    }
+
+    if args.iter().any(|a| a == "--mapper-uninstall") {
+        return CliMode::MapperUninstall;
+    }
+
+    if args.iter().any(|a| a == "--list-presets") {
+        return CliMode::ListPresets;
+    }
+
+    if args.iter().any(|a| a == "--list-devices") {
+        return CliMode::ListDevices;
+    }
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return CliMode::Help;
+    }
+
+    CliMode::Tui
+}
+
+/// CLI operating mode
+enum CliMode {
+    /// Normal TUI mode
+    Tui,
+    /// Run as key mapper daemon
+    Mapper {
+        preset: Option<String>,
+        device: Option<std::path::PathBuf>,
+    },
+    /// Install mapper as systemd service
+    MapperInstall { preset: Option<String> },
+    /// Uninstall mapper systemd service
+    MapperUninstall,
+    /// List available presets
+    ListPresets,
+    /// List input devices
+    ListDevices,
+    /// Show help
+    Help,
+}
+
 fn main() -> Result<()> {
-    // Initialize logging — output goes to stderr, hidden by the alternate screen.
-    // Use `RUST_LOG=debug ./keyboard-testkit 2>debug.log` to capture.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    let mode = parse_args();
+
+    // For mapper modes, use a visible logger (not hidden by alternate screen)
+    let log_filter = match &mode {
+        CliMode::Tui => "info",
+        _ => "info",
+    };
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_filter))
         .format_timestamp_millis()
         .init();
 
+    match mode {
+        CliMode::Help => {
+            print_help();
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        CliMode::ListPresets => {
+            println!("Available key mapping presets:\n");
+            for (name, desc) in mapper::MapperPreset::available() {
+                println!("  {:15} {}", name, desc);
+            }
+            println!("\nUsage: keyboard-testkit --mapper --preset <name>");
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        CliMode::ListDevices => {
+            println!("Detected input devices:\n");
+            match mapper::find_mapper_devices(None) {
+                Ok(devices) => {
+                    for (path, name) in &devices {
+                        println!("  {} - {}", path.display(), name);
+                    }
+                    println!("\nUsage: keyboard-testkit --mapper --device <path>");
+                }
+                Err(e) => {
+                    println!("Error: {}", e);
+                    println!("Try running with sudo for device access.");
+                }
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        CliMode::Mapper { preset, device } => {
+            info!("Keyboard TestKit v{} — Mapper Daemon", env!("CARGO_PKG_VERSION"));
+
+            let running = Arc::new(AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc::set_handler(move || {
+                info!("Received shutdown signal");
+                r.store(false, Ordering::SeqCst);
+            })?;
+
+            if let Err(e) =
+                mapper::run_mapper(preset.as_deref(), device, &[], running)
+            {
+                error!("Mapper error: {}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        CliMode::MapperInstall { preset } => {
+            info!("Installing key mapper service...");
+            if let Err(e) = mapper::install_service(preset.as_deref()) {
+                error!("Install error: {}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        CliMode::MapperUninstall => {
+            info!("Uninstalling key mapper service...");
+            if let Err(e) = mapper::uninstall_service() {
+                error!("Uninstall error: {}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        CliMode::Mapper { .. }
+        | CliMode::MapperInstall { .. }
+        | CliMode::MapperUninstall
+        | CliMode::ListPresets
+        | CliMode::ListDevices => {
+            eprintln!("Key mapper daemon is only supported on Linux.");
+            return Ok(());
+        }
+
+        CliMode::Tui => {
+            // Fall through to normal TUI mode
+        }
+    }
+
+    // Normal TUI mode
     info!("Keyboard TestKit v{}", env!("CARGO_PKG_VERSION"));
 
     // Install panic hook so a panic always restores the terminal first
@@ -97,6 +274,48 @@ fn main() -> Result<()> {
     }
 
     result.map(|_| ())
+}
+
+fn print_help() {
+    println!("Keyboard TestKit v{}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("USAGE:");
+    println!("  keyboard-testkit              Launch the interactive TUI");
+    println!("  keyboard-testkit --mapper     Run as key mapping daemon (Linux, needs root)");
+    println!();
+    println!("OPTIONS:");
+    println!("  -h, --help                    Show this help message");
+    println!();
+    println!("MAPPER OPTIONS (Linux only):");
+    println!("  --mapper                      Run as a key mapping daemon");
+    println!("  --preset <name>               Use a vendor preset (e.g. asus-g14)");
+    println!("  --device <path>               Target specific input device");
+    println!("  --mapper-install              Install as a systemd service (runs on boot)");
+    println!("  --mapper-uninstall            Remove the systemd service");
+    println!("  --list-presets                List available vendor presets");
+    println!("  --list-devices                List detected input devices");
+    println!();
+    println!("EXAMPLES:");
+    println!("  # Map ASUS G14 special keys");
+    println!("  sudo keyboard-testkit --mapper --preset asus-g14");
+    println!();
+    println!("  # Install as startup service with ASUS G14 preset");
+    println!("  sudo keyboard-testkit --mapper-install --preset asus-g14");
+    println!();
+    println!("  # Use a specific device");
+    println!("  sudo keyboard-testkit --mapper --device /dev/input/event5");
+    println!();
+    println!("  # Custom mappings via config file");
+    println!("  # Edit ~/.config/keyboard-testkit/config.toml:");
+    println!("  # [oem_keys]");
+    println!("  # key_mappings = [[148, 125], [149, 228]]");
+    println!();
+    println!("TUI CONTROLS:");
+    println!("  Tab/Shift+Tab    Navigate views");
+    println!("  1-9,0            Jump to view (when shortcuts enabled)");
+    println!("  Space            Pause/Resume");
+    println!("  q/Esc            Quit");
+    println!("  ?                Help");
 }
 
 fn run_app(

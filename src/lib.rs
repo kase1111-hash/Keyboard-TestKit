@@ -37,6 +37,8 @@
 
 pub mod config;
 pub mod keyboard;
+#[cfg(target_os = "linux")]
+pub mod mapper;
 pub mod report;
 pub mod tests;
 pub mod ui;
