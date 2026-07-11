@@ -356,7 +356,11 @@ impl KeyMapper {
         };
 
         let written = unsafe {
-            libc::write(fd, dev_bytes.as_ptr() as *const libc::c_void, dev_bytes.len())
+            libc::write(
+                fd,
+                dev_bytes.as_ptr() as *const libc::c_void,
+                dev_bytes.len(),
+            )
         };
 
         if written < 0 {
@@ -482,7 +486,9 @@ impl Drop for KeyMapper {
 }
 
 /// Find keyboard devices, optionally filtering by name pattern
-pub fn find_mapper_devices(name_pattern: Option<&str>) -> Result<Vec<(PathBuf, String)>, MapperError> {
+pub fn find_mapper_devices(
+    name_pattern: Option<&str>,
+) -> Result<Vec<(PathBuf, String)>, MapperError> {
     let input_dir = PathBuf::from("/dev/input");
     if !input_dir.exists() {
         return Err(MapperError::NoDevices);
@@ -591,10 +597,8 @@ pub fn run_mapper(
         path
     } else {
         // Auto-detect: try to find ASUS device first if using ASUS preset
-        let pattern = preset_name.and_then(|n| {
-            MapperPreset::by_name(n)
-                .and_then(|p| p.device_match)
-        });
+        let pattern =
+            preset_name.and_then(|n| MapperPreset::by_name(n).and_then(|p| p.device_match));
 
         let devices = find_mapper_devices(pattern.as_deref())?;
 
@@ -625,10 +629,7 @@ pub fn run_mapper(
         let to_info = crate::keyboard::keymap::get_key_info(KeyCode::new(*to));
         eprintln!(
             "  {} (0x{:03X}) → {} (0x{:03X})",
-            from_info.name,
-            from,
-            to_info.name,
-            to
+            from_info.name, from, to_info.name, to
         );
     }
 
@@ -734,12 +735,12 @@ pub fn install_service(preset: Option<&str>) -> Result<(), MapperError> {
     eprintln!("Service installed to {}", service_path);
     eprintln!("Udev rule installed to {}", udev_path);
     eprintln!("Binary installed to {}", target_bin);
-    eprintln!("");
+    eprintln!();
     eprintln!("To enable and start the service:");
     eprintln!("  sudo systemctl daemon-reload");
     eprintln!("  sudo systemctl enable keyboard-testkit-mapper");
     eprintln!("  sudo systemctl start keyboard-testkit-mapper");
-    eprintln!("");
+    eprintln!();
     eprintln!("To check status:");
     eprintln!("  sudo systemctl status keyboard-testkit-mapper");
     eprintln!("  journalctl -u keyboard-testkit-mapper -f");

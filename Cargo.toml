@@ -2,32 +2,33 @@
 name = "keyboard-testkit"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Keyboard TestKit Contributors"]
 description = "Portable keyboard testing and diagnostic utility"
 license = "MIT"
 
 [dependencies]
 # TUI framework
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # Serialization for config and logs
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1"
 
 # Cross-platform keyboard simulation (optional, requires system libs)
 [target.'cfg(target_os = "windows")'.dependencies]
-enigo = { version = "0.2", optional = true }
+enigo = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-enigo = { version = "0.2", optional = true }
+enigo = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-enigo = { version = "0.2", optional = true }
+enigo = { version = "0.6", optional = true }
 
 [features]
 default = []

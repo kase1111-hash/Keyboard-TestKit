@@ -53,7 +53,7 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 ### From Source (Recommended)
 
 **Prerequisites:**
-- [Rust](https://rustup.rs/) 1.70 or later
+- [Rust](https://rustup.rs/) 1.88 or later
 - Linux: `libx11-dev`, `libxi-dev`, `libxtst-dev`
 
 ```bash

@@ -267,10 +267,8 @@ fn report_file_export_json() {
     let mut app = App::default();
     tap(&mut app, 30, 1000);
 
-    let path = std::env::temp_dir().join(format!(
-        "keyboard-testkit-test-{}.json",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("keyboard-testkit-test-{}.json", std::process::id()));
     let filename = path.to_string_lossy().to_string();
 
     let result = app.export_report(&filename);
@@ -462,11 +460,7 @@ fn current_results_returns_correct_test_results() {
         let results = app.current_results();
         // Help view returns empty, all others should have results
         if *view != AppView::Help {
-            assert!(
-                !results.is_empty(),
-                "View {:?} should have results",
-                view
-            );
+            assert!(!results.is_empty(), "View {:?} should have results", view);
         }
     }
 }

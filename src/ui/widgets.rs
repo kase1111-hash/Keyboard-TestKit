@@ -495,9 +495,7 @@ impl<'a> Widget for ShortcutOverlay<'a> {
         let y = area.y;
 
         // Background
-        let bg_style = Style::default()
-            .bg(self.colors.bg)
-            .fg(self.colors.yellow);
+        let bg_style = Style::default().bg(self.colors.bg).fg(self.colors.yellow);
         for dy in 0..height {
             for dx in 0..width {
                 if x + dx < area.x + area.width && y + dy < area.y + area.height {
