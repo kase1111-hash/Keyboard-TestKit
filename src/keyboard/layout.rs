@@ -67,6 +67,7 @@ pub struct VisualKey {
 ///
 /// Returns 5 rows (number row, QWERTY, home, shift, bottom).
 /// Each row is a Vec of VisualKey definitions.
+#[rustfmt::skip]
 pub fn layout_rows(layout: KeyboardLayout) -> [Vec<VisualKey>; 5] {
     let w = 4;
 
@@ -242,9 +243,8 @@ fn parse_xkb_query(output: &str) -> KeyboardLayout {
 
     // Known ISO layout countries
     const ISO_LAYOUTS: &[&str] = &[
-        "gb", "uk", "de", "fr", "es", "it", "pt", "nl", "be", "dk", "fi",
-        "no", "se", "ch", "at", "ie", "is", "cz", "sk", "hu", "pl", "ro",
-        "bg", "hr", "si", "rs", "tr", "br", "latam",
+        "gb", "uk", "de", "fr", "es", "it", "pt", "nl", "be", "dk", "fi", "no", "se", "ch", "at",
+        "ie", "is", "cz", "sk", "hu", "pl", "ro", "bg", "hr", "si", "rs", "tr", "br", "latam",
     ];
 
     if ISO_LAYOUTS.contains(&layout) {

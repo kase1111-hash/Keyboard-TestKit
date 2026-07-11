@@ -108,7 +108,9 @@ fn platform_config_dir() -> Option<PathBuf> {
                 return Some(PathBuf::from(xdg));
             }
         }
-        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config"))
     }
     #[cfg(target_os = "macos")]
     {
@@ -122,7 +124,9 @@ fn platform_config_dir() -> Option<PathBuf> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config"))
     }
 }
 

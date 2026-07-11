@@ -447,10 +447,7 @@ impl KeyboardTest for ShortcutTest {
             }
         } else {
             results.push(TestResult::info("--- System Shortcuts ---", ""));
-            results.push(TestResult::info(
-                "  Not available",
-                "gsettings not found",
-            ));
+            results.push(TestResult::info("  Not available", "gsettings not found"));
         }
 
         // Known conflicts reference

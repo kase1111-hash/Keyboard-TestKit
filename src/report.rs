@@ -26,13 +26,13 @@
 
 use crate::keyboard::KeyboardState;
 use crate::tests::{ResultStatus, TestResult};
-use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
+use std::time::SystemTime;
 
 /// Complete session report
 #[derive(Debug, Clone, Serialize, Deserialize)]

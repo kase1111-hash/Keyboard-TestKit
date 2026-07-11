@@ -488,9 +488,15 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
 
     // ASUS / ROG laptop keys
     map.insert(KeyCode(248), KeyInfo::new("MicMute", "Mic", 0, 36, 1.0));
-    map.insert(KeyCode(247), KeyInfo::new("AirplaneMode", "Air", 0, 37, 1.0));
+    map.insert(
+        KeyCode(247),
+        KeyInfo::new("AirplaneMode", "Air", 0, 37, 1.0),
+    );
     map.insert(KeyCode(148), KeyInfo::new("ROG/Launch", "ROG", 0, 38, 1.0));
-    map.insert(KeyCode(149), KeyInfo::new("AURA/Backlight", "AURA", 0, 39, 1.0));
+    map.insert(
+        KeyCode(149),
+        KeyInfo::new("AURA/Backlight", "AURA", 0, 39, 1.0),
+    );
     map.insert(KeyCode(202), KeyInfo::new("FanProfile", "Fan", 0, 40, 1.0));
     map.insert(KeyCode(203), KeyInfo::new("Prog4", "Prg4", 0, 41, 1.0));
     map.insert(KeyCode(152), KeyInfo::new("ScreenLock", "SLck", 0, 42, 1.0));
@@ -499,7 +505,10 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(171), KeyInfo::new("Config", "Conf", 0, 45, 1.0));
     map.insert(KeyCode(414), KeyInfo::new("Screenshot", "Snip", 0, 46, 1.0));
     map.insert(KeyCode(140), KeyInfo::new("Calculator", "Calc", 0, 47, 1.0));
-    map.insert(KeyCode(144), KeyInfo::new("FileManager", "File", 0, 48, 1.0));
+    map.insert(
+        KeyCode(144),
+        KeyInfo::new("FileManager", "File", 0, 48, 1.0),
+    );
     map.insert(KeyCode(155), KeyInfo::new("Mail", "Mail", 0, 49, 1.0));
     map.insert(KeyCode(150), KeyInfo::new("Browser", "Web", 0, 50, 1.0));
 

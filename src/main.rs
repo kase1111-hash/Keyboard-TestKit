@@ -62,11 +62,7 @@ use keyboard_testkit::mapper;
 /// Called from the panic hook, signal handler cleanup, and normal exit.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        std::io::stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
 /// Global flag for signal handler to indicate shutdown.
@@ -205,14 +201,15 @@ fn main() -> Result<()> {
 
         #[cfg(target_os = "linux")]
         CliMode::Mapper { preset, device } => {
-            info!("Keyboard TestKit v{} — Mapper Daemon", env!("CARGO_PKG_VERSION"));
+            info!(
+                "Keyboard TestKit v{} — Mapper Daemon",
+                env!("CARGO_PKG_VERSION")
+            );
 
             let running = Arc::new(AtomicBool::new(true));
             install_signal_handler(running.clone());
 
-            if let Err(e) =
-                mapper::run_mapper(preset.as_deref(), device, &[], running)
-            {
+            if let Err(e) = mapper::run_mapper(preset.as_deref(), device, &[], running) {
                 error!("Mapper error: {}", e);
                 return Err(e.into());
             }
@@ -374,7 +371,8 @@ fn run_app(
             }
             None => {
                 app.set_status(
-                    "Evdev unavailable - using crossterm fallback (limited OEM key support)".to_string(),
+                    "Evdev unavailable - using crossterm fallback (limited OEM key support)"
+                        .to_string(),
                 );
                 None
             }
@@ -457,23 +455,19 @@ fn run_app(
                 }
                 AppView::Settings => {
                     let items = app.settings_items();
-                    let panel =
-                        SettingsPanel::new(&items, app.settings_selected).theme(colors);
+                    let panel = SettingsPanel::new(&items, app.settings_selected).theme(colors);
                     frame.render_widget(panel, chunks[2]);
                 }
                 _ => {
                     let results = app.current_results();
-                    let panel =
-                        ResultsPanel::new(&results, app.view.name()).theme(colors);
+                    let panel = ResultsPanel::new(&results, app.view.name()).theme(colors);
                     frame.render_widget(panel, chunks[2]);
                 }
             }
 
             // Shortcut overlay (shown in any view)
             if let Some((combo, desc)) = app.shortcut_overlay() {
-                let overlay = ShortcutOverlay::new(combo)
-                    .description(desc)
-                    .theme(colors);
+                let overlay = ShortcutOverlay::new(combo).description(desc).theme(colors);
                 frame.render_widget(overlay, chunks[2]);
             }
 
@@ -573,9 +567,7 @@ fn run_app(
                         CtKeyCode::Char('9') if app.shortcuts_enabled => {
                             app.view = AppView::OemKeys
                         }
-                        CtKeyCode::Char('0') if app.shortcuts_enabled => {
-                            app.view = AppView::Help
-                        }
+                        CtKeyCode::Char('0') if app.shortcuts_enabled => app.view = AppView::Help,
                         CtKeyCode::Char('v') => {
                             if app.view == AppView::Virtual {
                                 app.virtual_test.request_virtual_test();

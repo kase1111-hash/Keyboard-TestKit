@@ -579,8 +579,12 @@ impl App {
                     self.config.polling.test_duration_secs =
                         self.config.polling.test_duration_secs.saturating_add(5);
                 } else {
-                    self.config.polling.test_duration_secs =
-                        self.config.polling.test_duration_secs.saturating_sub(5).max(5);
+                    self.config.polling.test_duration_secs = self
+                        .config
+                        .polling
+                        .test_duration_secs
+                        .saturating_sub(5)
+                        .max(5);
                 }
             }
             1 => {
@@ -632,11 +636,19 @@ impl App {
             6 => {
                 // Warning duration
                 if increase {
-                    self.config.ui.warning_duration_secs =
-                        self.config.ui.warning_duration_secs.saturating_add(1).min(30);
+                    self.config.ui.warning_duration_secs = self
+                        .config
+                        .ui
+                        .warning_duration_secs
+                        .saturating_add(1)
+                        .min(30);
                 } else {
-                    self.config.ui.warning_duration_secs =
-                        self.config.ui.warning_duration_secs.saturating_sub(1).max(1);
+                    self.config.ui.warning_duration_secs = self
+                        .config
+                        .ui
+                        .warning_duration_secs
+                        .saturating_sub(1)
+                        .max(1);
                 }
             }
             _ => {}
@@ -925,10 +937,7 @@ mod tests {
 
         app.settings_selected = 0;
         app.adjust_setting(true);
-        assert_eq!(
-            app.config.polling.test_duration_secs,
-            original + 5
-        );
+        assert_eq!(app.config.polling.test_duration_secs, original + 5);
 
         app.adjust_setting(false);
         assert_eq!(app.config.polling.test_duration_secs, original);

@@ -97,7 +97,8 @@ impl<'a> Widget for KeyboardVisual<'a> {
             self.render_key(buf, ax + w + 1, y0 + 3, "\u{25B2}", KeyCode(103), w); // ▲
             self.render_key(buf, ax, y0 + 4, "\u{25C0}", KeyCode(105), w); // ◀
             self.render_key(buf, ax + w + 1, y0 + 4, "\u{25BC}", KeyCode(108), w); // ▼
-            self.render_key(buf, ax + (w + 1) * 2, y0 + 4, "\u{25B6}", KeyCode(106), w); // ▶
+            self.render_key(buf, ax + (w + 1) * 2, y0 + 4, "\u{25B6}", KeyCode(106), w);
+            // ▶
         }
     }
 }

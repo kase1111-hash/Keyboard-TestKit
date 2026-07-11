@@ -13,9 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - evdev-based keyboard listener for improved Linux support
 
 ### Changed
+- Updated dependencies to latest major versions: ratatui 0.29 → 0.30, crossterm 0.28 → 0.29, toml 0.8 → 1.1, enigo 0.2 → 0.6
+- Refreshed Cargo.lock so all transitive dependencies are current
+- Declared minimum supported Rust version (1.88) in Cargo.toml and README
 - Renamed "Latency" view to "Timing" to accurately reflect that it measures inter-event polling intervals rather than true end-to-end input latency
 
 ### Fixed
+- Resolved new clippy lints (`println_empty_string`) and formatting drift so `cargo clippy -D warnings` and `cargo fmt --check` pass on current stable Rust
 - Documentation now accurately describes the timing test as measuring inter-event intervals
 - README export section updated to reflect all 8 tests included in JSON reports
 - README keyboard controls table now documents OEM/FN view keys (a, f, c)
