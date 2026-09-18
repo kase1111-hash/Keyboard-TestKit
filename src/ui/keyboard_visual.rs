@@ -9,12 +9,15 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
+use std::collections::HashSet;
 
 /// Visual representation of a keyboard
 pub struct KeyboardVisual<'a> {
     keyboard_state: &'a KeyboardState,
     colors: ThemeColors,
     layout: KeyboardLayout,
+    /// Keys verified by the auto-test sweep (highlighted distinctly)
+    verified: Option<&'a HashSet<KeyCode>>,
 }
 
 impl<'a> KeyboardVisual<'a> {
@@ -23,7 +26,14 @@ impl<'a> KeyboardVisual<'a> {
             keyboard_state,
             colors: ThemeColors::dark(),
             layout: KeyboardLayout::Ansi,
+            verified: None,
         }
+    }
+
+    /// Highlight the given keys as verified by the auto test.
+    pub fn verified(mut self, keys: &'a HashSet<KeyCode>) -> Self {
+        self.verified = Some(keys);
+        self
     }
 
     pub fn theme(mut self, colors: ThemeColors) -> Self {
@@ -40,6 +50,8 @@ impl<'a> KeyboardVisual<'a> {
         let pressed = self.keyboard_state.pressed_keys().contains(&code);
         if pressed {
             (self.colors.key_on, self.colors.key_text_on, true)
+        } else if self.verified.is_some_and(|v| v.contains(&code)) {
+            (self.colors.key_verified, self.colors.key_text_on, false)
         } else if self
             .keyboard_state
             .get_key_state(code)

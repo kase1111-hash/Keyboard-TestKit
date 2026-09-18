@@ -62,6 +62,11 @@ impl RolloverTest {
         }
     }
 
+    /// Number of ghost key events detected
+    pub fn ghost_count(&self) -> usize {
+        self.ghost_detections.len()
+    }
+
     /// Get currently pressed keys
     pub fn pressed_keys(&self) -> Vec<KeyCode> {
         self.pressed_keys.iter().copied().collect()
@@ -175,9 +180,9 @@ impl KeyboardTest for RolloverTest {
         ));
 
         // Max rollover
+        // 1-2 keys is not enough evidence either way (hold more keys to test)
         let status = match self.max_simultaneous {
-            0 => ResultStatus::Info,
-            1..=2 => ResultStatus::Error,
+            0..=2 => ResultStatus::Info,
             3..=5 => ResultStatus::Warning,
             _ => ResultStatus::Ok,
         };

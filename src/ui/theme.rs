@@ -28,6 +28,8 @@ pub struct ThemeColors {
     pub key_on: Color,
     /// Key previously used background
     pub key_used: Color,
+    /// Key verified by the auto test sweep (pressed and released) background
+    pub key_verified: Color,
     /// Key label text (idle)
     pub key_text: Color,
     /// Key label text (pressed)
@@ -56,6 +58,7 @@ impl ThemeColors {
             key_off: Color::Rgb(40, 40, 50),
             key_on: Color::Rgb(80, 200, 120),
             key_used: Color::Rgb(55, 55, 70),
+            key_verified: Color::Rgb(40, 95, 70),
             key_text: Color::Rgb(180, 180, 190),
             key_text_on: Color::Rgb(20, 20, 25),
         }
@@ -74,6 +77,7 @@ impl ThemeColors {
             key_off: Color::Rgb(220, 220, 228),
             key_on: Color::Rgb(30, 150, 70),
             key_used: Color::Rgb(200, 200, 212),
+            key_verified: Color::Rgb(170, 220, 185),
             key_text: Color::Rgb(50, 50, 60),
             key_text_on: Color::Rgb(255, 255, 255),
         }

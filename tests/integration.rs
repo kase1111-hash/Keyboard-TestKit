@@ -182,6 +182,9 @@ fn view_navigation_backward_wraps() {
     assert_eq!(app.view, AppView::Help);
 
     app.prev_view();
+    assert_eq!(app.view, AppView::AutoTest);
+
+    app.prev_view();
     assert_eq!(app.view, AppView::OemKeys);
 }
 
@@ -463,4 +466,190 @@ fn current_results_returns_correct_test_results() {
             assert!(!results.is_empty(), "View {:?} should have results", view);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic diagnostic (auto test)
+// ---------------------------------------------------------------------------
+
+use keyboard_testkit::tests::{AutoTestState, InputSource, Severity, StepKind};
+use std::time::Duration;
+
+fn timed(key: u16, event_type: KeyEventType, at: Instant, delta_us: u64) -> KeyEvent {
+    KeyEvent::new(KeyCode(key), event_type, at, delta_us)
+}
+
+#[test]
+fn auto_test_starts_switches_view_and_resets_state() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    tap(&mut app, 30, 1000);
+    assert_eq!(app.total_events, 2);
+
+    app.start_auto_test();
+    assert_eq!(app.view, AppView::AutoTest);
+    assert!(app.auto_test_running());
+    assert_eq!(app.auto_test.state(), AutoTestState::Running);
+    assert_eq!(app.auto_test.current_step(), Some(StepKind::Idle));
+    // A fresh run starts from a clean slate
+    assert_eq!(app.total_events, 0);
+    assert_eq!(app.keyboard_state.total_events(), 0);
+}
+
+#[test]
+fn auto_test_view_renders_instructions_and_findings() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.view = AppView::AutoTest;
+    let idle = app.current_results();
+    assert!(idle.iter().any(|r| r.value.contains("Not started")));
+
+    app.start_auto_test();
+    let running = app.current_results();
+    assert!(running.iter().any(|r| r.label == "Do this"));
+    assert!(running.iter().any(|r| r.value.contains("Hands off")));
+}
+
+#[test]
+fn auto_test_phantom_input_during_idle_is_reported() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    // A key fires while the user was told to keep hands off
+    app.process_event(&press(30, 1000));
+    app.process_event(&release(30, 1000));
+    app.abort_auto_test();
+    assert_eq!(app.auto_test.state(), AutoTestState::Aborted);
+    let phantom = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Phantom input")
+        .expect("phantom finding present");
+    assert_eq!(phantom.severity, Severity::Critical);
+    assert!(app.issue_count() >= 1);
+}
+
+#[test]
+fn auto_test_skip_all_steps_completes_run() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    let steps = app.auto_test.steps().len();
+    assert_eq!(steps, 5);
+    for _ in 0..steps {
+        app.skip_auto_step();
+    }
+    assert!(app.auto_test.is_complete());
+    assert!(!app.auto_test_running());
+    // Skipping the sweep leaves the keys "not tested" as an informational finding
+    assert!(app
+        .findings
+        .iter()
+        .any(|f| f.category == "Not tested" && f.severity == Severity::Info));
+    // Dashboard summarises the result
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    assert!(dash
+        .iter()
+        .any(|r| r.label == "Issues Found" && r.value.contains("auto test complete")));
+}
+
+#[test]
+fn auto_test_press_only_terminal_skips_release_steps_and_warns() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    app.start_auto_test();
+    assert_eq!(
+        app.auto_test.steps(),
+        &[StepKind::Idle, StepKind::Sweep, StepKind::RapidTap]
+    );
+    app.refresh_findings();
+    assert!(app
+        .findings
+        .iter()
+        .any(|f| f.category == "Limited capture" && f.severity == Severity::Warning));
+}
+
+#[test]
+fn live_findings_detect_switch_bounce_without_running_auto_test() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let t0 = Instant::now();
+    // press, release 1ms later, press again 1ms later: classic contact bounce
+    app.process_event(&timed(30, KeyEventType::Press, t0, 0));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Release,
+        t0 + Duration::from_millis(1),
+        1000,
+    ));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Press,
+        t0 + Duration::from_millis(2),
+        1000,
+    ));
+    app.refresh_findings();
+    let bounce = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(bounce.severity, Severity::Critical);
+    assert!(bounce.detail.contains('A'));
+
+    // And the report carries the diagnostics
+    let report = app.generate_report();
+    assert!(!report.tests.diagnostics.is_empty());
+    let json = report.to_json().unwrap();
+    assert!(json.contains("\"diagnostics\""));
+    assert!(json.contains("Switch bounce"));
+    assert!(report.to_csv().contains("Diagnostics,Switch bounce"));
+    assert!(report.to_markdown().contains("## Diagnostics"));
+    assert!(report.to_text().contains("DIAGNOSTICS"));
+}
+
+#[test]
+fn clean_typing_produces_no_issues() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let mut at = Instant::now();
+    for key in [30u16, 31, 32, 33, 36, 37, 38, 39] {
+        app.process_event(&timed(key, KeyEventType::Press, at, 120_000));
+        at += Duration::from_millis(70);
+        app.process_event(&timed(key, KeyEventType::Release, at, 70_000));
+        at += Duration::from_millis(50);
+    }
+    app.refresh_findings();
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
+    assert_eq!(app.findings[0].category, "Summary");
+}
+
+#[test]
+fn stuck_key_flagged_via_tick_without_further_events() {
+    let mut config = Config::default();
+    config.stickiness.stuck_threshold_ms = 10;
+    let mut app = App::new(config);
+    app.set_input_source(InputSource::Evdev);
+    app.process_event(&press(30, 1000));
+    std::thread::sleep(Duration::from_millis(30));
+    // No further key events: tick alone must notice the stuck key
+    app.tick();
+    assert!(app
+        .status_message
+        .as_deref()
+        .is_some_and(|m| m.contains("stuck")));
+    app.refresh_findings();
+    assert!(app.findings.iter().any(|f| f.category == "Stuck key"));
+}
+
+#[test]
+fn reset_all_clears_auto_test_and_findings() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    app.process_event(&press(30, 1000));
+    app.reset_all();
+    assert_eq!(app.auto_test.state(), AutoTestState::Idle);
+    assert_eq!(app.issue_count(), 0);
 }

@@ -80,6 +80,9 @@ pub struct TestResults {
     pub shortcuts: Vec<ResultEntry>,
     pub virtual_detect: Vec<ResultEntry>,
     pub oem_keys: Vec<ResultEntry>,
+    /// Findings from the automatic diagnostic
+    #[serde(default)]
+    pub diagnostics: Vec<ResultEntry>,
 }
 
 /// Single result entry
@@ -110,6 +113,8 @@ impl From<&TestResult> for ResultEntry {
 pub struct ReportInput {
     pub start_time: Instant,
     pub total_events: u64,
+    /// Polling rate inferred from timestamp quantization, if available
+    pub polling_rate_hz: Option<f64>,
     pub polling: Vec<TestResult>,
     pub hold_release: Vec<TestResult>,
     pub stickiness: Vec<TestResult>,
@@ -118,6 +123,8 @@ pub struct ReportInput {
     pub shortcuts: Vec<TestResult>,
     pub virtual_detect: Vec<TestResult>,
     pub oem_keys: Vec<TestResult>,
+    /// Findings from the automatic diagnostic (rendered rows)
+    pub diagnostics: Vec<TestResult>,
 }
 
 impl SessionReport {
@@ -137,7 +144,7 @@ impl SessionReport {
                 .count() as u32
         };
 
-        let all_results: [&[TestResult]; 8] = [
+        let all_results: [&[TestResult]; 9] = [
             &input.polling,
             &input.hold_release,
             &input.stickiness,
@@ -146,8 +153,15 @@ impl SessionReport {
             &input.shortcuts,
             &input.virtual_detect,
             &input.oem_keys,
+            &input.diagnostics,
         ];
-        let issues: u32 = all_results.iter().map(|r| count_issues(r)).sum();
+        // The diagnostics section is the de-duplicated issue list; only fall
+        // back to counting coloured rows when no diagnostics were supplied.
+        let issues: u32 = if input.diagnostics.is_empty() {
+            all_results.iter().map(|r| count_issues(r)).sum()
+        } else {
+            count_issues(&input.diagnostics)
+        };
 
         Self {
             metadata: ReportMetadata {
@@ -158,7 +172,7 @@ impl SessionReport {
             summary: SessionSummary {
                 total_events: input.total_events,
                 max_rollover: keyboard_state.max_rollover(),
-                estimated_polling_rate_hz: keyboard_state.global_polling_rate_hz(),
+                estimated_polling_rate_hz: input.polling_rate_hz,
                 issues_detected: issues,
             },
             tests: TestResults {
@@ -170,6 +184,7 @@ impl SessionReport {
                 shortcuts: input.shortcuts.iter().map(ResultEntry::from).collect(),
                 virtual_detect: input.virtual_detect.iter().map(ResultEntry::from).collect(),
                 oem_keys: input.oem_keys.iter().map(ResultEntry::from).collect(),
+                diagnostics: input.diagnostics.iter().map(ResultEntry::from).collect(),
             },
         }
     }
@@ -227,6 +242,7 @@ impl SessionReport {
         write_results(&mut csv, "Shortcuts", &self.tests.shortcuts);
         write_results(&mut csv, "Virtual Detect", &self.tests.virtual_detect);
         write_results(&mut csv, "OEM Keys", &self.tests.oem_keys);
+        write_results(&mut csv, "Diagnostics", &self.tests.diagnostics);
 
         csv
     }
@@ -291,6 +307,7 @@ impl SessionReport {
         Self::write_markdown_section(&mut md, "Shortcuts", &self.tests.shortcuts);
         Self::write_markdown_section(&mut md, "Virtual Detect", &self.tests.virtual_detect);
         Self::write_markdown_section(&mut md, "OEM Keys", &self.tests.oem_keys);
+        Self::write_markdown_section(&mut md, "Diagnostics", &self.tests.diagnostics);
 
         md
     }
@@ -370,6 +387,7 @@ impl SessionReport {
         Self::write_text_section(&mut text, "SHORTCUTS", &self.tests.shortcuts);
         Self::write_text_section(&mut text, "VIRTUAL DETECT", &self.tests.virtual_detect);
         Self::write_text_section(&mut text, "OEM KEYS", &self.tests.oem_keys);
+        Self::write_text_section(&mut text, "DIAGNOSTICS", &self.tests.diagnostics);
 
         text
     }
@@ -441,6 +459,11 @@ mod tests {
                 shortcuts: vec![],
                 virtual_detect: vec![],
                 oem_keys: vec![],
+                diagnostics: vec![ResultEntry {
+                    label: "Summary".to_string(),
+                    value: "No issues detected".to_string(),
+                    status: "info".to_string(),
+                }],
             },
         }
     }

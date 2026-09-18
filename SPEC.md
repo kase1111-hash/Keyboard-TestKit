@@ -36,7 +36,7 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 | Specification | Details |
 |---------------|---------|
 | Detection Method | Monitor key-up event timing |
-| Threshold | Configurable (default: 50ms after physical release) |
+| Threshold | Configurable (default: 2000ms held without release) |
 | Alert Type | Visual highlight |
 | Logging | Record all sticky key incidents with timestamps |
 

@@ -44,7 +44,9 @@ mod state;
 #[cfg(target_os = "linux")]
 pub mod evdev_listener;
 
-pub use event::{KeyEvent, KeyEventType, KeyboardListener};
+pub use event::{
+    crossterm_to_keycode, KeyEvent, KeyEventType, KeyboardListener, AUTO_RELEASE_TIMEOUT,
+};
 pub use keymap::{get_key_info, KeyCode, KeyInfo, KEYMAP};
 pub use layout::KeyboardLayout;
 pub use state::{KeyState, KeyboardState};

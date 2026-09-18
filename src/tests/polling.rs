@@ -110,6 +110,34 @@ impl PollingRateTest {
         Some(variance.sqrt())
     }
 
+    /// Number of key press events recorded.
+    pub fn event_count(&self) -> u64 {
+        self.event_count
+    }
+
+    /// Recorded inter-press intervals in microseconds (only intervals < 100ms).
+    pub fn intervals_us(&self) -> &[u64] {
+        &self.intervals_us
+    }
+
+    /// Estimate the keyboard's USB/BT report interval from timestamp quantization.
+    ///
+    /// A polled keyboard can only deliver reports on its poll boundary, so the
+    /// gaps between its events are (near) multiples of the poll interval. This
+    /// looks for the largest candidate interval that explains almost all of the
+    /// recorded gaps. It needs precise (kernel) timestamps and at least
+    /// [`MIN_QUANTIZATION_SAMPLES`] samples; returns `None` otherwise, or when
+    /// no quantization is visible (interrupt-driven or >= 1000 Hz keyboards).
+    pub fn estimated_poll_interval_us(&self) -> Option<u64> {
+        estimate_quantization_us(&self.intervals_us)
+    }
+
+    /// Estimated polling rate in Hz derived from [`Self::estimated_poll_interval_us`].
+    pub fn estimated_poll_rate_hz(&self) -> Option<f64> {
+        self.estimated_poll_interval_us()
+            .map(|us| 1_000_000.0 / us as f64)
+    }
+
     /// Get test progress (0.0 to 1.0)
     pub fn progress(&self) -> f64 {
         match self.start_time {
@@ -120,6 +148,41 @@ impl PollingRateTest {
             None => 0.0,
         }
     }
+}
+
+/// Minimum number of samples before quantization analysis is attempted.
+pub const MIN_QUANTIZATION_SAMPLES: usize = 24;
+
+/// Candidate report intervals (µs) for common polling rates: 125, 250, 500 Hz.
+/// 1000 Hz and above cannot be told apart from interrupt-driven input with the
+/// tolerance used here, so they are reported as "not quantized".
+const QUANTIZATION_CANDIDATES_US: [u64; 3] = [8000, 4000, 2000];
+
+/// Fraction of intervals that must sit on the grid for a candidate to be accepted.
+const QUANTIZATION_MATCH_RATIO: f64 = 0.9;
+
+/// Tolerance around each grid point (USB scheduling jitter is well under this).
+const QUANTIZATION_TOLERANCE_US: u64 = 400;
+
+/// Estimate the timestamp quantization step of a set of intervals (see
+/// [`PollingRateTest::estimated_poll_interval_us`]).
+pub fn estimate_quantization_us(intervals: &[u64]) -> Option<u64> {
+    if intervals.len() < MIN_QUANTIZATION_SAMPLES {
+        return None;
+    }
+    for &step in &QUANTIZATION_CANDIDATES_US {
+        let matching = intervals
+            .iter()
+            .filter(|&&iv| {
+                let rem = iv % step;
+                rem <= QUANTIZATION_TOLERANCE_US || step - rem <= QUANTIZATION_TOLERANCE_US
+            })
+            .count();
+        if matching as f64 / intervals.len() as f64 >= QUANTIZATION_MATCH_RATIO {
+            return Some(step);
+        }
+    }
+    None
 }
 
 impl KeyboardTest for PollingRateTest {
@@ -181,8 +244,8 @@ impl KeyboardTest for PollingRateTest {
             "1000Hz=1ms, 125Hz=8ms delay",
         ));
         results.push(TestResult::info(
-            "Look for: 1000Hz gaming,",
-            "125Hz standard, low jitter",
+            "Tap keys rapidly; poll rate",
+            "is inferred from timestamps",
         ));
         results.push(TestResult::info("", ""));
 
@@ -191,50 +254,74 @@ impl KeyboardTest for PollingRateTest {
             format!("{}", self.event_count),
         ));
 
-        // Windowed rate is the primary display metric (more responsive)
+        // Poll rate inferred from timestamp quantization (needs kernel timestamps)
+        if self.intervals_us.len() >= MIN_QUANTIZATION_SAMPLES {
+            match self.estimated_poll_rate_hz() {
+                Some(hz) => {
+                    let status = if hz >= 500.0 {
+                        ResultStatus::Ok
+                    } else if hz >= 200.0 {
+                        ResultStatus::Warning
+                    } else {
+                        ResultStatus::Info
+                    };
+                    results.push(TestResult::new(
+                        "Est. Poll Rate",
+                        format!("{:.0} Hz (report every {:.0} ms)", hz, 1000.0 / hz),
+                        status,
+                    ));
+                }
+                None => {
+                    results.push(TestResult::ok("Est. Poll Rate", ">= 1000 Hz or not polled"));
+                }
+            }
+        } else {
+            results.push(TestResult::info(
+                "Est. Poll Rate",
+                format!(
+                    "need {} rapid taps ({} so far)",
+                    MIN_QUANTIZATION_SAMPLES,
+                    self.intervals_us.len()
+                ),
+            ));
+        }
+
+        // Windowed keystroke rate (how fast keys are arriving right now)
         let display_rate = self.windowed_rate_hz().or_else(|| self.avg_rate_hz());
         if let Some(rate) = display_rate {
-            let status = if rate >= 900.0 {
-                ResultStatus::Ok
-            } else if rate >= 450.0 {
-                ResultStatus::Warning
-            } else {
-                ResultStatus::Error
-            };
-            results.push(TestResult::new(
-                "Current Rate",
-                format!("{:.1} Hz", rate),
-                status,
+            results.push(TestResult::info(
+                "Burst Key Rate",
+                format!("{:.1} keys/s", rate),
             ));
         }
 
         if let Some(avg) = self.avg_rate_hz() {
             results.push(TestResult::info(
-                "Session Average",
-                format!("{:.1} Hz", avg),
+                "Avg Key Rate",
+                format!("{:.1} keys/s", avg),
             ));
         }
 
-        if let Some(min) = self.min_rate_hz() {
-            results.push(TestResult::info("Min Rate", format!("{:.1} Hz", min)));
+        if let Some(min) = self.min_interval_us {
+            results.push(TestResult::info(
+                "Shortest Gap",
+                format!("{:.2} ms", min as f64 / 1000.0),
+            ));
         }
 
-        if let Some(max) = self.max_rate_hz() {
-            results.push(TestResult::info("Max Rate", format!("{:.1} Hz", max)));
+        if let Some(max) = self.max_interval_us {
+            results.push(TestResult::info(
+                "Longest Gap",
+                format!("{:.2} ms", max as f64 / 1000.0),
+            ));
         }
 
+        // Spread of inter-key gaps. This reflects typing rhythm far more than
+        // the keyboard, so it is informational only.
         if let Some(jitter) = self.jitter_us() {
-            let status = if jitter < 500.0 {
-                ResultStatus::Ok
-            } else if jitter < 2000.0 {
-                ResultStatus::Warning
-            } else {
-                ResultStatus::Error
-            };
-            results.push(TestResult::new(
-                "Jitter",
-                format!("{:.1} μs", jitter),
-                status,
+            results.push(TestResult::info(
+                "Gap Spread (σ)",
+                format!("{:.1} ms", jitter / 1000.0),
             ));
         }
 
