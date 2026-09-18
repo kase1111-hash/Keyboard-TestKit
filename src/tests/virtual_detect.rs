@@ -505,6 +505,16 @@ impl VirtualKeyboardTest {
         self.test_mode_active = false;
     }
 
+    /// Current physical-vs-virtual diagnostic result
+    pub fn diagnostic(&self) -> DiagnosticResult {
+        self.diagnostic
+    }
+
+    /// Current input classification (physical vs. virtual heuristics)
+    pub fn classification(&self) -> InputClassification {
+        self.session_classification
+    }
+
     /// Get recent anomalies
     pub fn recent_anomalies(&self, count: usize) -> Vec<&AnomalyEvent> {
         self.anomalies.iter().rev().take(count).collect()

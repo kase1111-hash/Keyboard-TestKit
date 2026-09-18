@@ -79,6 +79,14 @@ impl StickinessTest {
             .collect()
     }
 
+    /// Keys that have been flagged as stuck: (key, hold duration at detection, occurrences)
+    pub fn flagged_keys(&self) -> Vec<(KeyCode, Duration, u32)> {
+        self.flagged_keys
+            .iter()
+            .map(|r| (r.key, r.duration_at_detection, r.occurrences))
+            .collect()
+    }
+
     /// Get the threshold duration
     pub fn threshold(&self) -> Duration {
         self.threshold

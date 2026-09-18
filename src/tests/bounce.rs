@@ -112,6 +112,24 @@ impl HoldReleaseTest {
         }
     }
 
+    /// Total bounces detected across all keys
+    pub fn total_bounces(&self) -> u32 {
+        self.total_bounces
+    }
+
+    /// Total key presses seen
+    pub fn total_presses(&self) -> u32 {
+        self.total_presses
+    }
+
+    /// Shortest completed hold duration per key, in milliseconds.
+    pub fn min_hold_by_key(&self) -> Vec<(KeyCode, f64)> {
+        self.key_stats
+            .iter()
+            .filter_map(|(k, s)| s.min_hold_ms.map(|m| (*k, m)))
+            .collect()
+    }
+
     /// Get keys with bounces
     pub fn bouncy_keys(&self) -> Vec<(KeyCode, u32)> {
         self.key_stats

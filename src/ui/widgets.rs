@@ -158,12 +158,21 @@ impl Widget for HelpPanel {
                 ][..],
             ),
             (
+                "AUTO",
+                &[
+                    ("A", "Run auto test"),
+                    ("Ctrl+N", "Skip step"),
+                    ("Ctrl+C", "Abort test"),
+                ][..],
+            ),
+            (
                 "CTL",
                 &[
                     ("Space", "Pause"),
                     ("r/R", "Reset"),
                     ("e", "Export"),
                     ("t", "Toggle theme"),
+                    ("S", "Settings"),
                     ("?", "Help"),
                 ][..],
             ),
@@ -179,7 +188,7 @@ impl Widget for HelpPanel {
                     ("7", "Shortcuts"),
                     ("8", "Virtual"),
                     ("9", "OEM/FN"),
-                    ("0", "Help"),
+                    ("0", "Auto"),
                 ][..],
             ),
             (

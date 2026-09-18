@@ -8,8 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Automatic diagnostic ("Auto" view, `A` key, `--auto` flag): a guided idle / key-sweep / hold / rollover / rapid-tap sequence that produces ranked findings (phantom input, dead keys, stuck keys, switch bounce and chatter, limited rollover, ghosting, polling rate, unknown scancodes). Findings are shown live on the Dashboard, included in exported reports under `diagnostics`, and printed on exit
+- Polling-rate estimate inferred from event timestamp quantization (125/250/500 Hz grids) when evdev timestamps are available
+- Key-release reporting through the kitty keyboard protocol on supporting terminals; on other terminals releases are synthesized after a short timeout so keys no longer look permanently pressed
+- Shifted symbols (`!@#$%^&*()_+{}|:"<>?~`) and kitty-reported modifier keys are mapped to their physical keys instead of being dropped
+- `--version` flag
 - OEM key detection and remapping support
-- Keyboard shortcuts for OEM/FN (9) and Help (0) views
+- Keyboard shortcuts for OEM/FN (9) and Auto (0) views; Help remains on `?`
 - evdev-based keyboard listener for improved Linux support
 
 ### Changed
@@ -19,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Renamed "Latency" view to "Timing" to accurately reflect that it measures inter-event polling intervals rather than true end-to-end input latency
 
 ### Fixed
+- evdev events are now timestamped with the kernel's event time instead of the UI poll time. Previously every event in a poll batch shared one timestamp, which quantized all timing to the refresh rate and made a quick tap look like switch bounce
+- Terminal key events are dispatched by kind: releases and repeats are no longer treated as new presses (on Windows every key was counted twice and controls such as Tab fired on release too), and controls only fire on the initial press
+- All queued terminal events are drained each frame instead of one per frame, so bursts of keys are not spread across several redraws
+- Stuck-key detection runs every frame rather than only when another key event arrives
+- Default stuck-key threshold raised from 50 ms to 2 s; the old value flagged ordinary key presses as stuck
+- Pressing one or two keys no longer shows the rollover result in red, and polling-view rows that reflected typing rhythm rather than the keyboard are no longer coloured as errors
+- Ctrl+C now quits (raw mode previously swallowed it)
 - Resolved new clippy lints (`println_empty_string`) and formatting drift so `cargo clippy -D warnings` and `cargo fmt --check` pass on current stable Rust
 - Documentation now accurately describes the timing test as measuring inter-event intervals
 - README export section updated to reflect all 8 tests included in JSON reports

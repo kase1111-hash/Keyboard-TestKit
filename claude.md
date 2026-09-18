@@ -39,7 +39,8 @@ src/
 │   ├── latency.rs       # Inter-event timing measurement
 │   ├── shortcuts.rs     # Hotkey conflict detection
 │   ├── virtual_detect.rs # Physical vs virtual comparison
-│   └── oem_keys.rs      # OEM key capture & FN restoration
+│   ├── oem_keys.rs      # OEM key capture & FN restoration
+│   └── auto_test.rs     # Guided automatic diagnostic + findings analysis
 └── ui/                  # Terminal UI components
     ├── app.rs           # Main App struct & state
     ├── keyboard_visual.rs # Real-time keyboard rendering
@@ -74,9 +75,11 @@ make install          # Install to /usr/local/bin
 
 1. Initialize terminal (raw mode, alternate screen)
 2. Create keyboard listener & event channels
-3. Try evdev listener on Linux (fallback to device_query)
-4. Main loop: poll events, update tests, render UI at 60Hz
-5. Cleanup terminal on exit
+3. Try evdev listener on Linux; otherwise use terminal input (kitty keyboard
+   protocol for key releases where supported, synthesized releases otherwise)
+4. Main loop: poll events, `app.tick()` (auto-test timers, stuck keys, live
+   findings), render UI at 60Hz, drain all queued terminal events
+5. Cleanup terminal on exit and print the findings summary
 
 ### KeyboardTest Trait
 
@@ -101,6 +104,10 @@ trait KeyboardTest {
 6. **ShortcutTest** - System hotkey conflict detection
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison
 8. **OemKeyTest** - OEM/FN key capture & restoration
+9. **AutoTest** - Guided diagnostic (idle, sweep, hold, rollover, rapid tap) whose
+   `analyze()` turns the data from all tests into ranked `Finding`s. It is fed
+   from `App::process_event` and driven by `App::tick`; `InputSource` tells it
+   what the capture path can measure.
 
 ## Configuration
 
@@ -117,15 +124,19 @@ Config file locations:
 - Platform-specific code uses `#[cfg(target_os = "...")]`
 - KeyCode uses Linux evdev scancodes as universal identifiers
 - Per-key metrics tracked separately in KeyboardState
+- Event timestamps come from the source (kernel time for evdev); never stamp a
+  batch with the poll time, the bounce and timing tests depend on it
 
 ### UI Controls
 
 - Tab/Shift+Tab: Navigate views
-- 1-9, 0: Direct view access (10 views)
+- 1-9, 0: Direct view access (0 = Auto; Help via `?`)
+- A: Start the auto test (Ctrl+N skips a step, Ctrl+C aborts). While it runs,
+  every other key is test input and no shortcuts fire
 - Space: Pause/Resume
 - r/R: Reset current/all tests
 - e: Export JSON report
-- q/Esc: Quit
+- q/Esc/Ctrl+C: Quit
 
 ### Build Profile
 

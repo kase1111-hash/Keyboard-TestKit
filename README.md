@@ -17,6 +17,7 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 | **Shortcuts** | Detect system hotkey conflicts intercepting input |
 | **Virtual** | Compare physical vs virtual keys to isolate hardware/software issues |
 | **OEM/FN** | OEM key detection, capture, and FN key remapping |
+| **Auto** | Guided automatic diagnostic that finds issues for you (dead, stuck and chattering keys, phantom input, limited rollover, polling rate) |
 
 ## Screenshots
 
@@ -112,9 +113,39 @@ make windows
 # Run the application
 ./keyboard-testkit
 
+# Jump straight into the automatic diagnostic
+./keyboard-testkit --auto
+
 # Or after installation
 keyboard-testkit
 ```
+
+On Linux, run with `sudo` (or add your user to the `input` group) so the app
+can read the keyboard through evdev: that gives raw scancodes, kernel
+timestamps and real key-release events. Without it the terminal is used as
+the input source; terminals that speak the kitty keyboard protocol (kitty,
+WezTerm, foot, Ghostty, Alacritty 0.13+) still report key releases, other
+terminals only report presses and releases are synthesized after a short
+timeout.
+
+### Automatic Diagnostic
+
+Press `A` (or start with `--auto`) and follow the on-screen instructions. The
+auto test runs five short steps and then writes a ranked list of findings:
+
+| Step | You do | It checks for |
+|------|--------|---------------|
+| Idle check | Nothing for 3 s | Phantom input, keys already stuck |
+| Key sweep | Press every key once | Dead keys, keys that never release |
+| Hold & release | Hold one key ~1 s | Release reporting, stuck keys |
+| Rollover | Hold as many keys as you can | Limited N-key rollover |
+| Rapid tap | Tap one key quickly | Switch chatter/bounce, polling rate |
+
+While the auto test runs every key is treated as test input, so `q`, `r`,
+`Esc` and the other shortcuts can be verified like any other key. `Ctrl+N`
+skips the current step and `Ctrl+C` aborts the run. The findings also appear
+on the Dashboard (updated live, even without running the guided test), in the
+exported report and on stdout when you quit.
 
 ### Keyboard Controls
 
@@ -124,6 +155,9 @@ keyboard-testkit
 | `Shift+Tab` | Previous test view |
 | `1-9`, `0` | Jump to specific view |
 | `m` | Toggle menu shortcuts (free number keys for testing) |
+| `A` | Run the automatic diagnostic |
+| `Ctrl+N` | Skip the current auto-test step |
+| `Ctrl+C` | Abort the auto test (quits when no test is running) |
 | `Space` | Pause/resume testing |
 | `r` | Reset current test |
 | `R` | Reset all tests |
@@ -132,6 +166,8 @@ keyboard-testkit
 | `a` | Add last unknown key as FN scancode (on OEM/FN view) |
 | `f` | Cycle FN key mode (on OEM/FN view) |
 | `c` | Clear OEM key mappings (on OEM/FN view) |
+| `S` | Settings |
+| `t` | Toggle dark/light theme |
 | `?` | Show help |
 | `q` / `Esc` | Quit |
 
@@ -146,7 +182,8 @@ keyboard-testkit
 7. **Shortcuts** - System hotkey conflict detection
 8. **Virtual** - Physical vs virtual keyboard comparison
 9. **OEM/FN** - OEM key capture and FN key remapping
-0. **Help** - In-app help and key reference
+0. **Auto** - Guided automatic diagnostic with ranked findings
+- **Help** - In-app help and key reference (`?`)
 
 ## Configuration
 
@@ -155,7 +192,7 @@ Default configuration values (in `src/config.rs`):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `polling.test_duration_secs` | 10 | Duration for polling rate test |
-| `stickiness.stuck_threshold_ms` | 50 | Time before key is considered stuck |
+| `stickiness.stuck_threshold_ms` | 2000 | Time before key is considered stuck |
 | `hold_release.bounce_window_ms` | 5 | Window for bounce detection |
 | `ui.refresh_rate_hz` | 60 | UI refresh rate |
 
@@ -172,16 +209,25 @@ The Virtual Keyboard test helps isolate issues:
 
 ## Export
 
-Press `e` to export a JSON report with results from all 8 tests (polling, bounce, stickiness, rollover, timing, shortcuts, virtual, and OEM/FN):
+Press `e` to export a JSON report with results from all 8 tests (polling, bounce, stickiness, rollover, timing, shortcuts, virtual, and OEM/FN) plus the diagnostic findings:
 
 ```json
 {
-  "session_duration_secs": 120,
-  "total_events": 1543,
-  "polling_rate": { "average_hz": 1000, "min_hz": 995, "max_hz": 1005 },
-  "rollover": { "max_keys": 6, "ghosting_detected": false },
-  "timing": { "average_ms": 8.2, "per_key": {...} },
-  ...
+  "metadata": { "generated_at": "1789766772Z", "version": "0.1.0", "duration_secs": 120.4 },
+  "summary": {
+    "total_events": 1543,
+    "max_rollover": 6,
+    "estimated_polling_rate_hz": 1000.0,
+    "issues_detected": 1
+  },
+  "tests": {
+    "polling": [ { "label": "Est. Poll Rate", "value": "1000 Hz ...", "status": "ok" } ],
+    "rollover": [ ... ],
+    "diagnostics": [
+      { "label": "Switch bounce", "value": "3 bounce(s) on 1 key(s)", "status": "error" },
+      { "label": "", "value": "  E (3 bounces)", "status": "info" }
+    ]
+  }
 }
 ```
 

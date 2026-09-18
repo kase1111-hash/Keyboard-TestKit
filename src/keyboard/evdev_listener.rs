@@ -11,7 +11,7 @@ use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Error type for evdev operations
 #[derive(Debug)]
@@ -64,6 +64,145 @@ struct InputEvent {
 
 const EV_KEY: u16 = 0x01;
 const INPUT_EVENT_SIZE: usize = std::mem::size_of::<InputEvent>();
+
+// ioctl(EVIOCSCLOCKID) request number, built the same way the kernel's
+// _IOW('E', 0xa0, int) macro does so it is correct on every architecture.
+#[cfg(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+))]
+const IOC_SIZEBITS: u64 = 13;
+#[cfg(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+))]
+const IOC_WRITE: u64 = 4;
+#[cfg(not(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const IOC_SIZEBITS: u64 = 14;
+#[cfg(not(any(
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const IOC_WRITE: u64 = 1;
+const IOC_NRBITS: u64 = 8;
+const IOC_TYPEBITS: u64 = 8;
+
+/// `EVIOCSCLOCKID`: ask the kernel to timestamp events with a given clock.
+const fn eviocsclockid() -> u64 {
+    (IOC_WRITE << (IOC_NRBITS + IOC_TYPEBITS + IOC_SIZEBITS))
+        | ((std::mem::size_of::<libc::c_int>() as u64) << (IOC_NRBITS + IOC_TYPEBITS))
+        | ((b'E' as u64) << IOC_NRBITS)
+        | 0xa0
+}
+
+/// Which clock a device's event timestamps are expressed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventClock {
+    /// `CLOCK_MONOTONIC` (set via `EVIOCSCLOCKID`) — same clock as `Instant`.
+    Monotonic,
+    /// `CLOCK_REALTIME` (kernel default) — mapped through `SystemTime`.
+    Realtime,
+}
+
+/// Maps kernel event timestamps onto the process' `Instant` timeline.
+///
+/// `Instant` cannot be constructed from a raw clock value, so we capture a
+/// (`Instant`, clock) pair once at startup and offset from it.
+#[derive(Debug, Clone, Copy)]
+struct ClockMapper {
+    base_instant: Instant,
+    /// Base value of CLOCK_MONOTONIC in microseconds
+    base_monotonic_us: i128,
+    /// Base value of CLOCK_REALTIME in microseconds
+    base_realtime_us: i128,
+}
+
+impl ClockMapper {
+    fn new() -> Self {
+        let base_instant = Instant::now();
+        let base_monotonic_us = monotonic_now_us();
+        let base_realtime_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as i128)
+            .unwrap_or(0);
+        Self {
+            base_instant,
+            base_monotonic_us,
+            base_realtime_us,
+        }
+    }
+
+    /// Convert a kernel `(tv_sec, tv_usec)` timestamp to an `Instant`.
+    ///
+    /// Timestamps that fall before the mapper was created or noticeably in the
+    /// future (clock jumps, suspend/resume) are clamped to `now` so callers
+    /// never observe time running backwards by more than the clamp.
+    fn to_instant(self, clock: EventClock, tv_sec: i64, tv_usec: i64, now: Instant) -> Instant {
+        let event_us = tv_sec as i128 * 1_000_000 + tv_usec as i128;
+        let base_us = match clock {
+            EventClock::Monotonic => self.base_monotonic_us,
+            EventClock::Realtime => self.base_realtime_us,
+        };
+        let offset_us = event_us - base_us;
+        if offset_us < 0 {
+            return self.base_instant;
+        }
+        let candidate = self.base_instant + Duration::from_micros(offset_us as u64);
+        if candidate > now + Duration::from_secs(1) {
+            now
+        } else {
+            candidate
+        }
+    }
+}
+
+/// Current CLOCK_MONOTONIC value in microseconds.
+fn monotonic_now_us() -> i128 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only writes to the provided, valid timespec.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    ts.tv_sec as i128 * 1_000_000 + (ts.tv_nsec / 1000) as i128
+}
+
+/// Ask the kernel to timestamp this device's events with CLOCK_MONOTONIC.
+fn set_monotonic_clock(file: &File) -> bool {
+    let clock: libc::c_int = libc::CLOCK_MONOTONIC;
+    // SAFETY: EVIOCSCLOCKID reads a single c_int from the pointer we pass;
+    // the fd is a valid, open evdev device.
+    let rc = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            eviocsclockid() as _,
+            &clock as *const libc::c_int,
+        )
+    };
+    rc == 0
+}
 
 /// Find all keyboard input devices
 fn find_keyboard_devices() -> Result<Vec<PathBuf>, EvdevError> {
@@ -137,9 +276,13 @@ fn is_keyboard_device(device_path: &std::path::Path) -> bool {
 /// Evdev-based keyboard listener for raw scancode detection
 pub struct EvdevListener {
     devices: Vec<File>,
+    /// Clock each device's timestamps are expressed in (parallel to `devices`)
+    device_clocks: Vec<EventClock>,
     device_paths: Vec<PathBuf>,
     pressed_keys: HashSet<u16>,
-    last_poll: Instant,
+    /// Timestamp of the last emitted event (for `delta_us`)
+    last_event: Option<Instant>,
+    clock: ClockMapper,
     event_tx: mpsc::Sender<KeyEvent>,
     buffer: Vec<u8>,
     enabled: bool,
@@ -150,6 +293,7 @@ impl EvdevListener {
     pub fn new(event_tx: mpsc::Sender<KeyEvent>) -> Result<Self, EvdevError> {
         let device_paths = find_keyboard_devices()?;
         let mut devices = Vec::new();
+        let mut device_clocks = Vec::new();
 
         for path in &device_paths {
             match File::open(path) {
@@ -164,7 +308,14 @@ impl EvdevListener {
                         let flags = libc::fcntl(fd, libc::F_GETFL);
                         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
                     }
+                    // Prefer monotonic timestamps (immune to NTP/clock jumps)
+                    let clock = if set_monotonic_clock(&file) {
+                        EventClock::Monotonic
+                    } else {
+                        EventClock::Realtime
+                    };
                     devices.push(file);
+                    device_clocks.push(clock);
                 }
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                     // Permission denied, skipping device
@@ -182,9 +333,11 @@ impl EvdevListener {
 
         Ok(Self {
             devices,
+            device_clocks,
             device_paths,
             pressed_keys: HashSet::new(),
-            last_poll: Instant::now(),
+            last_event: None,
+            clock: ClockMapper::new(),
             event_tx,
             buffer: vec![0u8; INPUT_EVENT_SIZE * 64], // Buffer for multiple events
             enabled: true,
@@ -221,20 +374,28 @@ impl EvdevListener {
         &self.pressed_keys
     }
 
+    /// Whether every opened device delivers monotonic (drift-free) timestamps.
+    pub fn uses_monotonic_timestamps(&self) -> bool {
+        self.device_clocks
+            .iter()
+            .all(|c| *c == EventClock::Monotonic)
+    }
+
     /// Poll for keyboard events
     /// Returns the number of events generated
+    ///
+    /// Events are timestamped with the kernel's own event time, not the time
+    /// the poll ran, so intervals between events reflect the keyboard rather
+    /// than the UI refresh rate.
     pub fn poll(&mut self) -> usize {
         if !self.enabled {
             return 0;
         }
 
         let now = Instant::now();
-        let delta_us = now.duration_since(self.last_poll).as_micros() as u64;
-        self.last_poll = now;
+        let mut pending: Vec<(Instant, u16, bool)> = Vec::new();
 
-        let mut event_count = 0;
-
-        for device in &mut self.devices {
+        for (device, &clock) in self.devices.iter_mut().zip(self.device_clocks.iter()) {
             loop {
                 match device.read(&mut self.buffer) {
                     Ok(bytes_read) if bytes_read >= INPUT_EVENT_SIZE => {
@@ -250,48 +411,37 @@ impl EvdevListener {
                             // 3. The slice was obtained from a buffer read from the kernel evdev interface
                             // 4. All bit patterns are valid for InputEvent's primitive fields
                             let input_event: InputEvent = unsafe {
-                                std::ptr::read(event_bytes.as_ptr() as *const InputEvent)
+                                std::ptr::read_unaligned(event_bytes.as_ptr() as *const InputEvent)
                             };
 
                             // We only care about key events
-                            if input_event.event_type == EV_KEY {
-                                let scancode = input_event.code;
-                                let pressed = input_event.value != 0; // 1 = press, 2 = repeat, 0 = release
-
-                                // Skip key repeats (value == 2)
-                                if input_event.value == 2 {
-                                    continue;
-                                }
-
-                                // Track key state
-                                if pressed {
-                                    if !self.pressed_keys.insert(scancode) {
-                                        // Key was already pressed, skip
-                                        continue;
-                                    }
-                                } else if !self.pressed_keys.remove(&scancode) {
-                                    // Key wasn't pressed, skip
-                                    continue;
-                                }
-
-                                // Create and send the event
-                                let event = KeyEvent::new(
-                                    KeyCode::new(scancode),
-                                    if pressed {
-                                        KeyEventType::Press
-                                    } else {
-                                        KeyEventType::Release
-                                    },
-                                    now,
-                                    delta_us,
-                                );
-                                if self.event_tx.send(event).is_err() {
-                                    eprintln!("[WARN]  Event channel disconnected, disabling evdev listener");
-                                    self.enabled = false;
-                                    return event_count;
-                                }
-                                event_count += 1;
+                            if input_event.event_type != EV_KEY {
+                                continue;
                             }
+                            // Skip key repeats (value == 2)
+                            if input_event.value == 2 {
+                                continue;
+                            }
+
+                            let scancode = input_event.code;
+                            let pressed = input_event.value != 0; // 1 = press, 0 = release
+
+                            // Track key state; drop duplicate presses/releases
+                            if pressed {
+                                if !self.pressed_keys.insert(scancode) {
+                                    continue;
+                                }
+                            } else if !self.pressed_keys.remove(&scancode) {
+                                continue;
+                            }
+
+                            let timestamp = self.clock.to_instant(
+                                clock,
+                                input_event.tv_sec,
+                                input_event.tv_usec,
+                                now,
+                            );
+                            pending.push((timestamp, scancode, pressed));
                         }
                     }
                     Ok(_) => break, // Not enough bytes for a complete event
@@ -303,13 +453,42 @@ impl EvdevListener {
             }
         }
 
+        // Events from several devices may interleave; deliver them in time order.
+        pending.sort_by_key(|(ts, _, _)| *ts);
+
+        let mut event_count = 0;
+        for (timestamp, scancode, pressed) in pending {
+            let delta_us = self
+                .last_event
+                .map(|last| timestamp.saturating_duration_since(last).as_micros() as u64)
+                .unwrap_or(0);
+            self.last_event = Some(timestamp);
+
+            let event = KeyEvent::new(
+                KeyCode::new(scancode),
+                if pressed {
+                    KeyEventType::Press
+                } else {
+                    KeyEventType::Release
+                },
+                timestamp,
+                delta_us,
+            );
+            if self.event_tx.send(event).is_err() {
+                eprintln!("[WARN]  Event channel disconnected, disabling evdev listener");
+                self.enabled = false;
+                return event_count;
+            }
+            event_count += 1;
+        }
+
         event_count
     }
 
     /// Reset the listener state
     pub fn reset(&mut self) {
         self.pressed_keys.clear();
-        self.last_poll = Instant::now();
+        self.last_event = None;
     }
 }
 
@@ -349,5 +528,78 @@ mod tests {
     fn test_evdev_status() {
         let status = evdev_status();
         assert!(!status.is_empty());
+    }
+
+    #[test]
+    fn eviocsclockid_matches_kernel_value_on_common_arches() {
+        // _IOW('E', 0xa0, int) == 0x400445a0 on x86/arm/riscv
+        #[cfg(not(any(
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        )))]
+        assert_eq!(eviocsclockid(), 0x4004_45a0);
+    }
+
+    #[test]
+    fn clock_mapper_monotonic_roundtrip() {
+        let mapper = ClockMapper::new();
+        let now = Instant::now();
+        // An event 5ms after the base maps 5ms after base_instant
+        let ev_us = mapper.base_monotonic_us + 5_000;
+        let ts = mapper.to_instant(
+            EventClock::Monotonic,
+            (ev_us / 1_000_000) as i64,
+            (ev_us % 1_000_000) as i64,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            ts.duration_since(mapper.base_instant),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn clock_mapper_realtime_roundtrip() {
+        let mapper = ClockMapper::new();
+        let ev_us = mapper.base_realtime_us + 12_345;
+        let ts = mapper.to_instant(
+            EventClock::Realtime,
+            (ev_us / 1_000_000) as i64,
+            (ev_us % 1_000_000) as i64,
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert_eq!(
+            ts.duration_since(mapper.base_instant),
+            Duration::from_micros(12_345)
+        );
+    }
+
+    #[test]
+    fn clock_mapper_clamps_past_and_future() {
+        let mapper = ClockMapper::new();
+        let now = Instant::now();
+        // Before the base: clamped to base_instant
+        let past = mapper.to_instant(EventClock::Monotonic, 0, 0, now);
+        assert_eq!(past, mapper.base_instant);
+        // Far future (clock jump): clamped to now
+        let ev_us = mapper.base_monotonic_us + 3_600_000_000;
+        let future = mapper.to_instant(
+            EventClock::Monotonic,
+            (ev_us / 1_000_000) as i64,
+            (ev_us % 1_000_000) as i64,
+            now,
+        );
+        assert_eq!(future, now);
+    }
+
+    #[test]
+    fn input_event_layout_matches_kernel_struct() {
+        // struct input_event on 64-bit: timeval (16) + type (2) + code (2) + value (4)
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(INPUT_EVENT_SIZE, 24);
     }
 }

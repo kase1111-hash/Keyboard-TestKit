@@ -174,7 +174,10 @@ pub struct StickinessConfig {
 impl Default for StickinessConfig {
     fn default() -> Self {
         Self {
-            stuck_threshold_ms: 50,
+            // A normal key press lasts 50-150 ms and modifiers are routinely
+            // held for a second or more, so anything below ~2 s flags normal
+            // typing as "stuck".
+            stuck_threshold_ms: 2000,
         }
     }
 }
@@ -381,7 +384,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.polling.test_duration_secs, 10);
         assert_eq!(config.polling.sample_window_ms, 100);
-        assert_eq!(config.stickiness.stuck_threshold_ms, 50);
+        assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
         assert_eq!(config.hold_release.bounce_window_ms, 5);
         assert_eq!(config.hold_release.min_hold_ms, 10);
         assert_eq!(config.ui.refresh_rate_hz, 60);

@@ -307,6 +307,16 @@ impl ShortcutTest {
         }
     }
 
+    /// Total shortcut combinations detected
+    pub fn total_shortcuts(&self) -> u32 {
+        self.total_shortcuts
+    }
+
+    /// Shortcuts detected that match a known system hotkey
+    pub fn conflict_count(&self) -> u32 {
+        self.conflict_count
+    }
+
     /// Get recent shortcuts (last N)
     pub fn recent_shortcuts(&self, count: usize) -> Vec<&ShortcutEvent> {
         self.shortcut_history.iter().rev().take(count).collect()

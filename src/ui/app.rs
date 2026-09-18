@@ -6,13 +6,20 @@ use crate::keyboard::remap::FnKeyMode;
 use crate::keyboard::{KeyEvent, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
-    EventTimingTest, HoldReleaseTest, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest,
-    ShortcutTest, StickinessTest, TestResult, VirtualKeyboardTest,
+    expected_keys_for_layout, AnalysisContext, AutoTest, EventTimingTest, Finding, HoldReleaseTest,
+    InputSource, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest, ShortcutTest, StepKind,
+    StickinessTest, TestResult, VirtualKeyboardTest,
 };
 use crate::ui::theme::ThemeColors;
 use crate::ui::widgets::SettingsItem;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How often the live diagnostic findings are recomputed.
+const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Stuck-key threshold applied while the auto test asks the user to hold a key.
+const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
 
 /// Current view/tab in the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +33,7 @@ pub enum AppView {
     Shortcuts,
     Virtual,
     OemKeys,
+    AutoTest,
     Help,
     Settings,
 }
@@ -42,6 +50,7 @@ impl AppView {
             Self::Shortcuts => "Shortcuts",
             Self::Virtual => "Virtual",
             Self::OemKeys => "OEM/FN",
+            Self::AutoTest => "Auto",
             Self::Help => "Help",
             Self::Settings => "Settings",
         }
@@ -59,6 +68,7 @@ impl AppView {
             Self::Shortcuts,
             Self::Virtual,
             Self::OemKeys,
+            Self::AutoTest,
             Self::Help,
         ]
     }
@@ -78,8 +88,9 @@ impl AppView {
             Self::Shortcuts => 6,
             Self::Virtual => 7,
             Self::OemKeys => 8,
-            Self::Help => 9,
-            Self::Settings => 10,
+            Self::AutoTest => 9,
+            Self::Help => 10,
+            Self::Settings => 11,
         }
     }
 
@@ -94,6 +105,7 @@ impl AppView {
             6 => Self::Shortcuts,
             7 => Self::Virtual,
             8 => Self::OemKeys,
+            9 => Self::AutoTest,
             _ => Self::Help,
         }
     }
@@ -155,6 +167,16 @@ pub struct App {
     pub last_shortcut_time: Option<Instant>,
     /// Detected keyboard layout
     pub keyboard_layout: KeyboardLayout,
+    /// Guided automatic diagnostic
+    pub auto_test: AutoTest,
+    /// Where key events come from (affects what the diagnostics can judge)
+    pub input_source: InputSource,
+    /// Latest diagnostic findings, most severe first
+    pub findings: Vec<Finding>,
+    /// When the findings were last recomputed
+    findings_updated: Option<Instant>,
+    /// Auto-test step observed on the previous tick (for step transitions)
+    last_auto_step: Option<StepKind>,
 }
 
 impl App {
@@ -180,6 +202,10 @@ impl App {
 
         let theme_colors = ThemeColors::from_theme(config.ui.theme);
         let keyboard_layout = KeyboardLayout::detect();
+
+        let input_source = InputSource::TerminalPressOnly;
+        let mut auto_test = AutoTest::new(input_source);
+        auto_test.set_expected_keys(expected_keys_for_layout(keyboard_layout));
 
         Self {
             view: AppView::Dashboard,
@@ -208,7 +234,18 @@ impl App {
             last_shortcut_desc: None,
             last_shortcut_time: None,
             keyboard_layout,
+            auto_test,
+            input_source,
+            findings: Vec::new(),
+            findings_updated: None,
+            last_auto_step: None,
         }
+    }
+
+    /// Tell the app where key events come from. Call once at startup.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.input_source = source;
+        self.auto_test.set_input_source(source);
     }
 
     /// Returns mutable references to all 8 test modules for batch operations.
@@ -267,6 +304,7 @@ impl App {
         for test in self.all_tests_mut() {
             test.process_event(event);
         }
+        self.auto_test.process_event(event);
 
         // Update shortcut overlay if a new shortcut was just detected
         if let Some(last) = self.shortcut_test.recent_shortcuts(1).first() {
@@ -277,11 +315,144 @@ impl App {
             }
         }
 
-        // Check for stuck keys periodically
+        self.check_stuck_keys();
+    }
+
+    /// Flag keys held past the stickiness threshold in the status bar.
+    fn check_stuck_keys(&mut self) {
+        // Synthesized releases make "stuck" meaningless in press-only mode.
+        if !self.input_source.has_release_events() {
+            return;
+        }
         let stuck = self.stickiness_test.check_stuck_keys();
         if !stuck.is_empty() {
             self.set_status(format!("Warning: {} potentially stuck key(s)", stuck.len()));
         }
+    }
+
+    /// Per-frame housekeeping: advance the auto test, re-check stuck keys and
+    /// refresh the live findings. Call once per main-loop iteration.
+    pub fn tick(&mut self) {
+        if self.state == AppState::Running {
+            self.check_stuck_keys();
+        }
+
+        let finished = self.auto_test.tick();
+        self.apply_auto_step_transition();
+
+        let stale = self
+            .findings_updated
+            .is_none_or(|t| t.elapsed() >= FINDINGS_REFRESH_INTERVAL);
+        if finished || stale {
+            self.refresh_findings();
+        }
+        if finished {
+            let issues = self.findings.iter().filter(|f| f.is_issue()).count();
+            self.view = AppView::AutoTest;
+            self.set_status(if issues == 0 {
+                "Auto test complete: no issues detected".to_string()
+            } else {
+                format!("Auto test complete: {} issue(s) found", issues)
+            });
+        }
+    }
+
+    /// Relax the stuck-key threshold while the user is asked to hold a key,
+    /// and restore it afterwards.
+    fn apply_auto_step_transition(&mut self) {
+        let step = self.auto_test.current_step();
+        if step == self.last_auto_step {
+            return;
+        }
+        match (self.last_auto_step, step) {
+            (_, Some(StepKind::Hold)) => {
+                self.stickiness_test.set_threshold(
+                    self.config
+                        .stickiness
+                        .stuck_threshold_ms
+                        .max(HOLD_STEP_STUCK_THRESHOLD_MS),
+                );
+            }
+            (Some(StepKind::Hold), _) => {
+                self.stickiness_test
+                    .set_threshold(self.config.stickiness.stuck_threshold_ms);
+            }
+            _ => {}
+        }
+        self.last_auto_step = step;
+    }
+
+    /// Recompute the diagnostic findings now.
+    pub fn refresh_findings(&mut self) {
+        self.findings = self.auto_test.analyze(&self.analysis_context());
+        self.findings_updated = Some(Instant::now());
+    }
+
+    fn analysis_context(&self) -> AnalysisContext<'_> {
+        AnalysisContext {
+            polling: &self.polling_test,
+            hold_release: &self.hold_release_test,
+            stickiness: &self.stickiness_test,
+            rollover: &self.rollover_test,
+            event_timing: &self.event_timing_test,
+            shortcuts: &self.shortcut_test,
+            virtual_detect: &self.virtual_test,
+            oem_keys: &self.oem_test,
+            keyboard_state: &self.keyboard_state,
+        }
+    }
+
+    /// Number of findings that count as issues (warning or critical).
+    pub fn issue_count(&self) -> usize {
+        self.findings.iter().filter(|f| f.is_issue()).count()
+    }
+
+    /// Start the automatic diagnostic and switch to its view.
+    pub fn start_auto_test(&mut self) {
+        // Give the run a clean slate so old data does not pollute the findings
+        self.keyboard_state.reset();
+        for test in self.all_tests_mut() {
+            test.reset();
+        }
+        self.total_events = 0;
+        self.stickiness_test
+            .set_threshold(self.config.stickiness.stuck_threshold_ms);
+        self.last_auto_step = None;
+        self.auto_test.start();
+        self.state = AppState::Running;
+        self.view = AppView::AutoTest;
+        self.refresh_findings();
+        self.set_status("Auto test started - follow the instructions".to_string());
+    }
+
+    /// Stop a running automatic diagnostic, keeping what it observed.
+    pub fn abort_auto_test(&mut self) {
+        if self.auto_test.is_running() {
+            self.auto_test.abort();
+            self.apply_auto_step_transition();
+            self.refresh_findings();
+            self.set_status("Auto test aborted".to_string());
+        }
+    }
+
+    /// Skip the current auto-test step.
+    pub fn skip_auto_step(&mut self) {
+        if let Some(step) = self.auto_test.current_step() {
+            self.auto_test.skip_step();
+            self.set_status(format!("Skipped: {}", step.title()));
+            // Skipping the last step completes the run
+            if self.auto_test.is_complete() {
+                self.apply_auto_step_transition();
+                self.refresh_findings();
+                let issues = self.issue_count();
+                self.set_status(format!("Auto test complete: {} issue(s) found", issues));
+            }
+        }
+    }
+
+    /// Whether the guided auto test is currently running.
+    pub fn auto_test_running(&self) -> bool {
+        self.auto_test.is_running()
     }
 
     /// Switch to the next view
@@ -308,7 +479,7 @@ impl App {
     pub fn toggle_shortcuts(&mut self) {
         self.shortcuts_enabled = !self.shortcuts_enabled;
         if self.shortcuts_enabled {
-            self.set_status("Menu shortcuts ON (1-8)".to_string());
+            self.set_status("Menu shortcuts ON (1-9, 0)".to_string());
         } else {
             self.set_status("Menu shortcuts OFF - number keys free".to_string());
         }
@@ -340,12 +511,24 @@ impl App {
         for test in self.all_tests_mut() {
             test.reset();
         }
+        self.auto_test.reset();
+        self.stickiness_test
+            .set_threshold(self.config.stickiness.stuck_threshold_ms);
+        self.last_auto_step = None;
         self.total_events = 0;
+        self.refresh_findings();
         self.set_status("All tests reset".to_string());
     }
 
     /// Reset current test
     pub fn reset_current(&mut self) {
+        if self.view == AppView::AutoTest {
+            self.auto_test.reset();
+            self.last_auto_step = None;
+            self.refresh_findings();
+            self.set_status("Auto test reset".to_string());
+            return;
+        }
         if let Some(idx) = Self::test_index_for_view(self.view) {
             let name = self.all_tests()[idx].name().to_string();
             self.all_tests_mut()[idx].reset();
@@ -371,6 +554,7 @@ impl App {
     pub fn current_results(&self) -> Vec<TestResult> {
         match self.view {
             AppView::Dashboard => self.dashboard_results(),
+            AppView::AutoTest => self.auto_test.results(&self.findings),
             AppView::Help | AppView::Settings => Vec::new(),
             other => {
                 if let Some(idx) = Self::test_index_for_view(other) {
@@ -408,15 +592,48 @@ impl App {
 
         if let Some(rate) = self.keyboard_state.global_polling_rate_hz() {
             results.push(TestResult::info(
-                "Est. Poll Rate",
-                format!("{:.0} Hz", rate),
+                "Event Rate",
+                format!("{:.1} events/s", rate),
             ));
+        }
+        if let Some(hz) = self.polling_test.estimated_poll_rate_hz() {
+            results.push(TestResult::info("Est. Poll Rate", format!("{:.0} Hz", hz)));
         }
 
         results.push(TestResult::info(
             "Layout",
             self.keyboard_layout.name().to_string(),
         ));
+
+        results.push(TestResult::info("Input", self.input_source.name()));
+
+        // Live diagnostics summary
+        results.push(TestResult::info("", ""));
+        results.push(TestResult::info("--- Auto Diagnostics ---", ""));
+        let issues = self.issue_count();
+        let issue_status = if issues == 0 {
+            crate::tests::ResultStatus::Ok
+        } else {
+            crate::tests::ResultStatus::Error
+        };
+        results.push(TestResult::new(
+            "Issues Found",
+            if self.auto_test.is_running() {
+                format!("{} so far (auto test running)", issues)
+            } else if self.auto_test.is_complete() {
+                format!("{} (auto test complete)", issues)
+            } else {
+                format!("{} (press A for the full auto test)", issues)
+            },
+            issue_status,
+        ));
+        for finding in self.findings.iter().filter(|f| f.is_issue()).take(4) {
+            results.push(TestResult::new(
+                format!("  {}", finding.category),
+                finding.title.clone(),
+                finding.severity.to_status(),
+            ));
+        }
 
         results
     }
@@ -435,6 +652,7 @@ impl App {
             ReportInput {
                 start_time: self.start_time,
                 total_events: self.total_events,
+                polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
                 polling: self.polling_test.get_results(),
                 hold_release: self.hold_release_test.get_results(),
                 stickiness: self.stickiness_test.get_results(),
@@ -443,6 +661,7 @@ impl App {
                 shortcuts: self.shortcut_test.get_results(),
                 virtual_detect: self.virtual_test.get_results(),
                 oem_keys: self.oem_test.get_results(),
+                diagnostics: self.findings.iter().flat_map(|f| f.to_results()).collect(),
             },
             &self.keyboard_state,
         )
@@ -590,16 +809,21 @@ impl App {
             1 => {
                 // Stuck threshold
                 if increase {
-                    self.config.stickiness.stuck_threshold_ms =
-                        self.config.stickiness.stuck_threshold_ms.saturating_add(10);
+                    self.config.stickiness.stuck_threshold_ms = self
+                        .config
+                        .stickiness
+                        .stuck_threshold_ms
+                        .saturating_add(250);
                 } else {
                     self.config.stickiness.stuck_threshold_ms = self
                         .config
                         .stickiness
                         .stuck_threshold_ms
-                        .saturating_sub(10)
-                        .max(10);
+                        .saturating_sub(250)
+                        .max(250);
                 }
+                self.stickiness_test
+                    .set_threshold(self.config.stickiness.stuck_threshold_ms);
             }
             2 => {
                 // Bounce window

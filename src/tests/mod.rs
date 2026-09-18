@@ -14,6 +14,7 @@
 //! | [`ShortcutTest`] | Validates keyboard shortcut combinations |
 //! | [`VirtualKeyboardTest`] | Compares physical vs virtual key events |
 //! | [`OemKeyTest`] | Captures OEM keys and provides FN key restoration |
+//! | [`AutoTest`] | Guided automatic diagnostic that turns all of the above into findings |
 //!
 //! ## Usage
 //!
@@ -39,18 +40,23 @@
 //! test.reset();
 //! ```
 
+mod auto_test;
 mod bounce;
 mod latency;
 mod oem_keys;
-mod polling;
+pub mod polling;
 mod rollover;
 mod shortcuts;
 mod stickiness;
-mod virtual_detect;
+pub mod virtual_detect;
 
 #[cfg(test)]
 pub mod test_helpers;
 
+pub use auto_test::{
+    expected_keys_for_layout, AnalysisContext, AutoTest, AutoTestState, Finding, InputSource,
+    Severity, StepKind, StepOutcome,
+};
 pub use bounce::HoldReleaseTest;
 pub use latency::EventTimingTest;
 pub use oem_keys::OemKeyTest;
