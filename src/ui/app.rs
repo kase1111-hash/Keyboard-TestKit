@@ -245,6 +245,9 @@ pub struct App {
     disconnects: DisconnectLog,
     /// Latest key press the tests saw (see [`App::auto_test_just_ended`])
     last_key_press: Option<Instant>,
+    /// The keyboard has been quiet since the auto test ended: the after-run
+    /// grace is over until the next run
+    after_run_quiet: bool,
     /// The config file Settings > Save writes (the default location if None)
     config_path: Option<PathBuf>,
     /// The config file exists but could not be used: saving keeps a backup
@@ -318,6 +321,7 @@ impl App {
             last_auto_step: None,
             disconnects: DisconnectLog::default(),
             last_key_press: None,
+            after_run_quiet: false,
             config_path: None,
             config_unreadable: false,
             config_notes: Vec::new(),
@@ -441,6 +445,8 @@ impl App {
 
         self.total_events += 1;
         if event.event_type == KeyEventType::Press {
+            // A press after a quiet spell is not the tail of the run
+            self.end_after_run_grace_if_quiet(event.timestamp);
             self.last_key_press = Some(
                 self.last_key_press
                     .map_or(event.timestamp, |t| t.max(event.timestamp)),
@@ -497,6 +503,7 @@ impl App {
 
         let finished = self.auto_test.tick();
         self.apply_auto_step_transition();
+        self.end_after_run_grace_if_quiet(Instant::now());
 
         let stale = self
             .findings_updated
@@ -605,6 +612,7 @@ impl App {
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
         self.last_auto_step = None;
+        self.after_run_quiet = false;
         self.auto_test.start();
         self.state = AppState::Running;
         self.view = AppView::AutoTest;
@@ -643,7 +651,8 @@ impl App {
 
     /// Whether the auto test ended so recently that plain keys are still
     /// test input: less than [`AFTER_RUN_GRACE`] has passed since the run
-    /// ended and since the latest key press after that.
+    /// ended and since the latest key press after that. Once the keyboard
+    /// has been quiet that long the grace is over until the next run.
     pub fn auto_test_just_ended(&self) -> bool {
         self.auto_test_just_ended_at(Instant::now())
     }
@@ -652,8 +661,21 @@ impl App {
         let Some(ended) = self.auto_test.finished_at() else {
             return false;
         };
+        if self.after_run_quiet {
+            return false;
+        }
         let last = self.last_key_press.map_or(ended, |t| t.max(ended));
         now.saturating_duration_since(last) < AFTER_RUN_GRACE
+    }
+
+    /// End the after-run grace for good once the keyboard has been quiet for
+    /// [`AFTER_RUN_GRACE`] since the run ended: keys typed later (in a test
+    /// view before pressing Tab, arrows in Settings) are not the tail of the
+    /// run, and must not turn the next command key into test input.
+    fn end_after_run_grace_if_quiet(&mut self, now: Instant) {
+        if self.auto_test.finished_at().is_some() && !self.auto_test_just_ended_at(now) {
+            self.after_run_quiet = true;
+        }
     }
 
     /// Switch to the next view
@@ -1712,6 +1734,39 @@ mod tests {
         let ended = app.auto_test.finished_at().unwrap();
         assert!(!app.auto_test_just_ended_at(ended + AFTER_RUN_GRACE));
         assert!(!App::default().auto_test_just_ended());
+    }
+
+    #[test]
+    fn keys_are_commands_for_good_once_the_keyboard_went_quiet_after_a_run() {
+        // The grace is for the keys still being typed as the run ends. Once
+        // the keyboard has been quiet, typing later (in a test view, then
+        // Tab; Down, Down in Settings; t, t on the Dashboard) must not make
+        // the next key within 2 s test input again, for the whole session.
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let ms = |n: u64| ended + Duration::from_millis(n);
+        // Ten seconds later the user types in the Polling view
+        for t in [10_000, 10_150, 10_300] {
+            app.process_event(&event_at(31, KeyEventType::Press, ms(t)));
+            app.process_event(&event_at(31, KeyEventType::Release, ms(t + 60)));
+        }
+        // ...and presses Tab half a second after the last key
+        assert!(!app.auto_test_just_ended_at(ms(10_800)));
+
+        // The quiet spell noticed by the main loop's tick ends it too
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        app.abort_auto_test();
+        let quiet = app.auto_test.finished_at().unwrap() + AFTER_RUN_GRACE;
+        app.end_after_run_grace_if_quiet(quiet);
+        let first_key = quiet + Duration::from_millis(10);
+        app.process_event(&event_at(31, KeyEventType::Press, first_key));
+        assert!(!app.auto_test_just_ended_at(first_key + Duration::from_millis(500)));
+
+        // A new run brings the grace back for its own end
+        app.start_auto_test();
+        app.abort_auto_test();
+        assert!(app.auto_test_just_ended());
     }
 
     #[test]
