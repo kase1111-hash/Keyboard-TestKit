@@ -132,10 +132,10 @@ true` in its config; it is off by default) still report key releases, other
 terminals only report presses: a key reported again within 200 ms is counted
 as a new press (unless it comes faster than a finger can press, which is
 autorepeat), a held key is recognised by its autorepeat (so taps resuming
-faster than ~8 per second after a short pause can be taken for it: tap counts
-are marked approximate), and releases are estimated, so hold times, stuck
-keys and rollover cannot be measured: those views show "n/a (terminal
-input)" instead of a number.
+faster than ~8 per second after a short pause can be taken for it: press
+counts and rates are marked approximate), and releases are estimated, so hold
+times, stuck keys and rollover cannot be measured: those views show "n/a
+(terminal input)" instead of a number.
 
 ### Automatic Diagnostic
 
@@ -255,7 +255,9 @@ sticking). While paused (`Space` or `Ctrl+P`) nothing new is recorded, but
 keys that were already down still register their release. Resetting (`r`,
 `R`, `Ctrl+R`) forgets keystrokes, not keys that are still down: a jammed
 key stays listed as stuck. The reset keystroke itself (Ctrl and R) is not
-counted by the tests it clears.
+counted by the tests it clears, as long as R sits where it does on a US
+keyboard (QWERTY, QWERTZ, AZERTY): evdev reports keys by position, so on
+Colemak or Dvorak the key that types R is counted like any other key.
 
 ## Diagnostic Logic
 
@@ -279,13 +281,22 @@ down for less than 20 ms just before it, or the re-press itself was: no
 finger holds a key that briefly, while a switch that chatters closes for a
 report or two. A wireless keyboard can deliver a late release together with
 the next press, so a fast double letter arrives with no gap at all, but both
-of its holds are a finger's and it is not counted. A key that bounces once
-is a warning; a key that bounces again is reported as a fault. On a wireless
-keyboard (Bluetooth, or a 2.4 GHz receiver recognized by its name or, for
-Logitech receivers, by the paired keyboard behind it) a radio stall that
-delivers a whole keystroke at once looks like a bounce, so its bounces stay
-a warning that says so: reset (`R`) and retest on the cable or next to the
-receiver.
+of its holds are a finger's and it is not counted. After a key held for half
+a second or more, and on a keyboard whose bus has no radio (a laptop's own
+keyboard on PS/2, I2C or SPI, or a PS/2 keyboard), any re-press inside the
+window counts: the contact dropped out under the finger. On USB, which may
+be a 2.4 GHz receiver, a dropout in the middle of a shorter keystroke cannot
+be told from a double letter the radio bunched, so it is not counted there.
+A key that bounces once is a warning; a key that bounces again is reported
+as a fault. On a wireless keyboard (Bluetooth, or a 2.4 GHz receiver
+recognized by its name, such as "Receiver" or "Dongle", or, for Logitech
+receivers, by the paired keyboard behind it) a radio stall that delivers a
+whole keystroke at once looks like a bounce, so its bounces stay a warning
+that says so: reset (`R`) and retest on the cable or next to the receiver; if
+the key still bounces there, or the keyboard already was on its cable, it is
+the switch. Logitech and Corsair keyboards keep "Wireless" in their USB name
+on the cable, so for them it does not count (their receivers say what they
+are); for other makers it does, since some receivers are named nothing else.
 
 Input during the idle check that looks like whole keystrokes (you pressed a
 key) is a warning worded as a condition; a key left down or firing again and

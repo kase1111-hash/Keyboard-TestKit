@@ -464,6 +464,14 @@ impl App {
         self.hold_release_test.note_wireless_keys(keys);
     }
 
+    /// Tell the tests which keys' events in the batch about to be processed
+    /// came from a keyboard whose bus carries no radio (see
+    /// `EvdevListener::take_radio_free_keys`; call before every batch): a
+    /// fast re-press there is the switch whatever the holds around it.
+    pub fn note_radio_free_keys(&mut self, keys: &[crate::keyboard::KeyCode]) {
+        self.hold_release_test.note_radio_free_keys(keys);
+    }
+
     /// Tell the app where key events come from. Call once at startup.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
@@ -969,6 +977,14 @@ impl App {
     /// Get dashboard summary results
     fn dashboard_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
+        // Without releases the terminal listener tells taps from autorepeat
+        // by their timing alone (and estimates the releases), as the Bounce
+        // and Polling views say of their counts too
+        let approximate = if self.input_source.has_release_events() {
+            ""
+        } else {
+            " (approximate: no key releases)"
+        };
 
         results.push(TestResult::info(
             "Session Time",
@@ -977,7 +993,7 @@ impl App {
 
         results.push(TestResult::info(
             "Total Events",
-            format!("{}", self.total_events),
+            format!("{}{}", self.total_events, approximate),
         ));
 
         results.push(TestResult::info(
@@ -999,7 +1015,7 @@ impl App {
         if let Some(rate) = self.keyboard_state.global_polling_rate_hz() {
             results.push(TestResult::info(
                 "Event Rate",
-                format!("{:.1} events/s", rate),
+                format!("{:.1} events/s{}", rate, approximate),
             ));
         }
         if let Some(hz) = self.polling_test.estimated_poll_rate_hz() {

@@ -61,7 +61,7 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 |---------------|---------|
 | Hold Times | Per-key hold durations (needs real key releases) |
 | Release Accuracy | Verify single key-up event on release |
-| Bounce Detection | Same key re-pressed less than 20-40 ms (configurable) after its release, or less than 40 ms after its press, with the hold before it or the re-press's own hold under 20 ms (judged when the re-press ends); evdev kernel timestamps only |
+| Bounce Detection | Same key re-pressed less than 20-40 ms (configurable) after its release, or less than 40 ms after its press, with the hold before it or the re-press's own hold under 20 ms (judged when the re-press ends), the hold before it 500 ms or more, or the keyboard on a bus with no radio (i8042, I2C, SPI, platform); evdev kernel timestamps only |
 | Press Rate | Presses per second of any keys (typing pace) |
 
 **Implementation Requirements:**
@@ -69,12 +69,19 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 - Detect key bounce from kernel timestamps; keys whose releases come from
   the driver (laptop hotkeys with a force-release quirk) are not judged
 - A fast re-press between two finger-length holds is not a bounce: a
-  wireless link can deliver a late release together with the next press
+  wireless link can deliver a late release together with the next press.
+  After a hold of 500 ms or more, or on a keyboard whose bus carries no
+  radio (a laptop's own keyboard, a PS/2 one), it is the contact dropping
+  out and is a bounce
 - A single bounce is a warning; a key that bounces again is a fault, except
   on a wireless keyboard (Bluetooth bus type from `EVIOCGID`, a receiver
   name, or a HID device paired behind a receiver), where a radio stall that
   delivers a whole keystroke at once looks the same: it stays a warning that
-  says so
+  says so. On USB "Wireless" alone in the name does not make a Logitech or
+  Corsair keyboard wireless (they keep it on their cable and name their
+  receivers), while for other makers it does (some receivers carry no other
+  hint), and the warning does not send a keyboard already on its cable to
+  the cable
 
 > **Current status:** autorepeat rate and delay are not measured (evdev and
 > the terminal listener drop autorepeat events), and there is no waveform

@@ -149,25 +149,37 @@ const fn eviocgid() -> u64 {
         | 0x02
 }
 
-/// `BUS_USB` and `BUS_BLUETOOTH` from `linux/input.h`.
+/// Bus types (`BUS_*`) from `linux/input.h`.
 const BUS_USB: u16 = 0x03;
 const BUS_BLUETOOTH: u16 = 0x05;
-
-/// Logitech's USB vendor ID.
-const VENDOR_LOGITECH: u16 = 0x046d;
+const BUS_I8042: u16 = 0x11;
+const BUS_I2C: u16 = 0x18;
+const BUS_HOST: u16 = 0x19;
+const BUS_SPI: u16 = 0x1C;
 
 /// Words in the names of 2.4 GHz receivers and of keyboards paired to them:
 /// "Logitech USB Receiver", "Microsoft Nano Transceiver", "2.4G Wireless
 /// Receiver", "2.4G Wireless Keyboard", "... Dongle".
-const RECEIVER_NAME_HINTS: [&str; 7] = [
-    "receiver",
-    "transceiver",
-    "unifying",
-    "lightspeed",
-    "wireless",
-    "2.4g",
-    "dongle",
-];
+const RECEIVER_NAME_HINTS: [&str; 5] = ["receiver", "transceiver", "unifying", "2.4g", "dongle"];
+
+/// Words that say a keyboard can go wireless, not always that it is:
+/// tri-mode keyboards keep them in their USB name on the cable ("Logitech
+/// G915 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard", "Corsair
+/// CORSAIR K63 Wireless Mechanical Gaming Keyboard"), while plenty of 2.4 GHz
+/// receivers have nothing else in theirs ("YICHIP Wireless Device"). On USB
+/// they count except for [`VENDORS_NAMING_RECEIVERS`].
+const WIRELESS_NAME_HINTS: [&str; 2] = ["wireless", "lightspeed"];
+
+/// USB vendors whose keyboards keep "Wireless" in their name on the cable
+/// and whose receivers show what they are: Logitech's are named "USB
+/// Receiver" with the paired keyboard behind them, Corsair's "USB Receiver"
+/// or "Gaming Dongle". Their keyboards are wireless on USB only behind or as
+/// such a receiver. Another maker's receiver may be named only after its
+/// keyboard, and taking it for a cable would make radio stalls switch faults,
+/// so for other makers "Wireless" in the name still counts (a keyboard of
+/// theirs on its cable then gets the wireless caveat, which says that on the
+/// cable a bounce is the switch).
+const VENDORS_NAMING_RECEIVERS: [u16; 2] = [0x046d, 0x1b1c];
 
 /// The device's bus type (`BUS_*`) and vendor ID, read with `EVIOCGID`.
 fn read_bus_and_vendor(file: &File) -> Option<(u16, u16)> {
@@ -190,23 +202,30 @@ fn is_hid_device_dir(component: &str) -> bool {
         })
 }
 
+/// Whether a keyboard's bus (`id`: bus type and vendor ID) carries no radio
+/// link: PS/2 (i8042), I2C, SPI or the platform itself, where laptops attach
+/// their own keyboard. Its reports cannot be held back and delivered late
+/// together. USB keyboards are not among them: a 2.4 GHz receiver is a USB
+/// device too.
+fn is_radio_free_bus(id: Option<(u16, u16)>) -> bool {
+    matches!(id, Some((BUS_I8042 | BUS_I2C | BUS_HOST | BUS_SPI, _)))
+}
+
 /// Whether a keyboard reaches the computer over a radio link, whose reports
 /// can be held back and delivered late and together. `id` is its bus type
 /// and vendor ID, `sysfs_path` where its event node really lives
 /// (`/sys/class/input/eventN`, resolved).
 ///
 /// Bluetooth keyboards have the Bluetooth bus type, also LE ones that
-/// bluetoothd feeds in through uhid. A 2.4 GHz receiver is a USB device: it
-/// shows in its name or its keyboard's, or (Logitech Unifying, Bolt and
-/// Lightspeed receivers) the paired keyboard is a HID device under the
-/// receiver's own. A receiver that does neither is taken for a cable.
-///
-/// Logitech keyboards keep "LIGHTSPEED Wireless" in their name on the
-/// cable ("Logitech G915 TKL LIGHTSPEED Wireless RGB Mechanical Gaming
-/// Keyboard"), while Logitech receivers are named "USB Receiver" and the
-/// keyboards paired to them sit behind them: for Logitech only those count.
+/// bluetoothd feeds in through uhid. A 2.4 GHz receiver is a USB device: its
+/// name says it is one ("Receiver", "Dongle", "2.4G", or "Wireless" from
+/// makers other than [`VENDORS_NAMING_RECEIVERS`]), or (Logitech Unifying,
+/// Bolt and Lightspeed receivers) the paired keyboard is a HID device under
+/// the receiver's own. A receiver whose name gives nothing away is taken for
+/// a cable.
 fn is_wireless_link(id: Option<(u16, u16)>, name: &str, sysfs_path: &Path) -> bool {
     let name = name.to_lowercase();
+    let named = |hints: &[&str]| hints.iter().any(|hint| name.contains(hint));
     let paired_behind_receiver = || {
         sysfs_path
             .iter()
@@ -216,9 +235,13 @@ fn is_wireless_link(id: Option<(u16, u16)>, name: &str, sysfs_path: &Path) -> bo
     };
     match id {
         Some((BUS_BLUETOOTH, _)) => true,
-        Some((BUS_USB, _)) if paired_behind_receiver() => true,
-        Some((BUS_USB, VENDOR_LOGITECH)) => name.contains("receiver"),
-        _ => RECEIVER_NAME_HINTS.iter().any(|hint| name.contains(hint)),
+        _ if is_radio_free_bus(id) => false,
+        _ if named(&RECEIVER_NAME_HINTS) => true,
+        Some((BUS_USB, vendor)) if VENDORS_NAMING_RECEIVERS.contains(&vendor) => {
+            paired_behind_receiver()
+        }
+        Some((BUS_USB, _)) => paired_behind_receiver() || named(&WIRELESS_NAME_HINTS),
+        _ => named(&WIRELESS_NAME_HINTS),
     }
 }
 
@@ -553,6 +576,8 @@ struct OpenDevice {
     typed: bool,
     /// The device is a wireless keyboard (see [`is_wireless_link`])
     wireless: bool,
+    /// The device's bus carries no radio (see [`is_radio_free_bus`])
+    radio_free: bool,
 }
 
 /// Open an evdev device for non-blocking reads with monotonic timestamps.
@@ -587,7 +612,8 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
     let name = device_name(path);
     let node = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let sysfs_path = fs::canonicalize(format!("/sys/class/input/{}", node)).unwrap_or_default();
-    let wireless = is_wireless_link(read_bus_and_vendor(&file), &name, &sysfs_path);
+    let id = read_bus_and_vendor(&file);
+    let wireless = is_wireless_link(id, &name, &sysfs_path);
     Ok(OpenDevice {
         file,
         path: path.to_path_buf(),
@@ -598,6 +624,7 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
         opened_at,
         typed: false,
         wireless,
+        radio_free: is_radio_free_bus(id),
     })
 }
 
@@ -721,6 +748,9 @@ pub struct EvdevListener {
     /// Keys whose events came from a wireless keyboard since the last
     /// `take_wireless_keys`
     wireless_keys: Vec<KeyCode>,
+    /// Keys whose events came from a keyboard whose bus carries no radio
+    /// since the last `take_radio_free_keys`
+    radio_free_keys: Vec<KeyCode>,
 }
 
 impl EvdevListener {
@@ -760,6 +790,7 @@ impl EvdevListener {
             queued: Vec::new(),
             typed_names: HashSet::new(),
             wireless_keys: Vec::new(),
+            radio_free_keys: Vec::new(),
         };
         for device in devices {
             listener.add_device(device);
@@ -832,7 +863,18 @@ impl EvdevListener {
     /// (Bluetooth or a 2.4 GHz receiver), each once. The radio can deliver
     /// their reports late and together, which timing checks need to know.
     pub fn take_wireless_keys(&mut self) -> Vec<KeyCode> {
-        let mut keys = std::mem::take(&mut self.wireless_keys);
+        Self::take_keys(&mut self.wireless_keys)
+    }
+
+    /// Keys whose events since the last call came from a keyboard whose bus
+    /// carries no radio (a laptop's own keyboard, a PS/2 one), each once: no
+    /// report of theirs can arrive late, which timing checks need to know.
+    pub fn take_radio_free_keys(&mut self) -> Vec<KeyCode> {
+        Self::take_keys(&mut self.radio_free_keys)
+    }
+
+    fn take_keys(keys: &mut Vec<KeyCode>) -> Vec<KeyCode> {
+        let mut keys = std::mem::take(keys);
         keys.sort_unstable_by_key(|k| k.0);
         keys.dedup();
         keys
@@ -872,8 +914,15 @@ impl EvdevListener {
                 device.typed = true;
                 self.typed_names.insert(device.name.clone());
             }
-            if device.wireless {
-                self.wireless_keys.extend(
+            let link_keys = if device.wireless {
+                Some(&mut self.wireless_keys)
+            } else if device.radio_free {
+                Some(&mut self.radio_free_keys)
+            } else {
+                None
+            };
+            if let Some(keys) = link_keys {
+                keys.extend(
                     pending[before..]
                         .iter()
                         .map(|(_, code, _)| KeyCode::new(*code)),
@@ -1118,6 +1167,9 @@ mod tests {
         assert_eq!(eviocgid(), 0x8008_4502);
     }
 
+    /// Logitech's USB vendor ID.
+    const VENDOR_LOGITECH: u16 = 0x046d;
+
     #[test]
     fn wireless_keyboards_are_told_from_wired_ones() {
         let wireless = |id, name, sysfs: &str| is_wireless_link(id, name, Path::new(sysfs));
@@ -1175,6 +1227,51 @@ mod tests {
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4:1.2/0003:046D:C545.0007/\
              0003:046D:408E.0008/input/input12/event7"
         ));
+        // Corsair keyboards keep "Wireless" in their name on the cable too;
+        // their receivers say what they are
+        assert!(!wireless(
+            Some((BUS_USB, 0x1b1c)),
+            "Corsair CORSAIR K63 Wireless Mechanical Gaming Keyboard",
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/\
+             0003:1B1C:1B45.0009/input/input14/event9"
+        ));
+        for name in [
+            "Corsair CORSAIR SLIPSTREAM WIRELESS USB Receiver",
+            "Corsair CORSAIR K57 RGB WIRELESS Gaming Dongle",
+        ] {
+            assert!(
+                wireless(
+                    Some((BUS_USB, 0x1b1c)),
+                    name,
+                    "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/\
+                     0003:1B1C:1BA6.000A/input/input15/event10"
+                ),
+                "{}",
+                name
+            );
+        }
+        // Other makers' receivers may carry nothing but "Wireless": taking
+        // one for a cable would turn its radio stalls into switch faults, so
+        // the word still counts for them (also for a keyboard of theirs on
+        // its cable, whose bounces then come with the wireless caveat)
+        for (vendor, name) in [
+            (0x3151, "YICHIP Wireless Device"),
+            (0x1038, "SteelSeries SteelSeries Apex Pro Mini Wireless"),
+            (0x0b05, "ASUSTeK ROG STRIX SCOPE II 96 WIRELESS"),
+        ] {
+            assert!(
+                wireless(
+                    Some((BUS_USB, vendor)),
+                    name,
+                    "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-6/1-6:1.0/\
+                     0003:3151:3020.000B/input/input16/event11"
+                ),
+                "{}",
+                name
+            );
+        }
+        // Off USB nothing carries the name over a cable
+        assert!(wireless(None, "Keychron K2 Wireless Keyboard", ""));
         // Cables: a USB keyboard and a laptop's own
         assert!(!wireless(
             Some((BUS_USB, 0x04d9)),
@@ -1183,15 +1280,35 @@ mod tests {
              input/input5/event3"
         ));
         assert!(!wireless(
-            Some((0x11, 0x0001)),
+            Some((BUS_I8042, 0x0001)),
             "AT Translated Set 2 keyboard",
             "/sys/devices/platform/i8042/serio0/input/input3/event2"
+        ));
+        // A laptop keyboard on I2C whose name happens to hold a hint: no radio
+        assert!(!wireless(
+            Some((BUS_I2C, 0x06cb)),
+            "Wireless Hotkeys Keyboard",
+            "/sys/devices/pci0000:00/0000:00:15.1/i2c_designware.1/i2c-2/\
+             i2c-SYNA0001:00/0018:06CB:CE44.0002/input/input18/event16"
         ));
         // Nothing known about the device: not called wireless
         assert!(!wireless(None, "/dev/input/event9", ""));
         assert!(is_hid_device_dir("0003:046D:C52B.0003"));
         assert!(!is_hid_device_dir("1-2:1.2"));
         assert!(!is_hid_device_dir("0003:046D:C52B:0003"));
+    }
+
+    #[test]
+    fn keyboards_on_a_bus_without_radio_are_known() {
+        for bus in [BUS_I8042, BUS_I2C, BUS_SPI, BUS_HOST] {
+            assert!(is_radio_free_bus(Some((bus, 0x0001))), "{:#x}", bus);
+        }
+        // USB may be a receiver, Bluetooth is a radio, a uinput device
+        // (BUS_VIRTUAL) relays anything, and an unknown bus is not assumed
+        for bus in [BUS_USB, BUS_BLUETOOTH, 0x06] {
+            assert!(!is_radio_free_bus(Some((bus, 0x0001))), "{:#x}", bus);
+        }
+        assert!(!is_radio_free_bus(None));
     }
 
     #[test]
@@ -1211,16 +1328,29 @@ mod tests {
         bluetooth.wireless = true;
         let _ = fs::remove_file(&file);
         let cable = fake_device("/dev/input/event-usb").unwrap();
+        let laptop_file =
+            std::env::temp_dir().join(format!("kt-evdev-i8042-{}", std::process::id()));
+        fs::write(
+            &laptop_file,
+            event_bytes(&[key(18, 1, 2_000), syn(SYN_REPORT, 2_000)]),
+        )
+        .unwrap();
+        let mut laptop = fake_device("/dev/input/event-i8042").unwrap();
+        laptop.file = File::open(&laptop_file).unwrap();
+        laptop.radio_free = true;
+        let _ = fs::remove_file(&laptop_file);
         let (tx, _rx) = mpsc::channel();
-        let mut listener = EvdevListener::with_devices(tx, vec![cable, bluetooth]);
-        assert_eq!(listener.poll(), 3);
+        let mut listener = EvdevListener::with_devices(tx, vec![cable, bluetooth, laptop]);
+        assert_eq!(listener.poll(), 4);
         assert_eq!(
             listener.take_wireless_keys(),
             vec![KeyCode::new(30), KeyCode::new(48)]
         );
+        assert_eq!(listener.take_radio_free_keys(), vec![KeyCode::new(18)]);
         // Handed out once
         listener.poll();
         assert!(listener.take_wireless_keys().is_empty());
+        assert!(listener.take_radio_free_keys().is_empty());
     }
 
     fn ev(event_type: u16, code: u16, value: i32, usec: i64) -> InputEvent {
@@ -1501,6 +1631,7 @@ mod tests {
             opened_at: Instant::now(),
             typed: false,
             wireless: false,
+            radio_free: false,
         })
     }
 
