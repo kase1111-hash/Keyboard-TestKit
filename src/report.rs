@@ -24,7 +24,6 @@
 //! // report.export_text(Path::new("report.txt"))?;
 //! ```
 
-use crate::keyboard::KeyboardState;
 use crate::tests::{ResultStatus, TestResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
@@ -115,9 +114,10 @@ impl From<&TestResult> for ResultEntry {
 pub struct ReportInput {
     pub start_time: Instant,
     pub total_events: u64,
-    /// Whether key releases are real, so the peak rollover is a measurement
-    /// (false for press-only terminal input, where releases are guessed)
-    pub rollover_measured: bool,
+    /// Peak keys held at once, modifiers not counted (as the rollover
+    /// rating counts them); `None` when releases are guessed (press-only
+    /// terminal input) and the peak is not a measurement
+    pub max_rollover: Option<usize>,
     /// Polling rate inferred from timestamp quantization, if available
     pub polling_rate_hz: Option<f64>,
     pub polling: Vec<TestResult>,
@@ -134,7 +134,7 @@ pub struct ReportInput {
 
 impl SessionReport {
     /// Create a new session report from all 8 test results
-    pub fn new(input: ReportInput, keyboard_state: &KeyboardState) -> Self {
+    pub fn new(input: ReportInput) -> Self {
         let duration_secs = input.start_time.elapsed().as_secs_f64();
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -176,9 +176,7 @@ impl SessionReport {
             },
             summary: SessionSummary {
                 total_events: input.total_events,
-                max_rollover: input
-                    .rollover_measured
-                    .then(|| keyboard_state.max_rollover()),
+                max_rollover: input.max_rollover,
                 estimated_polling_rate_hz: input.polling_rate_hz,
                 issues_detected: issues,
             },

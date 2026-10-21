@@ -239,6 +239,11 @@ impl KeyStateBits {
         let code = code as usize;
         code < KEY_CNT && (self.0[code / ULONG_BITS] >> (code % ULONG_BITS)) & 1 == 1
     }
+
+    /// Every key that is down, lowest code first.
+    fn down_keys(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..KEY_CNT as u16).filter(|code| self.is_down(*code))
+    }
 }
 
 /// Ask the kernel which keys are down on this device right now.
@@ -292,12 +297,18 @@ impl DeviceDecoder {
                 _ => RawOutcome::Nothing,
             };
         }
-        // Skip key repeats (value == 2) and anything that is not a key
-        if self.dropping || ev.event_type != EV_KEY || ev.value == 2 {
+        if self.dropping || ev.event_type != EV_KEY {
             return RawOutcome::Nothing;
         }
         let code = ev.code;
-        let pressed = ev.value != 0; // 1 = press, 0 = release
+        // Skip key repeats (value == 2) of keys already down. A repeat of a
+        // key this device never reported down means it went down before the
+        // device was opened (a jammed key, a key held through a replug) and
+        // the key state could not be read: it is down now.
+        if ev.value == 2 && self.pressed.contains(&code) {
+            return RawOutcome::Nothing;
+        }
+        let pressed = ev.value != 0; // 1 = press, 2 = repeat, 0 = release
 
         // Drop duplicate presses/releases
         let changed = if pressed {
@@ -312,11 +323,13 @@ impl DeviceDecoder {
         }
     }
 
-    /// After lost events, forget the keys that are no longer down and return
-    /// them so their releases can be reported. Without the kernel's state
-    /// (`None`) nothing is known, so every held key is released: a key shown
-    /// up while still held is less misleading than one shown stuck.
-    fn resync(&mut self, kernel: Option<&KeyStateBits>) -> Vec<u16> {
+    /// After lost events, bring the key state in line with the kernel's and
+    /// return the changes as `(code, pressed)`: releases of keys that are no
+    /// longer down, presses of keys that went down meanwhile. Without the
+    /// kernel's state (`None`) nothing is known, so every held key is
+    /// released: a key shown up while still held is less misleading than one
+    /// shown stuck.
+    fn resync(&mut self, kernel: Option<&KeyStateBits>) -> Vec<(u16, bool)> {
         let mut released: Vec<u16> = self
             .pressed
             .iter()
@@ -327,7 +340,18 @@ impl DeviceDecoder {
         for code in &released {
             self.pressed.remove(code);
         }
+        let pressed: Vec<u16> = kernel
+            .map(|k| {
+                k.down_keys()
+                    .filter(|code| self.pressed.insert(*code))
+                    .collect()
+            })
+            .unwrap_or_default();
         released
+            .into_iter()
+            .map(|code| (code, false))
+            .chain(pressed.into_iter().map(|code| (code, true)))
+            .collect()
     }
 }
 
@@ -358,11 +382,16 @@ fn apply_raw_events(
                 }
             }
             RawOutcome::Resync => {
-                // Releases lost in the overflow happened before this report
+                // Changes lost in the overflow happened before this report
                 let ts = timestamp(ev);
-                for code in decoder.resync(key_state().as_ref()) {
-                    if held.remove(&code) {
-                        out.push((ts, code, false));
+                for (code, pressed) in decoder.resync(key_state().as_ref()) {
+                    let changed = if pressed {
+                        held.insert(code)
+                    } else {
+                        held.remove(&code)
+                    };
+                    if changed {
+                        out.push((ts, code, pressed));
                     }
                 }
             }
@@ -430,10 +459,21 @@ struct OpenDevice {
     /// Clock the device's timestamps are expressed in
     clock: EventClock,
     decoder: DeviceDecoder,
+    /// Keys the kernel reported down when the device was opened, not yet
+    /// handed to the listener
+    down_at_open: Vec<u16>,
+    /// A moment before the key state was read: when the keys in
+    /// `down_at_open` are known to have been down. Any event read from the
+    /// device happened after it, so their releases sort after their presses.
+    opened_at: Instant,
+    /// Whether the device has delivered key events (see
+    /// [`EvdevDeviceChange::Disconnected`])
+    typed: bool,
 }
 
 /// Open an evdev device for non-blocking reads with monotonic timestamps.
 fn open_device(path: &Path) -> io::Result<OpenDevice> {
+    let opened_at = Instant::now();
     let file = File::open(path)?;
     // Set non-blocking mode
     let fd = file.as_raw_fd();
@@ -450,12 +490,25 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
     } else {
         EventClock::Realtime
     };
+    // A key that is already down sends no press, only autorepeat (dropped
+    // as such) or nothing at all: read the kernel's key state so a key
+    // jammed before launch, or held through a replug, is seen as down.
+    let down_at_open: Vec<u16> = read_key_state(&file)
+        .map(|k| k.down_keys().collect())
+        .unwrap_or_default();
+    let decoder = DeviceDecoder {
+        pressed: down_at_open.iter().copied().collect(),
+        ..DeviceDecoder::default()
+    };
     Ok(OpenDevice {
         file,
         path: path.to_path_buf(),
         name: device_name(path),
         clock,
-        decoder: DeviceDecoder::default(),
+        decoder,
+        down_at_open,
+        opened_at,
+        typed: false,
     })
 }
 
@@ -464,7 +517,17 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
 pub enum EvdevDeviceChange {
     /// The device stopped delivering events (unplugged, Bluetooth link lost,
     /// access revoked). Keys it held were reported released.
-    Disconnected { path: PathBuf, name: String },
+    ///
+    /// `typed` says whether it (or an earlier node of the same name, before
+    /// a replug) delivered key events this session. Many devices that are
+    /// not the keyboard under test have keyboard nodes (a YubiKey, a gaming
+    /// or Bluetooth mouse, a barcode scanner); one of those going away says
+    /// nothing about the keyboard.
+    Disconnected {
+        path: PathBuf,
+        name: String,
+        typed: bool,
+    },
     /// A keyboard appeared (replugged, reconnected, newly attached) and is
     /// now read.
     Connected { path: PathBuf, name: String },
@@ -561,6 +624,11 @@ pub struct EvdevListener {
     last_scan: Instant,
     /// Devices lost or found since the last `take_device_changes`
     changes: Vec<EvdevDeviceChange>,
+    /// Key events not yet sent: presses of keys found down when a device
+    /// was opened
+    queued: Vec<(Instant, u16, bool)>,
+    /// Names of the devices that delivered key events this session
+    typed_names: HashSet<String>,
 }
 
 impl EvdevListener {
@@ -586,9 +654,9 @@ impl EvdevListener {
     }
 
     fn with_devices(event_tx: mpsc::Sender<KeyEvent>, devices: Vec<OpenDevice>) -> Self {
-        Self {
-            device_paths: devices.iter().map(|d| d.path.clone()).collect(),
-            devices,
+        let mut listener = Self {
+            device_paths: Vec::new(),
+            devices: Vec::new(),
             pressed_keys: HashSet::new(),
             last_event: None,
             clock: ClockMapper::new(),
@@ -597,7 +665,32 @@ impl EvdevListener {
             enabled: true,
             last_scan: Instant::now(),
             changes: Vec::new(),
+            queued: Vec::new(),
+            typed_names: HashSet::new(),
+        };
+        for device in devices {
+            listener.add_device(device);
         }
+        listener
+    }
+
+    /// Start reading `device`. Keys it already holds are reported pressed
+    /// as of when it was opened: not later, when the listener gets to it (at
+    /// startup only after every other device was opened), or a release read
+    /// meanwhile would sort before its press and leave the key down for good
+    /// (the Enter that launched the app, still held as the keyboard opens).
+    fn add_device(&mut self, mut device: OpenDevice) {
+        for code in std::mem::take(&mut device.down_at_open) {
+            device.typed = true;
+            if self.pressed_keys.insert(code) {
+                self.queued.push((device.opened_at, code, true));
+            }
+        }
+        if device.typed {
+            self.typed_names.insert(device.name.clone());
+        }
+        self.device_paths.push(device.path.clone());
+        self.devices.push(device);
     }
 
     /// Try to create an evdev listener, return None if not available
@@ -654,7 +747,7 @@ impl EvdevListener {
         }
 
         let now = Instant::now();
-        let mut pending: Vec<(Instant, u16, bool)> = Vec::new();
+        let mut pending: Vec<(Instant, u16, bool)> = std::mem::take(&mut self.queued);
         let mut gone = Vec::new();
         let mut raw = Vec::new();
         let mapper = self.clock;
@@ -663,6 +756,7 @@ impl EvdevListener {
             raw.clear();
             let read = read_raw_events(&mut device.file, &mut self.buffer, &mut raw);
             let clock = device.clock;
+            let before = pending.len();
             apply_raw_events(
                 &mut device.decoder,
                 &mut self.pressed_keys,
@@ -671,6 +765,10 @@ impl EvdevListener {
                 |ev| mapper.to_instant(clock, ev.tv_sec, ev.tv_usec, now),
                 &mut pending,
             );
+            if pending.len() > before && !device.typed {
+                device.typed = true;
+                self.typed_names.insert(device.name.clone());
+            }
             if read == DeviceRead::Gone {
                 gone.push(index);
             }
@@ -729,9 +827,11 @@ impl EvdevListener {
                 out.push((now, code, false));
             }
         }
+        let typed = device.typed || self.typed_names.contains(&device.name);
         self.changes.push(EvdevDeviceChange::Disconnected {
             path: device.path,
             name: device.name,
+            typed,
         });
     }
 
@@ -752,8 +852,7 @@ impl EvdevListener {
                     path: device.path.clone(),
                     name: device.name.clone(),
                 });
-                self.device_paths.push(device.path.clone());
-                self.devices.push(device);
+                self.add_device(device);
             }
         }
     }
@@ -979,13 +1078,66 @@ mod tests {
             key(32, 1, 60_000),
         ];
         let out = decode(&mut d, &mut held, &raw, Some(key_state(&[31])), base);
+        // S's press was part of the incomplete packet, but the kernel says
+        // S is down after it: the resync reports it, and its release later
         assert_eq!(
             out,
-            vec![(1_000, 30, true), (50_000, 30, false), (60_000, 32, true)]
+            vec![
+                (1_000, 30, true),
+                (50_000, 30, false),
+                (50_000, 31, true),
+                (60_000, 32, true)
+            ]
         );
-        assert_eq!(held, HashSet::from([32]));
-        // S's later release is not reported: its press never was
-        assert!(decode(&mut d, &mut held, &[key(31, 0, 70_000)], None, base).is_empty());
+        assert_eq!(held, HashSet::from([31, 32]));
+        assert_eq!(
+            decode(&mut d, &mut held, &[key(31, 0, 70_000)], None, base),
+            vec![(70_000, 31, false)]
+        );
+    }
+
+    #[test]
+    fn syn_dropped_reports_keys_that_went_down_in_the_lost_events() {
+        // B pressed (and held) during the overflow: without the kernel's
+        // state its press is lost and the key is invisible until released
+        let mut d = DeviceDecoder::default();
+        let mut held = HashSet::new();
+        let base = Instant::now();
+        let raw = [
+            key(30, 1, 1_000),
+            syn(SYN_DROPPED, 50_000),
+            syn(SYN_REPORT, 50_000),
+        ];
+        let out = decode(&mut d, &mut held, &raw, Some(key_state(&[30, 48])), base);
+        assert_eq!(out, vec![(1_000, 30, true), (50_000, 48, true)]);
+        assert_eq!(held, HashSet::from([30, 48]));
+        let out = decode(&mut d, &mut held, &[key(48, 0, 90_000)], None, base);
+        assert_eq!(out, vec![(90_000, 48, false)]);
+    }
+
+    #[test]
+    fn autorepeat_of_a_key_never_seen_down_is_a_press() {
+        // Backspace jammed before the device was opened (key state not
+        // readable): only its autorepeat arrives. It must show up as down
+        // (and later stuck), not stay invisible until the sweep calls it dead.
+        let mut d = DeviceDecoder::default();
+        let mut held = HashSet::new();
+        let base = Instant::now();
+        let raw = [key(14, 2, 1_000), key(14, 2, 34_000), key(14, 2, 67_000)];
+        assert_eq!(
+            decode(&mut d, &mut held, &raw, None, base),
+            vec![(1_000, 14, true)]
+        );
+        assert_eq!(
+            decode(&mut d, &mut held, &[key(14, 0, 900_000)], None, base),
+            vec![(900_000, 14, false)]
+        );
+        // Autorepeat of a key that was seen going down stays silent
+        let raw = [key(30, 1, 1_000), key(30, 2, 500_000), key(30, 0, 600_000)];
+        assert_eq!(
+            decode(&mut d, &mut held, &raw, None, base),
+            vec![(1_000, 30, true), (600_000, 30, false)]
+        );
     }
 
     #[test]
@@ -1116,7 +1268,135 @@ mod tests {
             name: format!("Test keyboard {}", path),
             clock: EventClock::Monotonic,
             decoder: DeviceDecoder::default(),
+            down_at_open: Vec::new(),
+            opened_at: Instant::now(),
+            typed: false,
         })
+    }
+
+    /// A fake device that holds `down` when it is opened.
+    fn fake_device_holding(path: &str, down: &[u16]) -> OpenDevice {
+        let mut device = fake_device(path).unwrap();
+        device.decoder.pressed = down.iter().copied().collect();
+        device.down_at_open = down.to_vec();
+        device
+    }
+
+    #[test]
+    fn keys_down_when_a_device_is_opened_are_reported_pressed() {
+        // Backspace jammed before launch, and Shift held on a keyboard that
+        // is replugged: both are down, and their releases come through
+        let (tx, rx) = mpsc::channel();
+        let mut listener = EvdevListener::with_devices(
+            tx,
+            vec![fake_device_holding("/dev/input/event-t0", &[14])],
+        );
+        listener.add_new_devices(&[PathBuf::from("/dev/input/event-t1")], |p| {
+            Ok(fake_device_holding(p.to_str().unwrap(), &[42, 14]))
+        });
+        assert_eq!(listener.poll(), 2);
+        let events: Vec<(u16, KeyEventType)> =
+            rx.try_iter().map(|e| (e.key.0, e.event_type)).collect();
+        // Backspace held on both devices is one key down
+        assert_eq!(
+            events,
+            vec![(14, KeyEventType::Press), (42, KeyEventType::Press)]
+        );
+        assert_eq!(listener.pressed_keys(), &HashSet::from([14, 42]));
+        // A device found with nothing down reports nothing
+        let (tx, rx) = mpsc::channel();
+        let mut listener =
+            EvdevListener::with_devices(tx, vec![fake_device("/dev/input/event-t2").unwrap()]);
+        assert_eq!(listener.poll(), 0);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn a_key_released_while_the_devices_open_is_not_left_down() {
+        // `sudo keyboard-testkit` + Enter: Enter is still down when the
+        // keyboard is opened, and comes up while the other devices are being
+        // opened, before the listener starts. Its release must follow its
+        // press, or the app sees Enter go down for good (a "Stuck key").
+        let mut device = fake_device_holding("/dev/input/event-t3", &[28]);
+        std::thread::sleep(Duration::from_millis(2));
+        let us = monotonic_now_us();
+        let at = |event_type, code, value| InputEvent {
+            tv_sec: (us / 1_000_000) as i64,
+            tv_usec: (us % 1_000_000) as i64,
+            event_type,
+            code,
+            value,
+        };
+        let mut bytes = Vec::new();
+        for ev in [at(EV_KEY, 28, 0), at(EV_SYN, SYN_REPORT, 0)] {
+            // SAFETY: InputEvent is #[repr(C)] plain data, read back the
+            // same way by read_raw_events
+            bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(&ev as *const InputEvent as *const u8, INPUT_EVENT_SIZE)
+            });
+        }
+        let file = std::env::temp_dir().join(format!("kt-evdev-{}", std::process::id()));
+        fs::write(&file, &bytes).unwrap();
+        device.file = File::open(&file).unwrap();
+        let _ = fs::remove_file(&file);
+        // ...more devices are opened before the listener is created
+        std::thread::sleep(Duration::from_millis(2));
+        let (tx, rx) = mpsc::channel();
+        let mut listener = EvdevListener::with_devices(tx, vec![device]);
+        assert_eq!(listener.poll(), 2);
+        let events: Vec<(u16, KeyEventType)> =
+            rx.try_iter().map(|e| (e.key.0, e.event_type)).collect();
+        assert_eq!(
+            events,
+            vec![(28, KeyEventType::Press), (28, KeyEventType::Release)]
+        );
+        assert!(listener.pressed_keys().is_empty());
+    }
+
+    #[test]
+    fn only_devices_that_typed_count_as_a_lost_keyboard() {
+        let (tx, _rx) = mpsc::channel();
+        let keyboard = fake_device("/dev/input/event-k").unwrap();
+        let yubikey = fake_device("/dev/input/event-y").unwrap();
+        let mut listener = EvdevListener::with_devices(tx, vec![keyboard, yubikey]);
+        listener.devices[0].typed = true;
+        listener
+            .typed_names
+            .insert(listener.devices[0].name.clone());
+        let now = Instant::now();
+        let mut out = Vec::new();
+        // The YubiKey (never typed on) is pulled out, then the keyboard
+        listener.drop_device(1, now, &mut out);
+        listener.drop_device(0, now, &mut out);
+        let typed: Vec<(String, bool)> = listener
+            .take_device_changes()
+            .into_iter()
+            .map(|c| match c {
+                EvdevDeviceChange::Disconnected { path, typed, .. } => {
+                    (path.display().to_string(), typed)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            typed,
+            vec![
+                ("/dev/input/event-y".to_string(), false),
+                ("/dev/input/event-k".to_string(), true)
+            ]
+        );
+
+        // The keyboard comes back as a new node and drops out again before
+        // anything is typed on it: still the keyboard
+        listener.add_new_devices(&[PathBuf::from("/dev/input/event-k")], |p| {
+            fake_device(p.to_str().unwrap())
+        });
+        listener.take_device_changes();
+        listener.drop_device(0, now, &mut out);
+        assert!(matches!(
+            listener.take_device_changes()[..],
+            [EvdevDeviceChange::Disconnected { typed: true, .. }]
+        ));
     }
 
     #[test]
@@ -1139,6 +1419,7 @@ mod tests {
             vec![EvdevDeviceChange::Disconnected {
                 path: PathBuf::from("/dev/input/event-test0"),
                 name: "Test keyboard /dev/input/event-test0".to_string(),
+                typed: false,
             }]
         );
         // Changes are handed out once

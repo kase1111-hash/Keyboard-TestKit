@@ -54,8 +54,8 @@ pub mod virtual_detect;
 pub mod test_helpers;
 
 pub use auto_test::{
-    expected_keys_for_layout, AnalysisContext, AutoTest, AutoTestState, Finding, InputSource,
-    Severity, StepKind, StepOutcome,
+    expected_keys_for_layout, issues_status, AnalysisContext, AutoTest, AutoTestState, Finding,
+    InputSource, Severity, StepKind, StepOutcome, IDLE_DURATION,
 };
 pub use bounce::HoldReleaseTest;
 // The config clamps its bounce window to the range the test accepts

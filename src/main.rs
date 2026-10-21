@@ -16,13 +16,15 @@
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // Lightweight logging macros to replace log + env_logger crates.
-// info!/warn!/error! print to stderr; debug! is no-op in release builds.
+// info!/error! print to stderr, so they are only used outside the TUI (the
+// mapper, before the alternate screen is entered); inside it messages go to
+// the status line.
 macro_rules! info    { ($($arg:tt)*) => { eprintln!("[INFO]  {}", format_args!($($arg)*)) } }
-macro_rules! warn    { ($($arg:tt)*) => { eprintln!("[WARN]  {}", format_args!($($arg)*)) } }
+#[cfg_attr(not(target_os = "linux"), allow(unused_macros))]
 macro_rules! error   { ($($arg:tt)*) => { eprintln!("[ERROR] {}", format_args!($($arg)*)) } }
-macro_rules! debug   { ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!("[DEBUG] {}", format_args!($($arg)*)); } } }
 
 use crossterm::{
+    cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode,
         KeyEvent as CtKeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -43,7 +45,7 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keyboard_testkit::{
     config::Config,
@@ -61,15 +63,23 @@ use keyboard_testkit::keyboard::{evdev_status, EvdevDeviceChange, EvdevListener}
 #[cfg(target_os = "linux")]
 use keyboard_testkit::mapper;
 
-/// Restore the terminal to its original state.
-///
-/// Called from the panic hook, signal handler cleanup, and normal exit.
+/// Restore the terminal to its original state after a panic.
 fn restore_terminal() {
-    if KEYBOARD_ENHANCED.load(Ordering::SeqCst) {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
+    let _ = leave_tui(
+        &mut std::io::stdout(),
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    );
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+/// Leave the TUI screen: pop the keyboard flags (if `enhanced`) while still
+/// on the alternate screen, whose flag stack they were pushed on, then
+/// switch back to the shell's screen and show the cursor ratatui hid.
+fn leave_tui(out: &mut impl std::io::Write, enhanced: bool) -> std::io::Result<()> {
+    if enhanced {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
+    execute!(out, LeaveAlternateScreen, DisableMouseCapture, cursor::Show)
 }
 
 /// Whether kitty keyboard-protocol enhancement flags were pushed (must be popped on exit).
@@ -77,14 +87,16 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 /// Try to enable key-release reporting (kitty keyboard protocol).
 ///
+/// Call it on the alternate screen: terminals keep separate flag stacks for
+/// the main and alternate screens, so flags pushed before entering it would
+/// not apply to the TUI (presses only, no releases) and would be left
+/// active on the shell's screen after exit.
+///
 /// Returns true when the terminal supports it and the flags were pushed.
-fn enable_keyboard_enhancement() -> bool {
+fn enable_keyboard_enhancement(out: &mut impl std::io::Write) -> bool {
     match crossterm::terminal::supports_keyboard_enhancement() {
         Ok(true) => {
-            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
-            if execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok() {
+            if push_keyboard_flags(out).is_ok() {
                 KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
                 return true;
             }
@@ -92,6 +104,14 @@ fn enable_keyboard_enhancement() -> bool {
         }
         _ => false,
     }
+}
+
+/// Ask for press/repeat/release events for every key, modifiers included.
+fn push_keyboard_flags(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    execute!(out, PushKeyboardEnhancementFlags(flags))
 }
 
 /// Global flag for signal handler to indicate shutdown.
@@ -176,6 +196,14 @@ fn parse_args() -> CliMode {
     }
 }
 
+/// The `--config <path>` option: a config file other than the default one.
+fn config_arg() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    args.windows(2)
+        .find(|w| w[0] == "--config")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+}
+
 /// CLI operating mode
 enum CliMode {
     /// Normal TUI mode; `auto_start` launches straight into the auto test
@@ -251,8 +279,15 @@ fn main() -> Result<()> {
             let running = Arc::new(AtomicBool::new(true));
             install_signal_handler(running.clone());
 
-            if let Err(e) = mapper::run_mapper(preset.as_deref(), device, &[], running) {
+            let config = config_arg();
+            if let Err(e) =
+                mapper::run_mapper(preset.as_deref(), device, config.as_deref(), &[], running)
+            {
                 error!("Mapper error: {}", e);
+                // Its own exit status, which the service does not restart on
+                if matches!(e, mapper::MapperError::NoMappings) {
+                    std::process::exit(mapper::EXIT_NOTHING_TO_MAP);
+                }
                 return Err(e.into());
             }
             return Ok(());
@@ -261,7 +296,7 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         CliMode::MapperInstall { preset } => {
             info!("Installing key mapper service...");
-            if let Err(e) = mapper::install_service(preset.as_deref()) {
+            if let Err(e) = mapper::install_service(preset.as_deref(), config_arg().as_deref()) {
                 error!("Install error: {}", e);
                 return Err(e.into());
             }
@@ -303,10 +338,6 @@ fn main() -> Result<()> {
 
     // Setup terminal
     enable_raw_mode()?;
-    // Ask for key-release events where the terminal supports them
-    // (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+). Windows consoles
-    // report releases natively.
-    let release_reporting = cfg!(windows) || enable_keyboard_enhancement();
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -318,22 +349,19 @@ fn main() -> Result<()> {
     install_signal_handler(running.clone());
 
     // Run the application; cleanup runs regardless of success or failure
-    let result = run_app(&mut terminal, running, release_reporting, auto_start);
+    let result = run_app(&mut terminal, running, auto_start);
 
     // Cleanup terminal — always runs, even after signal or error
-    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    }
-    disable_raw_mode()?;
-    execute!(
+    let left = leave_tui(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    );
+    disable_raw_mode()?;
+    left?;
 
     if let Ok(Some(summary)) = &result {
         println!("\nKeyboard TestKit session complete.");
+        println!("Input source: {}", summary.input_source);
         println!("Total events processed: {}", summary.total_events);
         println!("Session duration: {}", summary.elapsed);
         // Same findings as the Dashboard and the exported report (keyboard
@@ -346,6 +374,9 @@ fn main() -> Result<()> {
                 println!("      {}", f.detail);
             }
         }
+        for note in &summary.config_notes {
+            println!("Config: {}", note);
+        }
     }
 
     result.map(|_| ())
@@ -353,6 +384,9 @@ fn main() -> Result<()> {
 
 /// What the TUI session reports on exit.
 struct SessionOutcome {
+    /// Problems with the config file (it could not be used, values clamped)
+    config_notes: Vec<String>,
+    input_source: &'static str,
     total_events: u64,
     elapsed: String,
     findings: Vec<Finding>,
@@ -370,6 +404,7 @@ fn print_help() {
     println!("  -h, --help                    Show this help message");
     println!("  -V, --version                 Show the version");
     println!("  --auto                        Start the guided auto test immediately");
+    println!("  --config <path>               Use this config file (TUI and mapper)");
     println!();
     println!("MAPPER OPTIONS (Linux only):");
     println!("  --mapper                      Run as a key mapping daemon");
@@ -390,7 +425,8 @@ fn print_help() {
     println!("  # Use a specific device");
     println!("  sudo keyboard-testkit --mapper --device /dev/input/event5");
     println!();
-    println!("  # Custom mappings via config file");
+    println!("  # Custom mappings via config file (under sudo, ~ is your own home;");
+    println!("  # the installed service is given your config file's path)");
     println!("  # Edit ~/.config/keyboard-testkit/config.toml:");
     println!("  # [oem_keys]");
     println!("  # key_mappings = [[148, 125], [149, 228]]");
@@ -417,29 +453,19 @@ fn print_help() {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     running: Arc<AtomicBool>,
-    release_reporting: bool,
     auto_start: bool,
 ) -> Result<Option<SessionOutcome>> {
-    // TODO: Support --config <path> CLI argument for custom config locations.
-    let config = Config::load().unwrap_or_else(|e| {
-        warn!("Failed to load config: {}. Using defaults.", e);
-        Config::default()
-    });
-    debug!(
-        "Config: polling={}s/{}ms, refresh={}Hz, theme={:?}",
-        config.polling.test_duration_secs,
-        config.polling.sample_window_ms,
-        config.ui.refresh_rate_hz,
-        config.ui.theme,
-    );
-    let mut app = App::new(config.clone());
+    let config_load = match config_arg() {
+        Some(path) => Config::load_reporting_from(&path),
+        None => Config::load_reporting(),
+    };
+    let mut app = App::new(config_load.config.clone());
 
     // Create keyboard event channel
     let (event_tx, event_rx) = mpsc::channel::<KeyEvent>();
 
     // Create keyboard listener (crossterm-based fallback for non-Linux)
     let mut listener = KeyboardListener::new(event_tx.clone());
-    listener.set_release_reporting(release_reporting);
 
     // On Linux, try to use evdev for better OEM key detection
     #[cfg(target_os = "linux")]
@@ -466,6 +492,15 @@ fn run_app(
     #[cfg(not(target_os = "linux"))]
     let use_evdev = false;
 
+    // When the terminal is the test input, ask it for key-release events
+    // where it supports them (kitty, foot, Ghostty, Alacritty 0.13+, WezTerm
+    // with enable_kitty_keyboard = true); Windows consoles report releases
+    // natively. Evdev already has real releases, so the terminal is left in
+    // its normal mode.
+    let release_reporting =
+        !use_evdev && (cfg!(windows) || enable_keyboard_enhancement(terminal.backend_mut()));
+    listener.set_release_reporting(release_reporting);
+
     let input_source = if use_evdev {
         InputSource::Evdev
     } else if release_reporting {
@@ -474,11 +509,13 @@ fn run_app(
         InputSource::TerminalPressOnly
     };
     app.set_input_source(input_source);
-    info!("Input source: {}", input_source.name());
+    // After the evdev status: a config file that could not be used must be seen
+    app.set_config_load(&config_load);
 
     if auto_start {
         app.start_auto_test();
     }
+    let mut held = HeldKeyFilter::default();
 
     // Main loop
     loop {
@@ -597,7 +634,7 @@ fn run_app(
         if event::poll(frame_interval(app.config.ui.refresh_rate_hz))? {
             loop {
                 if let Event::Key(key) = event::read()? {
-                    handle_terminal_key(&mut app, &mut listener, use_evdev, key);
+                    handle_terminal_key(&mut app, &mut listener, &mut held, use_evdev, key);
                 }
                 if app.state == AppState::Quitting || !event::poll(Duration::ZERO)? {
                     break;
@@ -605,17 +642,13 @@ fn run_app(
             }
         }
 
-        // Execute pending virtual key sends
+        // Execute pending virtual key sends. (Nothing may be printed to
+        // stderr while the TUI is up: it would land at the hidden cursor,
+        // where ratatui never repaints it. Results go to the status line.)
         if app.virtual_test.has_pending_send() {
             match app.virtual_test.execute_virtual_send() {
-                Ok(()) => {
-                    debug!("Virtual keys sent (z, x, c)");
-                    app.set_status("Virtual keys sent (z, x, c)".to_string());
-                }
-                Err(e) => {
-                    error!("Virtual send failed: {}", e);
-                    app.set_status(format!("Virtual send failed: {}", e));
-                }
+                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
+                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
             }
         }
 
@@ -626,12 +659,9 @@ fn run_app(
     }
 
     app.refresh_findings();
-    info!(
-        "Session ended: {} events in {}",
-        app.total_events,
-        app.elapsed_formatted()
-    );
     Ok(Some(SessionOutcome {
+        config_notes: app.config_notes().to_vec(),
+        input_source: app.input_source.name(),
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),
         findings: app.findings.clone(),
@@ -645,38 +675,80 @@ const NO_KEYBOARD_STATUS: &str =
 
 /// Make keyboards that disappear or come back visible in the status line,
 /// and record disconnects as a finding (Dashboard, report, exit summary).
-///
-/// A disconnect also stops a running auto test: its steps would otherwise
-/// time out and blame the missing input on dead keys.
 #[cfg(target_os = "linux")]
 fn report_device_changes(app: &mut App, evdev: &mut EvdevListener) {
-    let mut stopped = "";
+    let mut batch = DeviceBatch::default();
     for change in evdev.take_device_changes() {
-        match change {
-            EvdevDeviceChange::Disconnected { name, .. } => {
-                app.keyboard_disconnected(&name);
-                if app.auto_test_running() {
-                    app.abort_auto_test();
-                    stopped = " - auto test stopped";
-                }
-                let left = match evdev.device_count() {
-                    0 => "no keyboard left".to_string(),
-                    n => format!("{} device(s) left", n),
-                };
-                app.set_status(format!(
-                    "Keyboard disconnected: {} ({}){}",
-                    name, left, stopped
-                ));
-            }
-            EvdevDeviceChange::Connected { name, .. } => {
-                app.keyboard_connected();
-                app.set_status(format!("Keyboard connected: {}", name));
-            }
-        }
+        apply_device_change(app, change, evdev.device_count(), &mut batch);
     }
     // Keep saying so while nothing is connected (other messages expire)
     if evdev.device_count() == 0 && app.get_status().is_none() {
         app.set_status(NO_KEYBOARD_STATUS.to_string());
+    }
+}
+
+/// What the device changes read in one poll did so far: unplugging one
+/// keyboard removes several nodes at once.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct DeviceBatch {
+    /// A keyboard that was typed on went away
+    keyboard_lost: bool,
+    /// That stopped the auto test
+    stopped: bool,
+}
+
+/// Handle one device appearing or disappearing; `devices_left` are still open.
+///
+/// A keyboard that was typed on going away is a disconnect: a finding, and
+/// it stops a running auto test, whose steps would otherwise time out and
+/// blame the missing input on dead keys. A node nothing was typed on (a
+/// YubiKey, the keyboard interface of a mouse) is only mentioned, unless a
+/// keyboard went away with it.
+#[cfg(target_os = "linux")]
+fn apply_device_change(
+    app: &mut App,
+    change: EvdevDeviceChange,
+    devices_left: usize,
+    batch: &mut DeviceBatch,
+) {
+    match change {
+        EvdevDeviceChange::Disconnected {
+            name, typed: true, ..
+        } => {
+            app.keyboard_disconnected(&name);
+            batch.keyboard_lost = true;
+            if app.auto_test_running() {
+                app.abort_auto_test();
+                batch.stopped = true;
+            }
+            let left = match devices_left {
+                0 => "no keyboard left".to_string(),
+                n => format!("{} device(s) left", n),
+            };
+            app.set_status(format!(
+                "Keyboard disconnected: {} ({}){}",
+                name,
+                left,
+                if batch.stopped {
+                    " - auto test stopped"
+                } else {
+                    ""
+                }
+            ));
+        }
+        EvdevDeviceChange::Disconnected { name, .. } => {
+            if !batch.keyboard_lost {
+                app.set_status(format!(
+                    "Input device removed: {} (nothing was typed on it)",
+                    name
+                ));
+            }
+        }
+        EvdevDeviceChange::Connected { name, .. } => {
+            app.keyboard_connected();
+            app.set_status(format!("Keyboard connected: {}", name));
+        }
     }
 }
 
@@ -715,6 +787,114 @@ enum Command {
     SettingsIncrease,
     SettingsDecrease,
     SettingsSave,
+}
+
+impl Command {
+    /// Whether the command may fire again while its key is held: moving
+    /// between views or settings values, which is what holding Tab or an
+    /// arrow key is for. Everything else changes state once per keystroke.
+    fn repeats_safely(self) -> bool {
+        matches!(
+            self,
+            Command::None
+                | Command::NextView
+                | Command::PrevView
+                | Command::ShowView(_)
+                | Command::SettingsUp
+                | Command::SettingsDown
+                | Command::SettingsIncrease
+                | Command::SettingsDecrease
+        )
+    }
+}
+
+/// How much of the keyboard the auto test claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoKeys {
+    /// No run in progress: the usual commands
+    Free,
+    /// A run is in progress: every key is test input but Ctrl+N and Ctrl+C
+    Running,
+    /// A run just ended while keys were still being pressed (see
+    /// `App::auto_test_just_ended`): plain keys are still test input, only
+    /// Ctrl chords are commands
+    Ending,
+}
+
+impl AutoKeys {
+    fn of(app: &App) -> Self {
+        if app.auto_test_running() {
+            AutoKeys::Running
+        } else if app.auto_test_just_ended() {
+            AutoKeys::Ending
+        } else {
+            AutoKeys::Free
+        }
+    }
+}
+
+/// Reports of a held key come this soon after the previous report of it:
+/// the first autorepeat after the repeat delay (Windows and GNOME 500 ms,
+/// KDE 600 ms, X11 660 ms, plus read latency), then one every 30-50 ms.
+const HELD_KEY_WINDOW: Duration = Duration::from_millis(750);
+
+/// Recognises a held command key. Legacy terminals and the Windows console
+/// report autorepeat as more presses of the same key (only the kitty
+/// protocol marks them as repeats), so holding Ctrl+N would skip one step
+/// per repeat and holding Ctrl+C would abort the auto test and then quit.
+///
+/// A press identical to the previous report (same key and modifiers) within
+/// [`HELD_KEY_WINDOW`] of it, with no release of that key in between, is
+/// that key still held. The cost, on terminals without release events, is
+/// that pressing the same command key twice within 750 ms counts once.
+#[derive(Debug, Default)]
+struct HeldKeyFilter {
+    /// The latest report of a key and when it arrived
+    last: Option<(CtKeyCode, KeyModifiers, Instant)>,
+}
+
+impl HeldKeyFilter {
+    /// Note `key` arriving at `now`; returns whether it is a held key
+    /// reporting again rather than a new keystroke.
+    fn is_held(&mut self, key: &CtKeyEvent, now: Instant) -> bool {
+        let same = |(code, modifiers, _): &(CtKeyCode, KeyModifiers, Instant)| {
+            *code == key.code && *modifiers == key.modifiers
+        };
+        match key.kind {
+            KeyEventKind::Release => {
+                // The key came up, whatever is still held: the Ctrl of Ctrl+N
+                // is often let go first ('n' comes up alone), and Shift+R
+                // comes up as 'r' once Shift is up
+                if self
+                    .last
+                    .as_ref()
+                    .is_some_and(|(code, _, _)| same_key(*code, key.code))
+                {
+                    self.last = None;
+                }
+                false
+            }
+            KeyEventKind::Repeat => {
+                self.last = Some((key.code, key.modifiers, now));
+                true
+            }
+            KeyEventKind::Press => {
+                let held = self.last.as_ref().is_some_and(|last| {
+                    same(last) && now.saturating_duration_since(last.2) < HELD_KEY_WINDOW
+                });
+                self.last = Some((key.code, key.modifiers, now));
+                held
+            }
+        }
+    }
+}
+
+/// Whether two key codes are the same key, whatever the case of a letter.
+fn same_key(a: CtKeyCode, b: CtKeyCode) -> bool {
+    match (a, b) {
+        (CtKeyCode::Char(a), CtKeyCode::Char(b)) => a.to_lowercase().eq(b.to_lowercase()),
+        _ => a == b,
+    }
 }
 
 /// Views whose purpose is pressing keys: there every plain key (letters,
@@ -758,7 +938,8 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 ///
 /// The rule, also shown in the help panel and README:
 /// - while the auto test runs, every key is test input except Ctrl+N (skip
-///   step) and Ctrl+C (abort);
+///   step) and Ctrl+C (abort), and right after it ends plain keys stay test
+///   input until the user stops typing (see [`AutoKeys::Ending`]);
 /// - everywhere else Tab / Shift+Tab switch views, Esc and Ctrl+C quit, and
 ///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export,
 ///   except in the Shortcuts view, where Ctrl combos are the test input;
@@ -769,10 +950,11 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 fn command_for_key(
     key: &CtKeyEvent,
     view: AppView,
-    auto_test_running: bool,
+    auto: AutoKeys,
     shortcuts_enabled: bool,
 ) -> Command {
-    // Controls only fire on the initial press, never on repeat or release.
+    // Controls only fire on the initial press, never on repeat or release
+    // (repeats a terminal reports as presses: see `HeldKeyFilter`).
     if key.kind != KeyEventKind::Press {
         return Command::None;
     }
@@ -786,7 +968,7 @@ fn command_for_key(
 
     // Ctrl+C: abort a running auto test, otherwise quit.
     if ctrl_char == Some('c') {
-        return if auto_test_running {
+        return if auto == AutoKeys::Running {
             Command::AbortAutoTest
         } else {
             Command::Quit
@@ -796,12 +978,18 @@ fn command_for_key(
     // While the auto test runs, every key is test input: only the two
     // Ctrl chords are interpreted, so 'q', 'r', Esc... can be verified like
     // any other key.
-    if auto_test_running {
+    if auto == AutoKeys::Running {
         return if ctrl_char == Some('n') {
             Command::SkipAutoStep
         } else {
             Command::None
         };
+    }
+    // The run just ended under the user's fingers (the rapid-tap step ends
+    // on a timer, a disconnect stops a sweep): the keys they are still
+    // pressing are not meant as commands.
+    if auto == AutoKeys::Ending && !ctrl {
+        return Command::None;
     }
 
     // Ctrl chords work in every view but Shortcuts, which records Ctrl
@@ -878,19 +1066,30 @@ fn command_for_key(
     }
 }
 
+/// The command a terminal key event asks for, given what came before it.
+fn command_for_event(
+    key: &CtKeyEvent,
+    app: &App,
+    held: &mut HeldKeyFilter,
+    now: Instant,
+) -> Command {
+    let command = command_for_key(key, app.view, AutoKeys::of(app), app.shortcuts_enabled);
+    if held.is_held(key, now) && !command.repeats_safely() {
+        Command::None
+    } else {
+        command
+    }
+}
+
 /// Feed a terminal key event to the test pipeline and handle UI controls.
 fn handle_terminal_key(
     app: &mut App,
     listener: &mut KeyboardListener,
+    held: &mut HeldKeyFilter,
     use_evdev: bool,
     key: CtKeyEvent,
 ) {
-    let command = command_for_key(
-        &key,
-        app.view,
-        app.auto_test_running(),
-        app.shortcuts_enabled,
-    );
+    let command = command_for_event(&key, app, held, Instant::now());
 
     // When evdev is not in use, the terminal is the test input. Presses,
     // repeats and releases each mean something different to the tests.
@@ -904,11 +1103,11 @@ fn handle_terminal_key(
                 listener.swallow_press(key.code);
             }
             KeyEventKind::Press => {
-                listener.send_press(key.code);
+                listener.send_press_with(key.code, key.modifiers);
             }
             KeyEventKind::Repeat => listener.send_repeat(key.code),
             KeyEventKind::Release => {
-                listener.send_release(key.code);
+                listener.send_release_with(key.code, key.modifiers);
             }
         }
     }
@@ -940,12 +1139,10 @@ fn apply_command(app: &mut App, command: Command) {
                     .as_secs();
                 format!("keyboard_report_{}.json", secs)
             };
-            match app.export_report(&filename) {
-                Ok(_) => info!("Report exported to {}", filename),
-                Err(e) => {
-                    error!("Export failed: {}", e);
-                    app.set_status(format!("Export failed: {}", e));
-                }
+            // The outcome goes to the status line (export_report sets it on
+            // success), never to stderr while the TUI is drawn
+            if let Err(e) = app.export_report(&filename) {
+                app.set_status(format!("Export failed: {}", e));
             }
         }
         Command::ToggleShortcuts => app.toggle_shortcuts(),
@@ -1016,7 +1213,7 @@ mod tests {
     }
 
     fn cmd(key: CtKeyEvent, view: AppView) -> Command {
-        command_for_key(&key, view, false, true)
+        command_for_key(&key, view, AutoKeys::Free, true)
     }
 
     const TEST_VIEWS: [AppView; 8] = [
@@ -1129,7 +1326,7 @@ mod tests {
         }
         // Number keys freed with 'm'
         assert_eq!(
-            command_for_key(&plain('5'), AppView::Dashboard, false, false),
+            command_for_key(&plain('5'), AppView::Dashboard, AutoKeys::Free, false),
             Command::None
         );
     }
@@ -1162,7 +1359,8 @@ mod tests {
 
     #[test]
     fn running_auto_test_captures_every_key() {
-        let run = |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, true, true);
+        let run =
+            |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, AutoKeys::Running, true);
         for key in [
             plain('q'),
             plain(' '),
@@ -1178,6 +1376,165 @@ mod tests {
         }
         assert_eq!(run(ctrl('n')), Command::SkipAutoStep);
         assert_eq!(run(ctrl('c')), Command::AbortAutoTest);
+    }
+
+    #[test]
+    fn keys_still_typed_as_the_auto_test_ends_are_not_commands() {
+        // Tapping 'r' (or q, Space, a digit...) for the rapid-tap step a
+        // moment after it ended must not reset the run, quit or pause
+        let ending =
+            |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, AutoKeys::Ending, true);
+        for key in [
+            plain('q'),
+            plain('r'),
+            plain(' '),
+            plain('e'),
+            plain('5'),
+            legacy_shift('R'),
+            legacy_shift('A'),
+            press(CtKeyCode::Esc, KeyModifiers::NONE),
+            press(CtKeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            assert_eq!(ending(key), Command::None, "{:?}", key);
+        }
+        // Deliberate Ctrl chords still work (there is nothing left to skip)
+        assert_eq!(ending(ctrl('c')), Command::Quit);
+        assert_eq!(ending(ctrl('e')), Command::Export);
+        assert_eq!(ending(ctrl('n')), Command::None);
+        // Once the user has stopped typing the Auto view's keys are back
+        assert_eq!(cmd(plain('r'), AppView::AutoTest), Command::ResetCurrent);
+    }
+
+    /// Commands for `keys`, each `(ms after the first, key)`, fed to `app`
+    /// the way the main loop does, applying each command as it comes.
+    fn commands_for(app: &mut App, keys: &[(u64, CtKeyEvent)]) -> Vec<Command> {
+        let mut held = HeldKeyFilter::default();
+        let t0 = Instant::now();
+        keys.iter()
+            .map(|(ms, key)| {
+                let command =
+                    command_for_event(key, app, &mut held, t0 + Duration::from_millis(*ms));
+                apply_command(app, command);
+                command
+            })
+            .collect()
+    }
+
+    /// A key held down in a terminal without release events: the press, then
+    /// autorepeat after 500 ms every 33 ms until `until_ms`.
+    fn held_down(key: CtKeyEvent, until_ms: u64) -> Vec<(u64, CtKeyEvent)> {
+        let mut reports = vec![(0, key)];
+        reports.extend((500..=until_ms).step_by(33).map(|ms| (ms, key)));
+        reports
+    }
+
+    #[test]
+    fn holding_a_command_key_fires_it_once() {
+        // Ctrl+N held for 0.7 s during the auto test skips one step, not all
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(&mut app, &held_down(ctrl('n'), 700));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| **c == Command::SkipAutoStep)
+                .count(),
+            1
+        );
+        assert!(app.auto_test_running());
+
+        // Ctrl+C held a little long aborts the run but does not then quit
+        let commands = commands_for(&mut app, &held_down(ctrl('c'), 700));
+        assert_eq!(commands[0], Command::AbortAutoTest);
+        assert!(
+            commands[1..].iter().all(|c| *c == Command::None),
+            "{commands:?}"
+        );
+        assert_eq!(app.state, AppState::Running);
+
+        // Space held on the Dashboard pauses once, and stays paused
+        let mut app = App::default();
+        commands_for(&mut app, &held_down(plain(' '), 900));
+        assert_eq!(app.state, AppState::Paused);
+
+        // Esc held in Settings goes back, and does not quit from the Dashboard
+        let mut app = App::default();
+        app.view = AppView::Settings;
+        commands_for(
+            &mut app,
+            &held_down(press(CtKeyCode::Esc, KeyModifiers::NONE), 900),
+        );
+        assert_eq!(app.view, AppView::Dashboard);
+        assert_eq!(app.state, AppState::Running);
+    }
+
+    #[test]
+    fn separate_presses_and_moving_keys_still_work() {
+        // Two separate Ctrl+N presses skip two steps
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(&mut app, &[(0, ctrl('n')), (1200, ctrl('n'))]);
+        assert_eq!(commands, vec![Command::SkipAutoStep; 2]);
+
+        // A reported release ends the keystroke (kitty, Windows console), so
+        // a quick second press is a new one
+        let release = CtKeyEvent::new_with_kind(
+            CtKeyCode::Char(' '),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let mut app = App::default();
+        commands_for(
+            &mut app,
+            &[(0, plain(' ')), (90, release), (200, plain(' '))],
+        );
+        assert_eq!(app.state, AppState::Running);
+
+        // The release ends the keystroke also when it comes after the
+        // modifier was let go (kitty, Windows console): Ctrl+N up as a
+        // plain 'n', Shift+R up as 'r'. Two quick Ctrl+N skip two steps.
+        let up = |c| {
+            CtKeyEvent::new_with_kind(
+                CtKeyCode::Char(c),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        };
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(
+            &mut app,
+            &[(0, ctrl('n')), (120, up('n')), (350, ctrl('n'))],
+        );
+        assert_eq!(
+            commands,
+            vec![Command::SkipAutoStep, Command::None, Command::SkipAutoStep]
+        );
+        let mut app = App::default();
+        let commands = commands_for(
+            &mut app,
+            &[
+                (0, legacy_shift('R')),
+                (100, up('r')),
+                (300, legacy_shift('R')),
+            ],
+        );
+        assert_eq!(
+            commands,
+            vec![Command::ResetAll, Command::None, Command::ResetAll]
+        );
+
+        // Holding Tab or an arrow key keeps moving
+        let mut app = App::default();
+        let commands = commands_for(
+            &mut app,
+            &held_down(press(CtKeyCode::Tab, KeyModifiers::NONE), 600),
+        );
+        assert!(commands.iter().all(|c| *c == Command::NextView));
+        assert_eq!(
+            app.view,
+            AppView::from_index(commands.len() % AppView::all().len())
+        );
     }
 
     #[test]
@@ -1246,22 +1603,26 @@ mod tests {
     }
 
     /// Feed `keys` to a fresh app through the terminal path (no evdev), the
-    /// way the main loop does, then stop the auto test the first one started.
+    /// way the main loop does, then let the idle step of the auto test the
+    /// first one started run its course.
     fn idle_findings_after(source: InputSource, keys: &[CtKeyEvent]) -> Vec<Finding> {
         let (tx, rx) = mpsc::channel();
         let mut listener = KeyboardListener::new(tx);
         listener.set_release_reporting(source.has_release_events());
         let mut app = App::default();
         app.set_input_source(source);
+        let mut held = HeldKeyFilter::default();
         for key in keys {
-            handle_terminal_key(&mut app, &mut listener, false, *key);
+            handle_terminal_key(&mut app, &mut listener, &mut held, false, *key);
             listener.poll();
             while let Ok(event) = rx.try_recv() {
                 app.process_event(&event);
             }
         }
         assert!(app.auto_test_running());
-        app.abort_auto_test();
+        app.auto_test
+            .tick_at(Instant::now() + keyboard_testkit::tests::IDLE_DURATION);
+        app.refresh_findings();
         app.findings.clone()
     }
 
@@ -1301,6 +1662,136 @@ mod tests {
         ];
         let findings = idle_findings_after(InputSource::TerminalPressOnly, &keys);
         assert!(findings.iter().any(|f| f.category == "Phantom input"));
+    }
+
+    /// Escape sequences crossterm writes for the terminal modes involved.
+    #[cfg(unix)]
+    mod seq {
+        pub const ALT_SCREEN_ON: &str = "\x1b[?1049h";
+        pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
+        pub const FLAGS_PUSH: &str = "\x1b[>";
+        pub const FLAGS_POP: &str = "\x1b[<1u";
+        pub const CURSOR_SHOW: &str = "\x1b[?25h";
+    }
+
+    // (Unix only: on Windows crossterm drives the console through its API
+    // rather than writing these sequences.)
+    #[cfg(unix)]
+    #[test]
+    fn keyboard_flags_live_on_the_alternate_screen_and_the_cursor_comes_back() {
+        // Terminals keep one flag stack per screen: the flags must be pushed
+        // after entering the alternate screen and popped before leaving it,
+        // or the TUI gets no releases and the shell keeps the flags.
+        let mut out = Vec::new();
+        execute!(out, EnterAlternateScreen).unwrap();
+        push_keyboard_flags(&mut out).unwrap();
+        leave_tui(&mut out, true).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s:?} in {out:?}"));
+        assert!(at(seq::ALT_SCREEN_ON) < at(seq::FLAGS_PUSH));
+        assert!(at(seq::FLAGS_PUSH) < at(seq::FLAGS_POP));
+        assert!(at(seq::FLAGS_POP) < at(seq::ALT_SCREEN_OFF));
+        // ratatui hides the cursor on every frame; a panic must not leave
+        // the shell without one
+        assert!(at(seq::ALT_SCREEN_OFF) < at(seq::CURSOR_SHOW));
+
+        // Without pushed flags (evdev input, or a terminal without the
+        // protocol) nothing is popped from the shell's stack
+        let mut out = Vec::new();
+        leave_tui(&mut out, false).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(seq::FLAGS_POP), "{out:?}");
+        assert!(out.contains(seq::CURSOR_SHOW), "{out:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_keyboard_that_was_typed_on_counts_as_disconnected() {
+        let gone = |name: &str, typed| EvdevDeviceChange::Disconnected {
+            path: std::path::PathBuf::from("/dev/input/event9"),
+            name: name.to_string(),
+            typed,
+        };
+        // Pulling out a YubiKey mid-sweep leaves the run and the findings alone
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        let mut batch = DeviceBatch::default();
+        let yubikey = gone("Yubico YubiKey OTP+FIDO+CCID", false);
+        apply_device_change(&mut app, yubikey, 2, &mut batch);
+        assert!(app.auto_test_running());
+        assert_eq!(app.keyboard_disconnects(), 0);
+        assert!(app.get_status().unwrap().contains("YubiKey"));
+
+        // The keyboard being typed on going away (with its media-key node,
+        // never typed on, in the same poll) stops the run and is a finding
+        let mut batch = DeviceBatch::default();
+        apply_device_change(&mut app, gone("USB Keyboard", true), 2, &mut batch);
+        let media = gone("USB Keyboard Consumer Control", false);
+        apply_device_change(&mut app, media, 1, &mut batch);
+        assert!(!app.auto_test_running());
+        assert_eq!(app.keyboard_disconnects(), 1);
+        assert!(app.findings.iter().any(|f| f.category == "Connection"));
+        let status = app.get_status().unwrap();
+        assert!(
+            status.starts_with("Keyboard disconnected: USB Keyboard"),
+            "{status}"
+        );
+        assert!(status.ends_with("auto test stopped"), "{status}");
+    }
+
+    #[test]
+    fn aborting_the_idle_check_with_ctrl_c_is_not_phantom_input() {
+        use keyboard_testkit::keyboard::{KeyCode, KeyEventType};
+        let issues = |app: &App| -> Vec<&'static str> {
+            app.findings
+                .iter()
+                .filter(|f| f.is_issue())
+                .map(|f| f.category)
+                .collect()
+        };
+        // Evdev: the Ctrl press is read from the device a frame or more
+        // before the terminal delivers Ctrl+C
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        app.process_event(&KeyEvent::new(
+            KeyCode(29),
+            KeyEventType::Press,
+            Instant::now(),
+            0,
+        ));
+        let (tx, _rx) = mpsc::channel();
+        let mut listener = KeyboardListener::new(tx);
+        let mut held = HeldKeyFilter::default();
+        handle_terminal_key(&mut app, &mut listener, &mut held, true, ctrl('c'));
+        assert!(!app.auto_test_running());
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
+
+        // Kitty protocol: the bare Ctrl press is reported as a key event
+        let ctrl_key = CtKeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl);
+        let keys = [
+            press(CtKeyCode::Char('a'), KeyModifiers::SHIFT),
+            press(ctrl_key, KeyModifiers::CONTROL),
+            ctrl('c'),
+        ];
+        let (tx, rx) = mpsc::channel();
+        let mut listener = KeyboardListener::new(tx);
+        listener.set_release_reporting(true);
+        let mut app = App::default();
+        app.set_input_source(InputSource::TerminalWithRelease);
+        let mut held = HeldKeyFilter::default();
+        for key in keys {
+            handle_terminal_key(&mut app, &mut listener, &mut held, false, key);
+            while let Ok(event) = rx.try_recv() {
+                app.process_event(&event);
+            }
+        }
+        assert!(!app.auto_test_running());
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
+        // Quitting with Ctrl still held is not a key without a release either
+        app.refresh_findings();
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
     }
 
     #[test]

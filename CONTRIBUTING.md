@@ -29,7 +29,7 @@ Thank you for your interest in contributing to Keyboard TestKit! This document p
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) 1.70 or later
+- [Rust](https://rustup.rs/) 1.88 or later
 - Platform-specific dependencies:
 
 **Linux (Debian/Ubuntu):**

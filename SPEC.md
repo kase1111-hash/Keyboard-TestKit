@@ -15,17 +15,21 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 | Specification | Details |
 |---------------|---------|
 | Measurement Unit | Hertz (Hz) |
-| Display Format | Real-time Hz reading + average over test duration |
-| Target Range | 125Hz - 8000Hz |
-| Accuracy | ±1ms timing precision |
-| Test Duration | User-configurable (default: 10 seconds) |
+| Display Format | Estimated report rate, plus key-rate statistics |
+| Target Range | 125, 250 and 500 Hz (a 8, 4 or 2 ms report grid); 1000 Hz and above, and Bluetooth, show no grid and no rate is claimed |
+| Accuracy | The grid step itself; needs evdev kernel timestamps (terminal input shows "n/a") |
+| Test Duration | User-configurable (default: 10 seconds), and at least 24 gaps between key events |
 
 **Implementation Requirements:**
-- Timestamp each keypress event at OS level
-- Calculate intervals between consecutive reports
-- Display instantaneous and rolling average polling rates
-- Flag inconsistent polling (jitter detection)
-- Compare against manufacturer-stated specs
+- Timestamp each key event with the kernel's time (evdev)
+- Infer the report interval from the quantization of the gaps between key
+  events (presses and releases); gaps that are all multiples of a coarser
+  period (a Bluetooth connection interval) are not a report grid
+- Key rates, gap spread and the Timing view are typing rhythm, shown for
+  information, never as a keyboard rating
+
+> **Current status:** jitter detection and comparison against manufacturer
+> specs are not implemented.
 
 ---
 
@@ -55,17 +59,21 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 
 | Specification | Details |
 |---------------|---------|
-| Repeat Rate Test | Measure characters-per-second during hold |
-| Repeat Delay Test | Time from initial press to first repeat |
+| Hold Times | Per-key hold durations (needs real key releases) |
 | Release Accuracy | Verify single key-up event on release |
-| Bounce Detection | Identify multiple triggers on single press/release |
+| Bounce Detection | Same key re-pressed less than 20-40 ms (configurable) after its release, or less than 40 ms after its press; evdev kernel timestamps only |
+| Press Rate | Presses per second of any keys (typing pace) |
 
 **Implementation Requirements:**
 - Display real-time hold duration counter
-- Measure and display repeat rate (typically 2-30 chars/sec)
-- Measure initial delay before repeat starts (typically 250-1000ms)
-- Detect key bounce (multiple rapid on/off within 5ms)
-- Visual representation of key state over time (waveform view)
+- Detect key bounce from kernel timestamps; keys whose releases come from
+  the driver (laptop hotkeys with a force-release quirk) are not judged
+- A single bounce is a warning (a delayed wireless report looks the same);
+  a key that bounces again is a fault
+
+> **Current status:** autorepeat rate and delay are not measured (evdev and
+> the terminal listener drop autorepeat events), and there is no waveform
+> view.
 
 ---
 
@@ -114,6 +122,11 @@ Physical Works + Virtual Fails = API/Permission Issue
 - Identify which process registered the conflicting hotkey
 - Real-time "interrupt indicator" showing interception occurred
 - Quick-test mode: rapidly test all key combinations
+
+> **Current status:** the Shortcuts view records the modifier combos that
+> reach the app and flags known system shortcuts; interception itself is not
+> detected. Modifier keys only arrive through evdev or the kitty keyboard
+> protocol, so with other terminal input the view shows "n/a".
 
 ---
 
@@ -179,10 +192,10 @@ Physical Works + Virtual Fails = API/Permission Issue
 
 | Specification | Details |
 |---------------|---------|
-| Test Method | Count maximum concurrent key-down states |
+| Test Method | Count maximum concurrent key-down states (needs real key releases) |
 | Display | Visual keyboard with active key highlighting |
-| Reporting | X-Key Rollover rating (2KRO, 6KRO, NKRO) |
-| Matrix Analysis | Identify which key combinations fail |
+| Reporting | X-Key Rollover rating (2KRO, 6KRO, NKRO) counting keys other than modifiers, which are shown next to it |
+| Matrix Analysis | Identify which key combinations fail (not implemented) |
 
 ---
 
@@ -196,26 +209,33 @@ Physical Works + Virtual Fails = API/Permission Issue
 | Alert Type | Highlight phantom keys in different color |
 | Common Combos | Pre-test gaming combinations (WASD+Space+Shift) |
 
+> **Current status:** ghosting is not detected automatically: a ghost key
+> arrives as an ordinary press, and nothing tells the app which keys are
+> really held. The NKRO view lists the active keys for the user to judge.
+
 ---
 
 ### 10. Inter-Event Timing Measurement
 
-**Purpose:** Measure the time interval between consecutive keyboard polling events.
+**Purpose:** Show the gaps between consecutive key events.
 
 | Specification | Details |
 |---------------|---------|
 | Measurement | Milliseconds (ms) |
-| Method | Poll-to-poll interval timing |
+| Method | Time between consecutive key events |
 | Per-Key Testing | Individual timing per key option |
 
-> **Note:** This test measures inter-event polling intervals (time between consecutive keyboard reports), not true end-to-end input latency (physical switch actuation to software registration). True end-to-end latency measurement requires specialized hardware.
+> **Note:** These gaps are set by the typing rhythm, so they are shown for
+> information and never rate the keyboard. The keyboard's report interval is
+> estimated by the polling test. True end-to-end latency (switch actuation to
+> software registration) needs specialized hardware.
 
 ---
 
 ## User Interface Requirements
 
 ### Main Dashboard
-- Visual keyboard layout (currently hardcoded ANSI US layout)
+- Visual keyboard layout (ANSI, ISO or JIS, detected from the system)
 - Real-time key highlighting on press
 - Status indicators for each test module
 - Tab-based navigation between test views
@@ -228,8 +248,8 @@ Physical Works + Virtual Fails = API/Permission Issue
 - Settings managed via TOML configuration file
 - Platform-specific config file locations (see README)
 - Threshold configurations editable in config file
-
-> **Note:** An in-app settings panel for runtime configuration is planned but not yet implemented. Currently, all settings are managed through the TOML configuration file.
+- In-app Settings view (`S`) for the thresholds, refresh rate, theme and FN
+  key mode, saved to the same file
 
 ---
 

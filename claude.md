@@ -81,15 +81,20 @@ make install          # Install to /usr/local/bin
 2. Create keyboard listener & event channels
 3. Try evdev listener on Linux; otherwise use terminal input (kitty keyboard
    protocol for key releases where supported, synthesized releases otherwise).
+   The kitty flags are pushed on the alternate screen (terminals keep one
+   flag stack per screen) and popped before leaving it, never with evdev.
    `App::set_input_source` tells every test what the source can measure.
-4. Main loop: poll evdev (keyboards that vanish or come back are reported to
-   `App::keyboard_disconnected` / `keyboard_connected` and stop a running auto
-   test), `app.tick()` (auto-test timers, stuck keys, live findings), render
+4. Main loop: poll evdev (keyboards that were typed on and vanish or come
+   back are reported to `App::keyboard_disconnected` / `keyboard_connected`
+   and stop a running auto test; other nodes only reach the status line),
+   `app.tick()` (auto-test timers, stuck keys, live findings), render
    at the configured refresh rate, drain all queued terminal events. The
    keystroke that starts the auto test is swallowed by the terminal listener
    (with its autorepeat and release) so it is never phantom input.
-5. Cleanup terminal on exit and print the findings summary (the same
-   `App::findings` the Dashboard and the exported report show)
+5. Cleanup terminal on exit (also from the panic hook: flags popped, cursor
+   shown) and print the findings summary (the same `App::findings` the
+   Dashboard and the exported report show). Nothing is printed to stderr
+   while the TUI is drawn: messages go to the status line.
 
 ### KeyboardTest Trait
 
@@ -110,13 +115,14 @@ trait KeyboardTest {
    timestamp quantization; key-rate and gap statistics are informational
 2. **StickinessTest** - Stuck keys (still down past the threshold); released
    long holds are information only
-3. **RolloverTest** - Keys registered at once; ghost keys are shown, not
-   detected
+3. **RolloverTest** - Keys registered at once, rated without modifiers
+   (shown separately); ghost keys are shown, not detected
 4. **EventTimingTest** - Gaps between key events: typing rhythm, never a
    keyboard rating (the poll interval comes from PollingRateTest)
 5. **HoldReleaseTest** - Hold times & switch chatter (same-key re-press
    < 20-40 ms after release or < 40 ms after press, evdev only)
-6. **ShortcutTest** - System hotkey conflict detection
+6. **ShortcutTest** - Modifier combos and known system shortcuts (n/a when
+   the source does not report modifier keys)
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison
 8. **OemKeyTest** - OEM/FN key capture & restoration
 9. **AutoTest** - Guided diagnostic (idle, sweep, hold, rollover, rapid tap) whose
@@ -126,10 +132,15 @@ trait KeyboardTest {
 
 ## Configuration
 
-Config file locations:
-- Linux: `~/.config/keyboard-testkit/config.toml`
+Config file locations (`--config <path>` overrides):
+- Linux: `~/.config/keyboard-testkit/config.toml` (under sudo, the invoking
+  user's home, not root's; the mapper service gets the path via `--config`)
 - macOS: `~/Library/Application Support/keyboard-testkit/config.toml`
 - Windows: `%APPDATA%\keyboard-testkit\config.toml`
+
+`Config::load_reporting` keeps load errors and clamped values (`ConfigLoad`)
+so the app can show them; saving over a file that did not load keeps it as
+`config.toml.bak`.
 
 ## Conventions
 
@@ -145,8 +156,10 @@ Config file locations:
   the poll-rate estimate need evdev timestamps, stuck keys and rollover need
   real releases; otherwise the view says "n/a (terminal input)" (Info) and
   the analysis skips or downgrades the check. Findings that may be the user
-  rather than the keyboard (low rollover, disconnects) are worded as
-  conditions, and decision logic lives in pure, unit-tested functions
+  rather than the keyboard (low rollover, disconnects, keystrokes during the
+  idle check, a single bounce) are Warnings worded as conditions, summaries
+  are red only for a Critical finding (`issues_status`), and decision logic
+  lives in pure, unit-tested functions
 
 ### UI Controls
 
@@ -159,7 +172,10 @@ Config file locations:
   A starts the auto test, Space pause, r/R reset current/all, e export,
   q quit, S settings, t theme, m number keys, ? help
 - While the auto test runs every key is test input except Ctrl+N (skip a
-  step) and Ctrl+C (abort)
+  step) and Ctrl+C (abort); after it ends plain keys stay test input until
+  the keyboard has been quiet for 2 s (`App::auto_test_just_ended`)
+- A held key fires its command once, even where autorepeat arrives as
+  presses (`HeldKeyFilter`); only view and Settings navigation repeats
 - Key handling is decided by `command_for_key` in main.rs (unit-tested)
 
 ### Build Profile

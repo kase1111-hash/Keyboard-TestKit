@@ -11,6 +11,10 @@
 //! | macOS | `~/Library/Application Support/keyboard-testkit/config.toml` |
 //! | Windows | `%APPDATA%\keyboard-testkit\config.toml` |
 //!
+//! On Linux, run with `sudo`, `~` is the home of the user who ran sudo, not
+//! root's (sudo resets `HOME`); files created there are given to that user.
+//! `--config <path>` picks another file.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -30,7 +34,7 @@ use crate::keyboard::remap::FnKeyMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Error type for configuration operations
@@ -92,7 +96,12 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 
     // Create directory if it doesn't exist
     if !app_dir.exists() {
+        let config_dir_existed = config_dir.exists();
         fs::create_dir_all(&app_dir)?;
+        if !config_dir_existed {
+            give_to_invoking_user(&config_dir);
+        }
+        give_to_invoking_user(&app_dir);
     }
 
     Ok(app_dir.join("config.toml"))
@@ -102,15 +111,11 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 fn platform_config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        // $XDG_CONFIG_HOME or ~/.config
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg));
-            }
-        }
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".config"))
+        linux_config_dir(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            std::env::var("HOME").ok().map(PathBuf::from),
+            sudo_user().map(|u| u.home),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -128,6 +133,88 @@ fn platform_config_dir() -> Option<PathBuf> {
             .ok()
             .map(|h| PathBuf::from(h).join(".config"))
     }
+}
+
+/// The Linux config directory: `$XDG_CONFIG_HOME` or `~/.config`.
+///
+/// Under sudo (`sudo_home` is the invoking user's home) `HOME` is root's:
+/// the user's own file is meant, as the app tells users to run it with sudo
+/// for evdev. sudo drops `XDG_CONFIG_HOME` unless told to keep the
+/// environment, and then it is the user's.
+#[cfg(target_os = "linux")]
+fn linux_config_dir(
+    xdg_config_home: Option<String>,
+    home: Option<PathBuf>,
+    sudo_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(xdg));
+    }
+    sudo_home.or(home).map(|h| h.join(".config"))
+}
+
+/// The user who ran this process through sudo.
+#[cfg(target_os = "linux")]
+struct SudoUser {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: PathBuf,
+}
+
+/// The user who ran this process through sudo, if it runs as root via sudo
+/// on behalf of another user.
+#[cfg(target_os = "linux")]
+fn sudo_user() -> Option<SudoUser> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let name = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|n| !n.is_empty() && n != "root")?;
+    let name = CString::new(name).ok()?;
+    // SAFETY: getpwnam gets a NUL-terminated name and returns null or a
+    // pointer to a passwd record in static storage, which is copied out
+    // below before any other passwd lookup can overwrite it.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: `pw` is a valid passwd record (checked above); pw_dir is
+    // null or a NUL-terminated string.
+    let (uid, gid, dir) = unsafe { ((*pw).pw_uid, (*pw).pw_gid, (*pw).pw_dir) };
+    if dir.is_null() {
+        return None;
+    }
+    // SAFETY: `dir` is a non-null NUL-terminated string (see above).
+    let home = OsStr::from_bytes(unsafe { CStr::from_ptr(dir) }.to_bytes());
+    Some(SudoUser {
+        uid,
+        gid,
+        home: PathBuf::from(home),
+    })
+}
+
+/// Under sudo, hand a file or directory created in the invoking user's
+/// config directory to that user: owned by root, it could not be saved
+/// again by a run without sudo.
+fn give_to_invoking_user(path: &Path) {
+    #[cfg(target_os = "linux")]
+    if let Some(user) = sudo_user() {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            // SAFETY: chown gets a NUL-terminated path; a failure only
+            // leaves the file owned by root, as before.
+            unsafe {
+                libc::chown(path.as_ptr(), user.uid, user.gid);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
 }
 
 // ----------------------------------------------------------------------------
@@ -385,7 +472,84 @@ impl OemKeyConfig {
     }
 }
 
+/// What reading the config file gave: the settings in effect, and what the
+/// user has to be told about the file. A file that fails to load must not
+/// pass silently: the app then runs on defaults, and saving would replace
+/// the file (and the key mappings in it) with them.
+#[derive(Debug, Default)]
+pub struct ConfigLoad {
+    /// The settings in effect (the defaults if the file could not be used)
+    pub config: Config,
+    /// The file read and saved to (`None` without a config directory)
+    pub path: Option<PathBuf>,
+    /// Out-of-range values that were clamped or replaced (see `sanitize`)
+    pub adjusted: Vec<String>,
+    /// Why the file could not be used; the defaults are in effect
+    pub error: Option<String>,
+}
+
+impl ConfigLoad {
+    /// Whether a config file exists that could not be used, so saving over
+    /// it would lose what it holds (see [`Config::save_to_backing_up`]).
+    pub fn unreadable(&self) -> bool {
+        self.error.is_some() && self.path.as_deref().is_some_and(Path::exists)
+    }
+
+    /// One line per thing the user should know about the file.
+    pub fn notes(&self) -> Vec<String> {
+        let file = self
+            .path
+            .as_deref()
+            .map_or("config file".to_string(), |p| p.display().to_string());
+        let mut notes = Vec::new();
+        if let Some(error) = &self.error {
+            notes.push(format!(
+                "{}: not used, defaults in effect ({})",
+                file, error
+            ));
+        }
+        notes.extend(self.adjusted.iter().map(|a| format!("{}: {}", file, a)));
+        notes
+    }
+}
+
 impl Config {
+    /// Load the config file like [`Config::load`], but keep what went wrong
+    /// (a file that does not parse, values that were clamped) for the user.
+    pub fn load_reporting() -> ConfigLoad {
+        match config_path() {
+            Ok(path) => Self::load_reporting_from(&path),
+            Err(e) => ConfigLoad {
+                error: Some(e.to_string()),
+                ..ConfigLoad::default()
+            },
+        }
+    }
+
+    /// [`Config::load_reporting`] for a specific file. A missing file gives
+    /// the defaults without a note.
+    pub fn load_reporting_from(path: &Path) -> ConfigLoad {
+        let mut load = ConfigLoad {
+            path: Some(path.to_path_buf()),
+            ..ConfigLoad::default()
+        };
+        if !path.exists() {
+            return load;
+        }
+        let parsed = fs::read_to_string(path)
+            .map_err(ConfigError::from)
+            .and_then(|contents| toml::from_str::<Config>(&contents).map_err(ConfigError::from));
+        match parsed {
+            Ok(mut config) => {
+                load.adjusted = config.sanitize();
+                load.config = config;
+            }
+            // toml errors quote the offending line over several lines
+            Err(e) => load.error = Some(e.to_string().replace('\n', " ")),
+        }
+        load
+    }
+
     /// Load configuration from the default config file.
     ///
     /// Returns the default configuration if the file doesn't exist.
@@ -509,8 +673,29 @@ impl Config {
     /// Useful for testing or using custom config locations.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
+        let existed = path.exists();
         fs::write(path, &contents)?;
+        if !existed {
+            give_to_invoking_user(path);
+        }
         Ok(())
+    }
+
+    /// Save over a file that could not be loaded, keeping the old file as
+    /// `<name>.bak` first (its key mappings would be lost otherwise).
+    /// Returns where the old file was kept. Nothing is written if it cannot
+    /// be kept.
+    pub fn save_to_backing_up(&self, path: &PathBuf) -> Result<PathBuf, ConfigError> {
+        let mut backup = path.clone().into_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let existed = backup.exists();
+        fs::copy(path, &backup)?;
+        if !existed {
+            give_to_invoking_user(&backup);
+        }
+        self.save_to(path)?;
+        Ok(backup)
     }
 
     /// Get UI refresh interval as Duration
@@ -666,6 +851,34 @@ theme = "Light"
         let path = result.unwrap();
         assert!(path.to_string_lossy().contains("keyboard-testkit"));
         assert!(path.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sudo_reads_the_invoking_users_config() {
+        let user = PathBuf::from("/home/alice");
+        let root = PathBuf::from("/root");
+        // sudo: HOME is root's, the invoking user's home is meant
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), Some(user.clone())),
+            Some(user.join(".config"))
+        );
+        // Without sudo, and for root itself
+        assert_eq!(
+            linux_config_dir(None, Some(user.clone()), None),
+            Some(user.join(".config"))
+        );
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), None),
+            Some(root.join(".config"))
+        );
+        // XDG_CONFIG_HOME wins (sudo only keeps it when told to keep the
+        // user's environment)
+        assert_eq!(
+            linux_config_dir(Some("/cfg".into()), Some(root), Some(user)),
+            Some(PathBuf::from("/cfg"))
+        );
+        assert_eq!(linux_config_dir(Some(String::new()), None, None), None);
     }
 
     #[test]
@@ -927,6 +1140,56 @@ show_notifications = true
         // The rest of the file is kept
         assert_eq!(config.ui.theme, Theme::Light);
         assert_eq!(config.oem_keys.key_mappings, vec![(100, 97)]);
+    }
+
+    #[test]
+    fn a_file_that_does_not_load_is_reported_not_silently_replaced() {
+        // Hand edits the README invites: a lowercase theme, a float
+        for (name, contents) in [
+            (
+                "lowercase",
+                "[ui]\ntheme = \"light\"\n[oem_keys]\nkey_mappings = [[148, 125]]\n",
+            ),
+            ("float", "[stickiness]\nstuck_threshold_ms = 2000.0\n"),
+        ] {
+            let path = temp_path(name);
+            fs::write(&path, contents).unwrap();
+            let load = Config::load_reporting_from(&path);
+            assert!(load.error.is_some(), "{name}");
+            assert!(load.unreadable());
+            let notes = load.notes();
+            assert_eq!(notes.len(), 1);
+            assert!(
+                notes[0].contains("not used, defaults in effect"),
+                "{:?}",
+                notes
+            );
+            assert!(!notes[0].contains('\n'), "{:?}", notes);
+
+            // Saving keeps the user's file instead of overwriting it
+            let backup = load.config.save_to_backing_up(&path).unwrap();
+            assert_eq!(fs::read_to_string(&backup).unwrap(), contents);
+            assert!(Config::load_from(&path).is_ok());
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&backup);
+        }
+    }
+
+    #[test]
+    fn clamped_values_are_reported() {
+        let path = temp_path("clamp-report");
+        fs::write(&path, "[ui]\nrefresh_rate_hz = 0\n").unwrap();
+        let load = Config::load_reporting_from(&path);
+        let _ = fs::remove_file(&path);
+        assert!(load.error.is_none());
+        assert!(!load.unreadable());
+        assert_eq!(load.config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(load.adjusted.len(), 1);
+        assert!(load.notes()[0].contains("ui.refresh_rate_hz = 0"));
+
+        // A missing file is the defaults, nothing to report
+        let load = Config::load_reporting_from(&temp_path("missing"));
+        assert!(load.error.is_none() && load.notes().is_empty());
     }
 
     #[test]
