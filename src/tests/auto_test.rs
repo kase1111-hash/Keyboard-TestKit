@@ -1758,15 +1758,14 @@ fn bounce_finding(
             format!(
                 "A keystroke arrived doubled from a keyboard recognized as wireless: over a \
                  wireless link a radio stall that delivers a whole keystroke at once looks \
-                 the same as a switch that closed for less time than a finger holds a key, \
-                 so {}",
+                 the same as a switch whose contact closed or opened for a moment, so {}",
                 RADIO_RETEST
             )
         } else {
             advice(
-                "The switch closed for less time than a finger holds a key: usually a \
-                 worn or dirty switch. Press the key several times: if it bounces again, \
-                 clean or replace the switch.",
+                "The key registered twice faster than a finger can press it again: its \
+                 contact closed or opened for a moment, usually a worn or dirty switch. Press \
+                 the key several times: if it bounces again, clean or replace the switch.",
             )
         };
         Finding::new(
@@ -2813,6 +2812,18 @@ mod tests {
             .expect("bounce finding");
         assert_eq!(bounce.severity, Severity::Warning);
         assert_eq!(bounce.detail, "Space (1 bounce)");
+        // The contact opened under the finger: the advice does not say it
+        // closed for less time than a finger holds a key
+        assert!(
+            bounce.advice.contains("closed or opened for a moment"),
+            "{}",
+            bounce.advice
+        );
+        assert!(
+            !bounce.advice.contains("less time than a finger holds"),
+            "{}",
+            bounce.advice
+        );
     }
 
     #[test]
