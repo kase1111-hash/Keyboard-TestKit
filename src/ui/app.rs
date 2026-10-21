@@ -113,8 +113,14 @@ impl ResetChord {
             KeyEventType::Press => {
                 let own = self.keys.contains(&event.key)
                     && self.at.is_some_and(|at| event.timestamp <= at);
-                if own && !self.hidden.contains(&event.key) {
-                    self.hidden.push(event.key);
+                if own {
+                    if !self.hidden.contains(&event.key) {
+                        self.hidden.push(event.key);
+                    }
+                } else {
+                    // A later keystroke of the key (the release of the
+                    // command's was lost): the tests see it, release and all
+                    self.hidden.retain(|k| *k != event.key);
                 }
                 own
             }
@@ -2030,6 +2036,20 @@ mod tests {
         app.process_event(&event_at(29, Press, ms(400)));
         app.process_event(&event_at(19, Press, ms(450)));
         assert_eq!(app.rollover_test.peak_summary(), "1 + 1 modifier(s)");
+
+        // The release of the keystroke's Ctrl never arrives (the terminal
+        // lost focus): the next Ctrl keystroke is test input, release and all
+        let mut app = App::default();
+        app.set_input_source(InputSource::TerminalWithRelease);
+        app.view = AppView::Stickiness;
+        app.process_event(&event_at(29, Press, ms(-300)));
+        app.reset_current_on_chord_at(&ctrl_r, now);
+        app.process_event(&event_at(19, Press, ms(-20)));
+        app.process_event(&event_at(19, Release, ms(60)));
+        app.process_event(&event_at(29, Press, ms(5_000)));
+        assert_eq!(app.stickiness_test.held_keys().len(), 1);
+        app.process_event(&event_at(29, Release, ms(5_100)));
+        assert!(app.stickiness_test.held_keys().is_empty());
 
         // Press-only input: the R press and its synthesized release
         let mut app = App::default();
