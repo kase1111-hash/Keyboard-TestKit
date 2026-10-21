@@ -18,12 +18,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - evdev-based keyboard listener for improved Linux support
 
 ### Changed
+- In the test views (Polling ... OEM/FN) every key is test input except `Tab`/`Shift+Tab`, `Esc` and `Ctrl` chords, so mashing keys in the NKRO view no longer quits, resets or writes a report. Pause, reset and export are `Ctrl+P`, `Ctrl+R` and `Ctrl+E` there; single-key commands still work on the Dashboard, Auto and Help screens. In the Shortcuts view `Ctrl` combos are test input too (`Ctrl+C` still quits)
+- The Timing view shows the gaps between keystrokes as information only: they measure the typist, not the keyboard, and previously rated every keyboard "Poor"
+- Views, findings and reports say "n/a (terminal input)" for what terminal input cannot measure (polling rate, bounce, stuck keys, rollover peak) instead of a green "None" or ">= 1000 Hz"; `max_rollover` is `null` in exported JSON in that mode. Ghosting is reported as not measured instead of "None detected", and the virtual-keyboard check reports Inconclusive instead of verdicts it could never reach
+- Bounce/chatter is a same-key re-press less than 20 ms after its release or 40 ms after its previous press, judged only from evdev kernel timestamps. The old 5 ms window could never fire on a 125 Hz keyboard; saved values are clamped to 20-40 ms
+- Out-of-range values in `config.toml` are clamped on load (with a warning) instead of the whole file being discarded, and old files with the former 50 ms stuck-key default get the current default
 - Updated dependencies to latest major versions: ratatui 0.29 → 0.30, crossterm 0.28 → 0.29, toml 0.8 → 1.1, enigo 0.2 → 0.6
 - Refreshed Cargo.lock so all transitive dependencies are current
 - Declared minimum supported Rust version (1.88) in Cargo.toml and README
 - Renamed "Latency" view to "Timing" to accurately reflect that it measures inter-event polling intervals rather than true end-to-end input latency
 
 ### Fixed
+- Auto test false alarms on healthy keyboards:
+  - Holding a key for 2 s or more and releasing it (the Rollover step asks for exactly that) was a permanent Critical "Stuck key". Only a key that is still down is stuck now; long holds are informational
+  - The evdev copy of the keystroke that starts the test (or of `Ctrl+N`), and the autorepeat of a held start key on terminals, were recorded as phantom input
+  - The key sweep expected keys the input source cannot report (Shift/Ctrl/Alt/Win in the Windows console, modifiers in legacy terminals), so it could never pass and ended with "Dead keys". It now expects only reportable keys; keys a keyboard may lack (ISO, JIS, Right Ctrl, a locked Windows key) are warnings; only an evdev timeout is critical; a sweep still making progress is not cut off; a key jammed before the start is reported as stuck rather than dead
+  - US keyboards on systems configured as `pc105` were treated as ISO and expected to press a key they do not have
+  - The Rollover step accepted the first attempt with two keys; it now waits for a real attempt (6+ keys) and words a low peak as a condition
+  - "Limited capture" was a warning, so terminal runs could never report no issues
+- Auto test missed real faults: the chatter check could never fire (15 ms press-to-press on keyboards that report every 8 ms); one bouncing key is now reported once, and the rapid-tap rate uses the measured time
+- evdev keyboards that are unplugged, replugged or reconnect over Bluetooth are picked up again (rescanned every second) instead of silently going dead; disconnects are reported as a Connection finding on the Dashboard, in reports and on exit. `SYN_DROPPED` re-reads the key state, so a release lost in a buffer overflow no longer leaves a key looking stuck
+- Press-only terminals: fast same-key presses (double letters, chatter) were swallowed as repeats, holds were cut short before the autorepeat delay, and a held key could turn into a burst of presses
+- Shift commands (`A`, `S`, `R`, `?`) did nothing in kitty-protocol terminals
+- Keys released while paused stayed down after resuming and were later flagged as stuck
+- The Bounce Window, Polling Duration and Refresh Rate settings never reached the running tests or the main loop, and `refresh_rate_hz = 0` crashed at startup
+- Ctrl+Alt+Del, Ctrl+Shift+Esc and PrtSc in the known-shortcut table could never match; normal chords and switch chatter were called virtual input; laptop keys whose driver auto-releases them were counted as bounce
+- CI: the workflow referenced a non-existent action (`dtolnay/rust-action`), so every job failed at setup since it was added; new clippy lints are fixed
 - evdev events are now timestamped with the kernel's event time instead of the UI poll time. Previously every event in a poll batch shared one timestamp, which quantized all timing to the refresh rate and made a quick tap look like switch bounce
 - Terminal key events are dispatched by kind: releases and repeats are no longer treated as new presses (on Windows every key was counted twice and controls such as Tab fired on release too), and controls only fire on the initial press
 - All queued terminal events are drained each frame instead of one per frame, so bursts of keys are not spread across several redraws
