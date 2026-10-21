@@ -589,13 +589,15 @@ mod tests {
         assert!(!test.description().is_empty());
     }
 
-    /// Feed presses separated by the given gaps (µs).
+    /// Feed presses separated by the given gaps (µs), rolling over four
+    /// keys as fast typing does (one key cannot be re-pressed that fast).
     fn feed_gaps(test: &mut PollingRateTest, gaps_us: &[u64]) {
+        let key = |i: usize| crate::keyboard::KeyCode(30 + (i % 4) as u16);
         let mut at = Instant::now();
-        test.process_event(&press_at(DEFAULT_KEY, at, 0));
-        for &gap in gaps_us {
+        test.process_event(&press_at(key(0), at, 0));
+        for (i, &gap) in gaps_us.iter().enumerate() {
             at += Duration::from_micros(gap);
-            test.process_event(&press_at(DEFAULT_KEY, at, gap));
+            test.process_event(&press_at(key(i + 1), at, gap));
         }
     }
 
@@ -606,14 +608,14 @@ mod tests {
             .expect("poll rate row")
     }
 
-    /// Rapid tapping on a 125 Hz keyboard: human gaps of 24-56 ms, each one
-    /// landing on the 8 ms report grid.
+    /// Fast rolled typing on a 125 Hz keyboard: human gaps of 24-56 ms,
+    /// each one landing on the 8 ms report grid.
     fn gaps_125hz() -> Vec<u64> {
         (0..30u64).map(|i| 8_000 * (3 + i % 4)).collect()
     }
 
-    /// Human rapid tapping with gaps that are not on any report grid
-    /// (1000 Hz keyboard, or Bluetooth with jittery connection events).
+    /// Fast typing with gaps that are not on any report grid (1000 Hz
+    /// keyboard, or Bluetooth with jittery connection events).
     fn gaps_unquantized() -> Vec<u64> {
         (0..30u64).map(|i| 31_000 + (i * 7_919) % 23_000).collect()
     }

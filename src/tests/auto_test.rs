@@ -2832,14 +2832,15 @@ mod tests {
     fn analyze_reports_polling_rate_from_quantized_timestamps() {
         let mut parts = ctx_parts();
         let t0 = Instant::now();
-        // 30 presses exactly 8ms*k apart -> 125 Hz grid
+        // 30 presses rolling over four keys, exactly 8ms*k apart -> 125 Hz grid
         let mut at = t0;
         for i in 0..30u64 {
             let gap = Duration::from_millis(8 * (3 + i % 4)); // 24..56ms
             at += gap;
+            let key = 30 + (i % 4) as u16;
             parts
                 .0
-                .process_event(&evt(30, KeyEventType::Press, at, gap.as_micros() as u64));
+                .process_event(&evt(key, KeyEventType::Press, at, gap.as_micros() as u64));
         }
         let t = AutoTest::new(InputSource::Evdev);
         let findings = t.analyze(&ctx!(parts));
