@@ -648,38 +648,55 @@ const NO_KEYBOARD_STATUS: &str =
 
 /// Make keyboards that disappear or come back visible in the status line,
 /// and record disconnects as a finding (Dashboard, report, exit summary).
-///
-/// A disconnect also stops a running auto test: its steps would otherwise
-/// time out and blame the missing input on dead keys.
 #[cfg(target_os = "linux")]
 fn report_device_changes(app: &mut App, evdev: &mut EvdevListener) {
-    let mut stopped = "";
     for change in evdev.take_device_changes() {
-        match change {
-            EvdevDeviceChange::Disconnected { name, .. } => {
-                app.keyboard_disconnected(&name);
-                if app.auto_test_running() {
-                    app.abort_auto_test();
-                    stopped = " - auto test stopped";
-                }
-                let left = match evdev.device_count() {
-                    0 => "no keyboard left".to_string(),
-                    n => format!("{} device(s) left", n),
-                };
-                app.set_status(format!(
-                    "Keyboard disconnected: {} ({}){}",
-                    name, left, stopped
-                ));
-            }
-            EvdevDeviceChange::Connected { name, .. } => {
-                app.keyboard_connected();
-                app.set_status(format!("Keyboard connected: {}", name));
-            }
-        }
+        apply_device_change(app, change, evdev.device_count());
     }
     // Keep saying so while nothing is connected (other messages expire)
     if evdev.device_count() == 0 && app.get_status().is_none() {
         app.set_status(NO_KEYBOARD_STATUS.to_string());
+    }
+}
+
+/// Handle one device appearing or disappearing; `devices_left` are still open.
+///
+/// A keyboard that was typed on going away is a disconnect: a finding, and
+/// it stops a running auto test, whose steps would otherwise time out and
+/// blame the missing input on dead keys. A node nothing was typed on (a
+/// YubiKey, the keyboard interface of a mouse) is only mentioned.
+#[cfg(target_os = "linux")]
+fn apply_device_change(app: &mut App, change: EvdevDeviceChange, devices_left: usize) {
+    match change {
+        EvdevDeviceChange::Disconnected {
+            name, typed: true, ..
+        } => {
+            app.keyboard_disconnected(&name);
+            let stopped = if app.auto_test_running() {
+                app.abort_auto_test();
+                " - auto test stopped"
+            } else {
+                ""
+            };
+            let left = match devices_left {
+                0 => "no keyboard left".to_string(),
+                n => format!("{} device(s) left", n),
+            };
+            app.set_status(format!(
+                "Keyboard disconnected: {} ({}){}",
+                name, left, stopped
+            ));
+        }
+        EvdevDeviceChange::Disconnected { name, .. } => {
+            app.set_status(format!(
+                "Input device removed: {} (nothing was typed on it)",
+                name
+            ));
+        }
+        EvdevDeviceChange::Connected { name, .. } => {
+            app.keyboard_connected();
+            app.set_status(format!("Keyboard connected: {}", name));
+        }
     }
 }
 
@@ -1581,6 +1598,31 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains(seq::FLAGS_POP), "{out:?}");
         assert!(out.contains(seq::CURSOR_SHOW), "{out:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_keyboard_that_was_typed_on_counts_as_disconnected() {
+        let gone = |name: &str, typed| EvdevDeviceChange::Disconnected {
+            path: std::path::PathBuf::from("/dev/input/event9"),
+            name: name.to_string(),
+            typed,
+        };
+        // Pulling out a YubiKey mid-sweep leaves the run and the findings alone
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        apply_device_change(&mut app, gone("Yubico YubiKey OTP+FIDO+CCID", false), 2);
+        assert!(app.auto_test_running());
+        assert_eq!(app.keyboard_disconnects(), 0);
+        assert!(app.get_status().unwrap().contains("YubiKey"));
+
+        // The keyboard being typed on going away stops the run and is a finding
+        apply_device_change(&mut app, gone("USB Keyboard", true), 1);
+        assert!(!app.auto_test_running());
+        assert_eq!(app.keyboard_disconnects(), 1);
+        assert!(app.findings.iter().any(|f| f.category == "Connection"));
+        assert!(app.get_status().unwrap().ends_with("auto test stopped"));
     }
 
     #[test]

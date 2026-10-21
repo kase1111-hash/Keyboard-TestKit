@@ -260,7 +260,12 @@ A keyboard that disconnects (evdev) is reported as a "Connection" warning on
 the Dashboard, in the exported report and on exit. An unplug you made on
 purpose, or a wireless keyboard going to sleep, looks the same, so the
 finding is worded as a condition; resetting all tests (`R`) or starting the
-auto test clears it.
+auto test clears it. Only a device that keys were typed on counts: many
+other devices have keyboard nodes (a YubiKey, gaming and Bluetooth mice, a
+barcode scanner), and one of those going away is only mentioned in the
+status line. Keys that are already down when evdev opens a keyboard (a key
+jammed before launch, or held while a keyboard reconnects) are read from the
+kernel and count as pressed from that moment.
 
 ## Export
 
