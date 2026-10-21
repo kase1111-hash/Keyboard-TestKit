@@ -121,8 +121,10 @@ trait KeyboardTest {
    keyboard rating (the poll interval comes from PollingRateTest)
 5. **HoldReleaseTest** - Hold times & switch chatter (same-key re-press
    < 20-40 ms after release or < 40 ms after press, counted only with a
-   hold < 20 ms on either side, evdev only; bounces in events from a
-   wireless keyboard, `App::note_wireless_keys`, are never judged a fault)
+   hold < 20 ms on either side, after a hold >= 500 ms, or from a keyboard
+   whose bus has no radio, `App::note_radio_free_keys`; evdev only;
+   bounces in events from a wireless keyboard, `App::note_wireless_keys`,
+   are never judged a fault)
 6. **ShortcutTest** - Modifier combos and known system shortcuts (n/a when
    the source does not report modifier keys)
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison

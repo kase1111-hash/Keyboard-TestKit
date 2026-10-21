@@ -531,6 +531,7 @@ fn run_app(
             if let Some(ref mut evdev) = evdev_listener {
                 evdev.poll();
                 app.note_wireless_keys(&evdev.take_wireless_keys());
+                app.note_radio_free_keys(&evdev.take_radio_free_keys());
                 report_device_changes(&mut app, evdev);
             } else {
                 listener.poll();

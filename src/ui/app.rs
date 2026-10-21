@@ -464,6 +464,14 @@ impl App {
         self.hold_release_test.note_wireless_keys(keys);
     }
 
+    /// Tell the tests which keys' events in the batch about to be processed
+    /// came from a keyboard whose bus carries no radio (see
+    /// `EvdevListener::take_radio_free_keys`; call before every batch): a
+    /// fast re-press there is the switch whatever the holds around it.
+    pub fn note_radio_free_keys(&mut self, keys: &[crate::keyboard::KeyCode]) {
+        self.hold_release_test.note_radio_free_keys(keys);
+    }
+
     /// Tell the app where key events come from. Call once at startup.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;

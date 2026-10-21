@@ -279,13 +279,18 @@ down for less than 20 ms just before it, or the re-press itself was: no
 finger holds a key that briefly, while a switch that chatters closes for a
 report or two. A wireless keyboard can deliver a late release together with
 the next press, so a fast double letter arrives with no gap at all, but both
-of its holds are a finger's and it is not counted. A key that bounces once
-is a warning; a key that bounces again is reported as a fault. On a wireless
-keyboard (Bluetooth, or a 2.4 GHz receiver recognized by its name or, for
-Logitech receivers, by the paired keyboard behind it) a radio stall that
-delivers a whole keystroke at once looks like a bounce, so its bounces stay
-a warning that says so: reset (`R`) and retest on the cable or next to the
-receiver.
+of its holds are a finger's and it is not counted. After a key held for half
+a second or more, and on a keyboard whose bus has no radio (a laptop's own
+keyboard on PS/2, I2C or SPI, or a PS/2 keyboard), any re-press inside the
+window counts: the contact dropped out under the finger. On USB, which may
+be a 2.4 GHz receiver, a dropout in the middle of a shorter keystroke cannot
+be told from a double letter the radio bunched, so it is not counted there.
+A key that bounces once is a warning; a key that bounces again is reported
+as a fault. On a wireless keyboard (Bluetooth, or a 2.4 GHz receiver
+recognized by its name or, for Logitech receivers, by the paired keyboard
+behind it) a radio stall that delivers a whole keystroke at once looks like a
+bounce, so its bounces stay a warning that says so: reset (`R`) and retest on
+the cable or next to the receiver.
 
 Input during the idle check that looks like whole keystrokes (you pressed a
 key) is a warning worded as a condition; a key left down or firing again and

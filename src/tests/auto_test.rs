@@ -2771,6 +2771,35 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_dropping_out_during_the_hold_step_is_reported() {
+        // Space held for 2 s on a wired keyboard, its contact open for 3 ms
+        // at 1.2 s: the hold step passes on the first 1.2 s, and the dropout
+        // is a bounce, not something hidden behind "reported correctly"
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Hold);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &[
+                evt(57, KeyEventType::Press, s, 0),
+                evt(57, KeyEventType::Release, s + ms(1200), 0),
+                evt(57, KeyEventType::Press, s + ms(1203), 0),
+                evt(57, KeyEventType::Release, s + ms(2000), 0),
+            ],
+        );
+        t.tick_at(s + ms(2100));
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .expect("bounce finding");
+        assert_eq!(bounce.severity, Severity::Warning);
+        assert_eq!(bounce.detail, "Space (1 bounce)");
+    }
+
+    #[test]
     fn a_single_bounce_over_a_wireless_link_is_worded_for_the_radio_first() {
         // A healthy Bluetooth keyboard: one stall during the rapid-tap step
         // delivers a whole tap of A at once
