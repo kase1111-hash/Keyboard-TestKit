@@ -127,8 +127,9 @@ wireless keyboard loses its link, the status line says so (a running auto
 test stops) and the keyboard is picked up again when it comes back. Without
 evdev the terminal is used as the input source; terminals that speak the kitty
 keyboard protocol (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+) still report
-key releases, other terminals only report presses: a repeated key within
-200 ms is counted as a new press, a held key is recognised by its autorepeat,
+key releases, other terminals only report presses: a key reported again
+within 200 ms is counted as a new press (unless it comes faster than a finger
+can press, which is autorepeat), a held key is recognised by its autorepeat,
 and releases are estimated, so hold times and rollover cannot be measured.
 
 ### Automatic Diagnostic

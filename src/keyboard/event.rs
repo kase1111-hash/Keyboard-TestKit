@@ -64,6 +64,14 @@ const INITIAL_HOLD_TIMEOUT: Duration = Duration::from_millis(750);
 /// it, so it is only counted once no repeat cadence follows.
 const MAX_AUTOREPEAT_DELAY: Duration = Duration::from_secs(2);
 
+/// Two reports of the same key closer together than this did not come from a
+/// finger: even drumming on one key with two fingers stays above ~60 ms
+/// (16 Hz). They are autorepeat (20 Hz or faster: X11 and KDE 25 Hz, GNOME
+/// and Windows ~30 Hz by default) or reports that a stalled read delivered
+/// at once. The one exception is the first report after an idle key's press,
+/// which autorepeat cannot produce: that is switch chatter.
+const MIN_REPRESS_GAP: Duration = Duration::from_millis(50);
+
 /// Per-key bookkeeping of the listener.
 #[derive(Debug, Clone, Copy)]
 struct KeyTrack {
@@ -79,6 +87,9 @@ struct KeyTrack {
     /// autorepeat, but possibly a new tap. The next report (repeat cadence or
     /// not) or [`AUTO_RELEASE_TIMEOUT`] of silence decides.
     pending: Option<Instant>,
+    /// The key was idle before this press, so no autorepeat can be running:
+    /// a report right after it is chatter (see [`MIN_REPRESS_GAP`]).
+    idle_before: bool,
 }
 
 impl KeyTrack {
@@ -89,6 +100,7 @@ impl KeyTrack {
             last_report: now,
             repeated: false,
             pending: None,
+            idle_before: false,
         }
     }
 }
@@ -112,7 +124,9 @@ fn midpoint(a: Instant, b: Instant) -> Instant {
 /// tells the two apart from their timing:
 ///
 /// - a report within 200 ms of the key's press is a new press (autorepeat
-///   cannot have started yet), so fast taps and chatter are counted;
+///   cannot have started yet), so fast taps and chatter are counted, unless
+///   it comes faster than a finger can press again ([`MIN_REPRESS_GAP`]):
+///   that is autorepeat, so a held key never turns into a burst of presses;
 /// - a later report is held back until the next one shows whether it starts
 ///   a repeat cadence (gap below [`AUTO_RELEASE_TIMEOUT`]) or was another tap;
 /// - releases are synthesized 750 ms after a press that never repeated (longer
@@ -241,7 +255,11 @@ impl KeyboardListener {
 
         let pressed = match self.keys.get(&key).copied() {
             None => {
-                self.keys.insert(key, KeyTrack::pressed(now));
+                let track = KeyTrack {
+                    idle_before: true,
+                    ..KeyTrack::pressed(now)
+                };
+                self.keys.insert(key, track);
                 out.push((now, key, KeyEventType::Press));
                 true
             }
@@ -265,9 +283,19 @@ impl KeyboardListener {
             t.last_report = now;
             return false;
         }
-        if t.repeated && now.saturating_duration_since(t.last_report) < AUTO_RELEASE_TIMEOUT {
+        let since_report = now.saturating_duration_since(t.last_report);
+        if t.repeated && since_report < AUTO_RELEASE_TIMEOUT {
             // Autorepeat continues (also for a key released early by
             // INITIAL_HOLD_TIMEOUT whose repeat started late).
+            t.last_report = now;
+            return false;
+        }
+        if !t.idle_before && since_report < MIN_REPRESS_GAP {
+            // Too fast for a finger: autorepeat that started within
+            // MIN_AUTOREPEAT_DELAY (a short repeat delay setting), or repeats
+            // a stalled read delivered together. Counting it would turn the
+            // rest of the hold into a burst of presses at the repeat rate.
+            t.repeated = true;
             t.last_report = now;
             return false;
         }
@@ -616,20 +644,54 @@ mod tests {
     /// Drive a press-only listener like the main loop does: poll every
     /// 16 ms frame, deliver each report (ms after start) at its time.
     fn run_press_only(reports: &[(u64, char)], end_ms: u64) -> Vec<KeyEvent> {
+        run_with_stalls(reports, end_ms, &[])
+    }
+
+    /// Like [`run_press_only`], but the main loop is stuck (slow redraw,
+    /// loaded machine, laggy SSH link) during each `(from_ms, to_ms)` stall:
+    /// nothing is polled, and the reports made meanwhile are all read when it
+    /// ends, with the same read time.
+    fn run_with_stalls(
+        reports: &[(u64, char)],
+        end_ms: u64,
+        stalls: &[(u64, u64)],
+    ) -> Vec<KeyEvent> {
         let (mut l, rx) = listener();
         let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let stall_end = |ms: u64| {
+            stalls
+                .iter()
+                .find(|(from, to)| (*from..*to).contains(&ms))
+                .map(|(_, to)| *to)
+        };
         let mut next = 0;
         let mut frame = 0;
         while frame <= end_ms {
-            l.poll_at(t0 + Duration::from_millis(frame));
+            if stall_end(frame).is_none() {
+                l.poll_at(at(frame));
+            }
             while next < reports.len() && reports[next].0 < frame + 16 {
-                let (at, c) = reports[next];
-                l.press_at(CtKeyCode::Char(c), t0 + Duration::from_millis(at));
+                let (ms, c) = reports[next];
+                l.press_at(CtKeyCode::Char(c), at(stall_end(ms).unwrap_or(ms)));
                 next += 1;
             }
             frame += 16;
         }
         rx.try_iter().collect()
+    }
+
+    /// Shortest gap between two consecutive presses.
+    fn min_press_gap(events: &[KeyEvent]) -> Option<Duration> {
+        let presses: Vec<Instant> = events
+            .iter()
+            .filter(|e| e.event_type == KeyEventType::Press)
+            .map(|e| e.timestamp)
+            .collect();
+        presses
+            .windows(2)
+            .map(|w| w[1].saturating_duration_since(w[0]))
+            .min()
     }
 
     fn presses(events: &[KeyEvent]) -> usize {
@@ -758,6 +820,44 @@ mod tests {
         let mut reports = hold('a', 500, 33, 900);
         reports.push((1200, 'a'));
         let events = run_press_only(&reports, 2500);
+        assert_eq!(presses(&events), 2);
+    }
+
+    #[test]
+    fn short_autorepeat_delay_does_not_turn_a_hold_into_a_burst() {
+        // Repeat delays below 200 ms (xset r rate 150-200, macOS
+        // InitialKeyRepeat 10-13, or 200 ms read slightly early): the first
+        // autorepeat looks like a fast re-press, but the repeats after it
+        // come faster than a finger and must not each count as a press.
+        for (delay, interval) in [(150, 15), (150, 30), (180, 20), (195, 33), (199, 40)] {
+            let events = run_press_only(&hold('a', delay, interval, 1500), 2000);
+            assert_eq!(
+                presses(&events),
+                2,
+                "delay {delay} ms, interval {interval} ms"
+            );
+            assert!(min_press_gap(&events).unwrap() >= Duration::from_millis(delay));
+        }
+    }
+
+    #[test]
+    fn stalled_reads_during_a_hold_are_not_chatter() {
+        // Autorepeat queued while the main loop was stuck is read in one go.
+        // Same-key presses microseconds apart would be reported as chatter.
+        for stall in [(700, 900), (510, 650), (1200, 1500)] {
+            let events = run_with_stalls(&hold('a', 500, 33, 2000), 2500, &[stall]);
+            assert!(presses(&events) <= 3, "stall {stall:?}: {events:?}");
+            assert!(
+                min_press_gap(&events).unwrap() >= MIN_REPRESS_GAP,
+                "stall {stall:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chatter_on_an_idle_key_is_still_reported_when_read_together() {
+        // The doubled report of a chattering switch, read in the same batch
+        let events = run_with_stalls(&[(0, 'a'), (6, 'a')], 1500, &[(0, 10)]);
         assert_eq!(presses(&events), 2);
     }
 
