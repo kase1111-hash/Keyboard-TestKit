@@ -771,6 +771,16 @@ impl AutoTest {
             }
         }
 
+        // Likewise the evdev copy of the Ctrl+N that skipped the previous
+        // step is read after the skip: it belongs to that step, not this one
+        // (it would start the rapid-tap timer before the user taps).
+        if self
+            .step_started
+            .is_some_and(|start| event.timestamp < start)
+        {
+            return;
+        }
+
         match step {
             StepKind::Idle => {
                 match event.event_type {
@@ -1823,13 +1833,15 @@ mod tests {
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION); // -> Sweep
         assert_eq!(t.current_step(), Some(StepKind::Sweep));
-        t.process_event(&press(KeyCode(30)));
-        t.process_event(&release(KeyCode(30)));
+        let s = t0 + IDLE_DURATION + Duration::from_millis(200);
+        t.process_event(&evt(30, KeyEventType::Press, s, 0));
+        t.process_event(&evt(30, KeyEventType::Release, s, 0));
         assert!(!t.tick_at(t0 + Duration::from_secs(4)));
         assert_eq!(t.sweep_seen_count(), 1);
         assert_eq!(t.sweep_missing(), vec![KeyCode(31)]);
-        t.process_event(&press(KeyCode(31)));
-        t.process_event(&release(KeyCode(31)));
+        let s = t0 + Duration::from_secs(4);
+        t.process_event(&evt(31, KeyEventType::Press, s, 0));
+        t.process_event(&evt(31, KeyEventType::Release, s, 0));
         assert!(!t.tick_at(t0 + Duration::from_secs(5)));
         assert_eq!(t.current_step(), Some(StepKind::Hold));
     }
@@ -1841,8 +1853,9 @@ mod tests {
         let t0 = Instant::now();
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION);
-        t.process_event(&press(KeyCode(30)));
-        t.process_event(&release(KeyCode(30)));
+        let s = t0 + Duration::from_secs(4);
+        t.process_event(&evt(30, KeyEventType::Press, s, 0));
+        t.process_event(&evt(30, KeyEventType::Release, s, 0));
         // Time out the sweep
         t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
         assert_eq!(t.current_step(), Some(StepKind::Hold));
@@ -2456,6 +2469,40 @@ mod tests {
         t.tick_at(t0 + IDLE_DURATION);
         let findings = t.analyze(&ctx!(parts));
         assert!(findings.iter().any(|f| f.category == "Phantom input"));
+    }
+
+    #[test]
+    fn skip_keystroke_read_after_the_skip_stays_out_of_the_next_step() {
+        // With evdev the Ctrl+N that skipped the rollover step is read on the
+        // next loop iteration. Its presses predate the rapid-tap step: they
+        // must not start its timer or count as taps.
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
+        let skip = t0 + Duration::from_secs(10);
+        t.skip_step_at(skip);
+        assert_eq!(t.current_step(), Some(StepKind::RapidTap));
+        let ms = Duration::from_millis;
+        t.process_event(&evt(29, KeyEventType::Press, skip - ms(60), 0));
+        t.process_event(&evt(49, KeyEventType::Press, skip - ms(20), 0));
+        t.process_event(&evt(49, KeyEventType::Release, skip + ms(50), 0));
+        t.process_event(&evt(29, KeyEventType::Release, skip + ms(80), 0));
+        // The user reads the instruction, then taps 11 times in one second
+        let s = skip + Duration::from_secs(3);
+        assert!(!t.tick_at(s));
+        for i in 0..11u64 {
+            t.process_event(&evt(30, KeyEventType::Press, s + ms(i * 100), 0));
+            t.process_event(&evt(30, KeyEventType::Release, s + ms(i * 100 + 40), 0));
+        }
+        // The 5 s window runs from the first tap
+        assert!(!t.tick_at(s + Duration::from_secs(2)));
+        assert!(t.tick_at(s + RAPID_TAP_DURATION));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let f = findings.iter().find(|f| f.category == "Rapid tap").unwrap();
+        assert!(
+            f.title.contains("11 presses in 1.0s (10.0 per second)"),
+            "{}",
+            f.title
+        );
     }
 
     #[test]
