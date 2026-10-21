@@ -48,7 +48,7 @@ use std::time::Duration;
 use keyboard_testkit::{
     config::Config,
     keyboard::{KeyEvent, KeyboardListener},
-    tests::{Finding, InputSource},
+    tests::{Finding, InputSource, Severity},
     ui::{
         App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, SettingsPanel,
         ShortcutOverlay, StatusBar, TabBar,
@@ -56,7 +56,7 @@ use keyboard_testkit::{
 };
 
 #[cfg(target_os = "linux")]
-use keyboard_testkit::keyboard::{evdev_status, EvdevListener};
+use keyboard_testkit::keyboard::{evdev_status, EvdevDeviceChange, EvdevListener};
 
 #[cfg(target_os = "linux")]
 use keyboard_testkit::mapper;
@@ -336,7 +336,11 @@ fn main() -> Result<()> {
         println!("\nKeyboard TestKit session complete.");
         println!("Total events processed: {}", summary.total_events);
         println!("Session duration: {}", summary.elapsed);
-        let issues: Vec<&Finding> = summary.findings.iter().filter(|f| f.is_issue()).collect();
+        let mut findings = summary.findings.clone();
+        if let Some(finding) = disconnect_finding(summary.keyboard_disconnects) {
+            findings.insert(0, finding);
+        }
+        let issues: Vec<&Finding> = findings.iter().filter(|f| f.is_issue()).collect();
         println!("Issues found: {}", issues.len());
         for f in issues {
             println!("  [{}] {}: {}", f.severity.label(), f.category, f.title);
@@ -354,6 +358,26 @@ struct SessionOutcome {
     total_events: u64,
     elapsed: String,
     findings: Vec<Finding>,
+    /// Times an evdev keyboard disappeared during the session
+    keyboard_disconnects: u32,
+}
+
+/// A keyboard that drops off the bus mid-session (flaky cable or port,
+/// weak wireless link) is a fault in its own right, and it explains keys
+/// that "never registered" in the meantime.
+fn disconnect_finding(disconnects: u32) -> Option<Finding> {
+    (disconnects > 0).then(|| Finding {
+        severity: Severity::Warning,
+        category: "Connection",
+        title: format!(
+            "Keyboard disconnected {} time(s) during the session",
+            disconnects
+        ),
+        detail: "Keys pressed while it was gone were not seen by any test.".to_string(),
+        advice: "Check the cable and USB port (try another port), or the wireless \
+                 link and batteries."
+            .to_string(),
+    })
 }
 
 fn print_help() {
@@ -395,11 +419,15 @@ fn print_help() {
     println!();
     println!("TUI CONTROLS:");
     println!("  Tab/Shift+Tab    Navigate views");
-    println!("  1-9,0            Jump to view (when shortcuts enabled)");
+    println!("  Esc/Ctrl+C       Quit");
+    println!("  Ctrl+P/R/E       Pause, reset current test, export report (any view)");
+    println!("  In the test views (Polling ... OEM/FN) every other key is test input.");
+    println!("  On the Dashboard, Auto and Help screens these single keys also work:");
     println!("  A                Run the automatic diagnostic (Ctrl+N skip step, Ctrl+C abort)");
+    println!("  1-9,0            Jump to view (when shortcuts enabled)");
     println!("  Space            Pause/Resume");
-    println!("  q/Esc/Ctrl+C     Quit");
-    println!("  ?                Help");
+    println!("  r/R  e  q        Reset current/all, export, quit");
+    println!("  S  t  m  ?       Settings, theme, number-key shortcuts, help");
     println!();
     println!("INPUT:");
     println!("  On Linux, raw evdev access (sudo, or membership of the 'input' group) gives");
@@ -473,9 +501,11 @@ fn run_app(
         app.start_auto_test();
     }
 
-    // Main loop
-    let tick_rate = config.refresh_interval();
+    // Times an evdev keyboard disappeared (shown in the exit summary)
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut keyboard_disconnects = 0u32;
 
+    // Main loop
     loop {
         // Check if Ctrl+C / SIGTERM was received
         if !running.load(Ordering::SeqCst) {
@@ -488,6 +518,7 @@ fn run_app(
         {
             if let Some(ref mut evdev) = evdev_listener {
                 evdev.poll();
+                report_device_changes(&mut app, evdev, &mut keyboard_disconnects);
             } else {
                 listener.poll();
             }
@@ -587,7 +618,8 @@ fn run_app(
 
         // Handle terminal events (for navigation/control). Drain everything
         // that is queued so a burst of keys is not spread over several frames.
-        if event::poll(tick_rate)? {
+        // The refresh rate is read every frame so Settings changes apply.
+        if event::poll(frame_interval(app.config.ui.refresh_rate_hz))? {
             loop {
                 if let Event::Key(key) = event::read()? {
                     handle_terminal_key(&mut app, &mut listener, use_evdev, key);
@@ -628,7 +660,240 @@ fn run_app(
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),
         findings: app.findings.clone(),
+        keyboard_disconnects,
     }))
+}
+
+/// Status shown while evdev has no keyboard to read.
+#[cfg(target_os = "linux")]
+const NO_KEYBOARD_STATUS: &str =
+    "No keyboard connected - plug it in or reconnect it, it is picked up automatically";
+
+/// Make keyboards that disappear or come back visible in the status line.
+///
+/// A disconnect also stops a running auto test: its steps would otherwise
+/// time out and blame the missing input on dead keys.
+#[cfg(target_os = "linux")]
+fn report_device_changes(app: &mut App, evdev: &mut EvdevListener, disconnects: &mut u32) {
+    for change in evdev.take_device_changes() {
+        match change {
+            EvdevDeviceChange::Disconnected { name, .. } => {
+                *disconnects += 1;
+                let stopped = if app.auto_test_running() {
+                    app.abort_auto_test();
+                    " - auto test stopped"
+                } else {
+                    ""
+                };
+                let left = match evdev.device_count() {
+                    0 => "no keyboard left".to_string(),
+                    n => format!("{} device(s) left", n),
+                };
+                app.set_status(format!(
+                    "Keyboard disconnected: {} ({}){}",
+                    name, left, stopped
+                ));
+            }
+            EvdevDeviceChange::Connected { name, .. } => {
+                app.set_status(format!("Keyboard connected: {}", name));
+            }
+        }
+    }
+    // Keep saying so while nothing is connected (other messages expire)
+    if evdev.device_count() == 0 && app.get_status().is_none() {
+        app.set_status(NO_KEYBOARD_STATUS.to_string());
+    }
+}
+
+/// Status hint shown when a key-test view is opened.
+const TEST_VIEW_HINT: &str =
+    "Keys here are test input - Ctrl+P pause, Ctrl+R reset, Ctrl+E export, Esc quit";
+
+/// What a terminal keystroke asks the app to do, besides being test input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    None,
+    Quit,
+    AbortAutoTest,
+    SkipAutoStep,
+    NextView,
+    PrevView,
+    ShowView(AppView),
+    StartAutoTest,
+    TogglePause,
+    ResetCurrent,
+    ResetAll,
+    Export,
+    ToggleShortcuts,
+    ToggleTheme,
+    SendVirtualKeys,
+    AddOemMapping,
+    CycleFnMode,
+    ClearOemMappings,
+    SettingsBack,
+    SettingsUp,
+    SettingsDown,
+    SettingsIncrease,
+    SettingsDecrease,
+    SettingsSave,
+}
+
+/// Views whose purpose is pressing keys: there every plain key (letters,
+/// digits, Space, punctuation, with or without Shift) is test input, so
+/// mashing keys can never quit, reset, export or pause by accident.
+fn is_key_test_view(view: AppView) -> bool {
+    matches!(
+        view,
+        AppView::PollingRate
+            | AppView::HoldRelease
+            | AppView::Stickiness
+            | AppView::Rollover
+            | AppView::Latency
+            | AppView::Shortcuts
+            | AppView::Virtual
+            | AppView::OemKeys
+    )
+}
+
+/// The character a key stands for as a command key.
+///
+/// Terminals using the kitty keyboard protocol report Shift+a as 'a' with
+/// SHIFT (crossterm only folds the case when comparing whole events), and
+/// Shift+/ as '/' with SHIFT; legacy terminals and Windows send 'A' and '?'.
+fn command_char(key: &CtKeyEvent) -> Option<char> {
+    let CtKeyCode::Char(c) = key.code else {
+        return None;
+    };
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        if c.is_ascii_lowercase() {
+            return Some(c.to_ascii_uppercase());
+        }
+        if c == '/' {
+            return Some('?');
+        }
+    }
+    Some(c)
+}
+
+/// Map a terminal keystroke to a command.
+///
+/// The rule, also shown in the help panel and README:
+/// - while the auto test runs, every key is test input except Ctrl+N (skip
+///   step) and Ctrl+C (abort);
+/// - everywhere else Tab / Shift+Tab switch views, Esc and Ctrl+C quit, and
+///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export;
+/// - single-key commands (q, Space, r, R, e, A, S, t, m, ?, 1-9/0) only work
+///   on the Dashboard, Auto and Help screens; in the key-test views every
+///   other key is test input, apart from the view's own action keys (v on
+///   Virtual; a, f, c on OEM/FN).
+fn command_for_key(
+    key: &CtKeyEvent,
+    view: AppView,
+    auto_test_running: bool,
+    shortcuts_enabled: bool,
+) -> Command {
+    // Controls only fire on the initial press, never on repeat or release.
+    if key.kind != KeyEventKind::Press {
+        return Command::None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let ch = command_char(key);
+    let ctrl_char = if ctrl {
+        ch.map(|c| c.to_ascii_lowercase())
+    } else {
+        None
+    };
+
+    // Ctrl+C: abort a running auto test, otherwise quit.
+    if ctrl_char == Some('c') {
+        return if auto_test_running {
+            Command::AbortAutoTest
+        } else {
+            Command::Quit
+        };
+    }
+
+    // While the auto test runs, every key is test input: only the two
+    // Ctrl chords are interpreted, so 'q', 'r', Esc... can be verified like
+    // any other key.
+    if auto_test_running {
+        return if ctrl_char == Some('n') {
+            Command::SkipAutoStep
+        } else {
+            Command::None
+        };
+    }
+
+    // Ctrl chords work in every view. Ctrl+Alt is AltGr on Windows, which
+    // types characters on many layouts, so it is never a command.
+    if ctrl {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return Command::None;
+        }
+        return match ctrl_char {
+            Some('p') => Command::TogglePause,
+            Some('r') => Command::ResetCurrent,
+            Some('e') => Command::Export,
+            _ => Command::None,
+        };
+    }
+
+    // Settings view has its own key handling
+    if view == AppView::Settings {
+        return match key.code {
+            CtKeyCode::Char('q') | CtKeyCode::Esc => Command::SettingsBack,
+            CtKeyCode::Up => Command::SettingsUp,
+            CtKeyCode::Down => Command::SettingsDown,
+            CtKeyCode::Right => Command::SettingsIncrease,
+            CtKeyCode::Left => Command::SettingsDecrease,
+            CtKeyCode::Char('s') => Command::SettingsSave,
+            CtKeyCode::Tab => Command::NextView,
+            CtKeyCode::BackTab => Command::PrevView,
+            _ => Command::None,
+        };
+    }
+
+    match key.code {
+        CtKeyCode::Esc => return Command::Quit,
+        CtKeyCode::BackTab => return Command::PrevView,
+        CtKeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => return Command::PrevView,
+        CtKeyCode::Tab => return Command::NextView,
+        _ => {}
+    }
+
+    let Some(c) = ch else {
+        return Command::None;
+    };
+
+    if is_key_test_view(view) {
+        return match (view, c) {
+            (AppView::Virtual, 'v') => Command::SendVirtualKeys,
+            (AppView::OemKeys, 'a') => Command::AddOemMapping,
+            (AppView::OemKeys, 'f') => Command::CycleFnMode,
+            (AppView::OemKeys, 'c') => Command::ClearOemMappings,
+            _ => Command::None,
+        };
+    }
+
+    // Dashboard, Auto and Help: single-key commands
+    match c {
+        'q' => Command::Quit,
+        ' ' => Command::TogglePause,
+        'r' => Command::ResetCurrent,
+        'R' => Command::ResetAll,
+        'e' => Command::Export,
+        'A' => Command::StartAutoTest,
+        'S' => Command::ShowView(AppView::Settings),
+        '?' => Command::ShowView(AppView::Help),
+        'm' => Command::ToggleShortcuts,
+        't' => Command::ToggleTheme,
+        '1'..='9' | '0' if shortcuts_enabled => {
+            // 1-9 are the first nine tabs, 0 the tenth (Auto)
+            let index = c.to_digit(10).map_or(0, |d| (d as usize + 9) % 10);
+            Command::ShowView(AppView::from_index(index))
+        }
+        _ => Command::None,
+    }
 }
 
 /// Feed a terminal key event to the test pipeline and handle UI controls.
@@ -638,16 +903,18 @@ fn handle_terminal_key(
     use_evdev: bool,
     key: CtKeyEvent,
 ) {
-    // The keystroke that starts the auto test must not be counted by the
-    // test it starts (it would show up as phantom input in the idle step).
-    let starts_auto_test = key.kind == KeyEventKind::Press
-        && key.code == CtKeyCode::Char('A')
-        && !app.auto_test_running()
-        && app.view != AppView::Settings;
+    let command = command_for_key(
+        &key,
+        app.view,
+        app.auto_test_running(),
+        app.shortcuts_enabled,
+    );
 
     // When evdev is not in use, the terminal is the test input. Presses,
     // repeats and releases each mean something different to the tests.
-    if !use_evdev && !starts_auto_test {
+    // The keystroke that starts the auto test must not be counted by the
+    // test it starts (it would show up as phantom input in the idle step).
+    if !use_evdev && command != Command::StartAutoTest {
         match key.kind {
             KeyEventKind::Press => {
                 listener.send_press(key.code);
@@ -659,121 +926,25 @@ fn handle_terminal_key(
         }
     }
 
-    // Controls only fire on the initial press, never on repeat or release.
-    if key.kind != KeyEventKind::Press {
-        return;
-    }
+    apply_command(app, command);
+}
 
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-    // Ctrl+C: abort a running auto test, otherwise quit.
-    if ctrl && matches!(key.code, CtKeyCode::Char('c') | CtKeyCode::Char('C')) {
-        if app.auto_test_running() {
-            app.abort_auto_test();
-        } else {
-            app.quit();
-        }
-        return;
-    }
-
-    // While the auto test runs, every key is test input: only the two
-    // Ctrl chords above/below are interpreted, so 'q', 'r', Esc... can be
-    // verified like any other key.
-    if app.auto_test_running() {
-        if ctrl && matches!(key.code, CtKeyCode::Char('n') | CtKeyCode::Char('N')) {
-            app.skip_auto_step();
-        }
-        return;
-    }
-
-    // Settings view has its own key handling
-    if app.view == AppView::Settings {
-        match key.code {
-            CtKeyCode::Char('q') | CtKeyCode::Esc => {
-                app.view = AppView::Dashboard; // Back to dashboard
-            }
-            CtKeyCode::Up => {
-                if app.settings_selected > 0 {
-                    app.settings_selected -= 1;
-                }
-            }
-            CtKeyCode::Down => {
-                let item_count = app.settings_items().len();
-                if app.settings_selected + 1 < item_count {
-                    app.settings_selected += 1;
-                }
-            }
-            CtKeyCode::Right => {
-                app.adjust_setting(true);
-            }
-            CtKeyCode::Left => {
-                app.adjust_setting(false);
-            }
-            CtKeyCode::Char('s') => {
-                app.save_config();
-            }
-            CtKeyCode::Tab => {
-                app.next_view();
-            }
-            _ => {}
-        }
-        return;
-    }
-
-    match key.code {
-        CtKeyCode::Char('q') | CtKeyCode::Esc => {
-            app.quit();
-        }
-        CtKeyCode::BackTab => {
-            app.prev_view();
-        }
-        CtKeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.prev_view();
-        }
-        CtKeyCode::Tab => {
-            app.next_view();
-        }
-        CtKeyCode::Char('m') => app.toggle_shortcuts(),
-        CtKeyCode::Char('t') => app.toggle_theme(),
-        CtKeyCode::Char('S') => {
-            app.view = AppView::Settings;
-        }
-        CtKeyCode::Char('A') => app.start_auto_test(),
-        CtKeyCode::Char('1') if app.shortcuts_enabled => app.view = AppView::Dashboard,
-        CtKeyCode::Char('2') if app.shortcuts_enabled => app.view = AppView::PollingRate,
-        CtKeyCode::Char('3') if app.shortcuts_enabled => app.view = AppView::HoldRelease,
-        CtKeyCode::Char('4') if app.shortcuts_enabled => app.view = AppView::Stickiness,
-        CtKeyCode::Char('5') if app.shortcuts_enabled => app.view = AppView::Rollover,
-        CtKeyCode::Char('6') if app.shortcuts_enabled => app.view = AppView::Latency,
-        CtKeyCode::Char('7') if app.shortcuts_enabled => app.view = AppView::Shortcuts,
-        CtKeyCode::Char('8') if app.shortcuts_enabled => app.view = AppView::Virtual,
-        CtKeyCode::Char('9') if app.shortcuts_enabled => app.view = AppView::OemKeys,
-        CtKeyCode::Char('0') if app.shortcuts_enabled => app.view = AppView::AutoTest,
-        CtKeyCode::Char('v') => {
-            if app.view == AppView::Virtual {
-                app.virtual_test.request_virtual_test();
-            }
-        }
-        CtKeyCode::Char('a') => {
-            if app.view == AppView::OemKeys {
-                app.add_oem_mapping_for_last_unknown();
-            }
-        }
-        CtKeyCode::Char('f') => {
-            if app.view == AppView::OemKeys {
-                app.cycle_fn_mode();
-            }
-        }
-        CtKeyCode::Char('c') => {
-            if app.view == AppView::OemKeys {
-                app.clear_oem_mappings();
-            }
-        }
-        CtKeyCode::Char('?') => app.view = AppView::Help,
-        CtKeyCode::Char(' ') => app.toggle_pause(),
-        CtKeyCode::Char('r') => app.reset_current(),
-        CtKeyCode::Char('R') => app.reset_all(),
-        CtKeyCode::Char('e') => {
+/// Carry out a command.
+fn apply_command(app: &mut App, command: Command) {
+    let view_before = app.view;
+    match command {
+        Command::None => {}
+        Command::Quit => app.quit(),
+        Command::AbortAutoTest => app.abort_auto_test(),
+        Command::SkipAutoStep => app.skip_auto_step(),
+        Command::NextView => app.next_view(),
+        Command::PrevView => app.prev_view(),
+        Command::ShowView(view) => app.view = view,
+        Command::StartAutoTest => app.start_auto_test(),
+        Command::TogglePause => app.toggle_pause(),
+        Command::ResetCurrent => app.reset_current(),
+        Command::ResetAll => app.reset_all(),
+        Command::Export => {
             let filename = {
                 use std::time::SystemTime;
                 let secs = SystemTime::now()
@@ -790,6 +961,297 @@ fn handle_terminal_key(
                 }
             }
         }
-        _ => {}
+        Command::ToggleShortcuts => app.toggle_shortcuts(),
+        Command::ToggleTheme => app.toggle_theme(),
+        Command::SendVirtualKeys => app.virtual_test.request_virtual_test(),
+        Command::AddOemMapping => app.add_oem_mapping_for_last_unknown(),
+        Command::CycleFnMode => app.cycle_fn_mode(),
+        Command::ClearOemMappings => app.clear_oem_mappings(),
+        Command::SettingsBack => app.view = AppView::Dashboard,
+        Command::SettingsUp => {
+            if app.settings_selected > 0 {
+                app.settings_selected -= 1;
+            }
+        }
+        Command::SettingsDown => {
+            let item_count = app.settings_items().len();
+            if app.settings_selected + 1 < item_count {
+                app.settings_selected += 1;
+            }
+        }
+        Command::SettingsIncrease => app.adjust_setting(true),
+        Command::SettingsDecrease => app.adjust_setting(false),
+        Command::SettingsSave => app.save_config(),
+    }
+    // Entering a key-test view: say how commands work there
+    if app.view != view_before && is_key_test_view(app.view) {
+        app.set_status(TEST_VIEW_HINT.to_string());
+    }
+}
+
+/// Main-loop frame interval for a refresh rate read from the config.
+///
+/// The config file is hand-editable, so 0 Hz (division by zero) and absurd
+/// rates (a busy loop) are clamped to 1-1000 Hz.
+fn frame_interval(refresh_rate_hz: u32) -> Duration {
+    Duration::from_micros(1_000_000 / u64::from(refresh_rate_hz.clamp(1, 1000)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: CtKeyCode, modifiers: KeyModifiers) -> CtKeyEvent {
+        CtKeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
+    }
+
+    fn plain(c: char) -> CtKeyEvent {
+        press(CtKeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> CtKeyEvent {
+        press(CtKeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Legacy terminals and Windows: Shift+a arrives as 'A' with SHIFT
+    fn legacy_shift(c: char) -> CtKeyEvent {
+        press(CtKeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    /// Kitty keyboard protocol: Shift+a arrives as the base key 'a' with SHIFT
+    fn kitty_shift(c: char) -> CtKeyEvent {
+        press(CtKeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    fn cmd(key: CtKeyEvent, view: AppView) -> Command {
+        command_for_key(&key, view, false, true)
+    }
+
+    const TEST_VIEWS: [AppView; 8] = [
+        AppView::PollingRate,
+        AppView::HoldRelease,
+        AppView::Stickiness,
+        AppView::Rollover,
+        AppView::Latency,
+        AppView::Shortcuts,
+        AppView::Virtual,
+        AppView::OemKeys,
+    ];
+
+    #[test]
+    fn mashing_keys_in_test_views_never_triggers_commands() {
+        // Every printable key a user may hit while testing, plain and shifted
+        let mut keys: Vec<CtKeyEvent> = "abcdefghijklmnopqrstuvwxyz0123456789 -=[];',./`\\"
+            .chars()
+            .flat_map(|c| [plain(c), kitty_shift(c)])
+            .collect();
+        keys.extend("ASRE?!@QZ".chars().map(legacy_shift));
+        keys.extend(
+            [
+                CtKeyCode::Enter,
+                CtKeyCode::Backspace,
+                CtKeyCode::Up,
+                CtKeyCode::F(5),
+            ]
+            .map(|k| press(k, KeyModifiers::NONE)),
+        );
+        for view in TEST_VIEWS {
+            for key in &keys {
+                let command = cmd(*key, view);
+                let view_action = matches!(
+                    (view, key.code),
+                    (AppView::Virtual, CtKeyCode::Char('v'))
+                        | (AppView::OemKeys, CtKeyCode::Char('a' | 'f' | 'c'))
+                ) && key.modifiers.is_empty();
+                assert!(
+                    command == Command::None || view_action,
+                    "{:?} in {:?} gave {:?}",
+                    key,
+                    view,
+                    command
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_views_keep_navigation_quit_and_ctrl_commands() {
+        for view in TEST_VIEWS {
+            assert_eq!(
+                cmd(press(CtKeyCode::Esc, KeyModifiers::NONE), view),
+                Command::Quit
+            );
+            assert_eq!(cmd(ctrl('c'), view), Command::Quit);
+            assert_eq!(
+                cmd(press(CtKeyCode::Tab, KeyModifiers::NONE), view),
+                Command::NextView
+            );
+            assert_eq!(
+                cmd(press(CtKeyCode::BackTab, KeyModifiers::SHIFT), view),
+                Command::PrevView
+            );
+            assert_eq!(
+                cmd(press(CtKeyCode::Tab, KeyModifiers::SHIFT), view),
+                Command::PrevView
+            );
+            assert_eq!(cmd(ctrl('p'), view), Command::TogglePause);
+            assert_eq!(cmd(ctrl('r'), view), Command::ResetCurrent);
+            assert_eq!(cmd(ctrl('e'), view), Command::Export);
+        }
+        assert_eq!(cmd(plain('v'), AppView::Virtual), Command::SendVirtualKeys);
+        assert_eq!(cmd(plain('a'), AppView::OemKeys), Command::AddOemMapping);
+        assert_eq!(cmd(plain('f'), AppView::OemKeys), Command::CycleFnMode);
+        assert_eq!(cmd(plain('c'), AppView::OemKeys), Command::ClearOemMappings);
+    }
+
+    #[test]
+    fn overview_screens_keep_single_key_commands() {
+        for view in [AppView::Dashboard, AppView::AutoTest, AppView::Help] {
+            assert_eq!(cmd(plain('q'), view), Command::Quit);
+            assert_eq!(cmd(plain(' '), view), Command::TogglePause);
+            assert_eq!(cmd(plain('r'), view), Command::ResetCurrent);
+            assert_eq!(cmd(plain('e'), view), Command::Export);
+            assert_eq!(cmd(plain('m'), view), Command::ToggleShortcuts);
+            assert_eq!(cmd(plain('t'), view), Command::ToggleTheme);
+            assert_eq!(cmd(plain('5'), view), Command::ShowView(AppView::Rollover));
+            assert_eq!(cmd(plain('1'), view), Command::ShowView(AppView::Dashboard));
+            assert_eq!(cmd(plain('0'), view), Command::ShowView(AppView::AutoTest));
+            // View actions belong to their views only
+            assert_eq!(cmd(plain('v'), view), Command::None);
+            assert_eq!(cmd(plain('a'), view), Command::None);
+        }
+        // Number keys freed with 'm'
+        assert_eq!(
+            command_for_key(&plain('5'), AppView::Dashboard, false, false),
+            Command::None
+        );
+    }
+
+    #[test]
+    fn shifted_commands_work_with_legacy_and_kitty_terminals() {
+        // (legacy/Windows character, kitty base key) for the same keystroke
+        for (legacy, kitty, expected) in [
+            ('A', 'a', Command::StartAutoTest),
+            ('S', 's', Command::ShowView(AppView::Settings)),
+            ('R', 'r', Command::ResetAll),
+            ('?', '/', Command::ShowView(AppView::Help)),
+        ] {
+            assert_eq!(cmd(legacy_shift(legacy), AppView::Dashboard), expected);
+            assert_eq!(cmd(kitty_shift(kitty), AppView::Dashboard), expected);
+            assert_eq!(cmd(kitty_shift(kitty), AppView::AutoTest), expected);
+        }
+        // Ctrl+Shift chords are still Ctrl chords
+        assert_eq!(
+            cmd(
+                press(
+                    CtKeyCode::Char('c'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                AppView::Rollover
+            ),
+            Command::Quit
+        );
+    }
+
+    #[test]
+    fn running_auto_test_captures_every_key() {
+        let run = |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, true, true);
+        for key in [
+            plain('q'),
+            plain(' '),
+            plain('A'),
+            legacy_shift('A'),
+            press(CtKeyCode::Esc, KeyModifiers::NONE),
+            press(CtKeyCode::Tab, KeyModifiers::NONE),
+            ctrl('p'),
+            ctrl('r'),
+            ctrl('e'),
+        ] {
+            assert_eq!(run(key), Command::None, "{:?}", key);
+        }
+        assert_eq!(run(ctrl('n')), Command::SkipAutoStep);
+        assert_eq!(run(ctrl('c')), Command::AbortAutoTest);
+    }
+
+    #[test]
+    fn only_key_presses_are_commands() {
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let key = CtKeyEvent::new_with_kind(CtKeyCode::Esc, KeyModifiers::NONE, kind);
+            assert_eq!(cmd(key, AppView::Dashboard), Command::None);
+        }
+    }
+
+    #[test]
+    fn altgr_and_unmapped_characters_are_never_commands() {
+        // AltGr is Ctrl+Alt on Windows; Ctrl+Q is not a command
+        let altgr = press(
+            CtKeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(cmd(altgr, AppView::Rollover), Command::None);
+        assert_eq!(cmd(ctrl('q'), AppView::Dashboard), Command::None);
+        for c in ['é', 'ß', 'ü', '€', 'ñ'] {
+            for view in [AppView::Dashboard, AppView::Rollover, AppView::Settings] {
+                assert_eq!(cmd(plain(c), view), Command::None);
+                assert_eq!(cmd(kitty_shift(c), view), Command::None);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_view_keys() {
+        let v = AppView::Settings;
+        assert_eq!(cmd(plain('q'), v), Command::SettingsBack);
+        assert_eq!(
+            cmd(press(CtKeyCode::Esc, KeyModifiers::NONE), v),
+            Command::SettingsBack
+        );
+        assert_eq!(cmd(plain('s'), v), Command::SettingsSave);
+        assert_eq!(
+            cmd(press(CtKeyCode::Right, KeyModifiers::NONE), v),
+            Command::SettingsIncrease
+        );
+        assert_eq!(
+            cmd(press(CtKeyCode::Tab, KeyModifiers::NONE), v),
+            Command::NextView
+        );
+        assert_eq!(cmd(ctrl('c'), v), Command::Quit);
+    }
+
+    #[test]
+    fn entering_a_test_view_shows_the_command_hint() {
+        let mut app = App::default();
+        apply_command(&mut app, Command::ShowView(AppView::Rollover));
+        assert_eq!(app.get_status(), Some(TEST_VIEW_HINT));
+        // Mashing keys there leaves the app running and data intact
+        app.process_event(&keyboard_testkit::keyboard::KeyEvent::new(
+            keyboard_testkit::keyboard::KeyCode(16),
+            keyboard_testkit::keyboard::KeyEventType::Press,
+            std::time::Instant::now(),
+            0,
+        ));
+        for c in "qre ".chars() {
+            let command = cmd(plain(c), app.view);
+            apply_command(&mut app, command);
+        }
+        assert_eq!(app.state, AppState::Running);
+        assert_eq!(app.total_events, 1);
+    }
+
+    #[test]
+    fn frame_interval_follows_refresh_rate_and_survives_bad_values() {
+        assert_eq!(frame_interval(60), Duration::from_micros(16_666));
+        assert_eq!(frame_interval(120), Duration::from_micros(8_333));
+        // refresh_rate_hz = 0 in a hand-edited config used to divide by zero
+        assert_eq!(frame_interval(0), Duration::from_secs(1));
+        assert_eq!(frame_interval(u32::MAX), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn disconnects_are_reported_as_an_issue() {
+        assert!(disconnect_finding(0).is_none());
+        let finding = disconnect_finding(2).unwrap();
+        assert!(finding.is_issue());
+        assert!(finding.title.contains("2 time(s)"));
     }
 }

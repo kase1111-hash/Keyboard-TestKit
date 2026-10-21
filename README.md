@@ -122,11 +122,14 @@ keyboard-testkit
 
 On Linux, run with `sudo` (or add your user to the `input` group) so the app
 can read the keyboard through evdev: that gives raw scancodes, kernel
-timestamps and real key-release events. Without it the terminal is used as
-the input source; terminals that speak the kitty keyboard protocol (kitty,
-WezTerm, foot, Ghostty, Alacritty 0.13+) still report key releases, other
-terminals only report presses and releases are synthesized after a short
-timeout.
+timestamps and real key-release events. If a keyboard is unplugged or a
+wireless keyboard loses its link, the status line says so (a running auto
+test stops) and the keyboard is picked up again when it comes back. Without
+evdev the terminal is used as the input source; terminals that speak the kitty
+keyboard protocol (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+) still report
+key releases, other terminals only report presses: a repeated key within
+200 ms is counted as a new press, a held key is recognised by its autorepeat,
+and releases are estimated, so hold times and rollover cannot be measured.
 
 ### Automatic Diagnostic
 
@@ -149,27 +152,31 @@ exported report and on stdout when you quit.
 
 ### Keyboard Controls
 
-| Key | Action |
-|-----|--------|
-| `Tab` | Next test view |
-| `Shift+Tab` | Previous test view |
-| `1-9`, `0` | Jump to specific view |
-| `m` | Toggle menu shortcuts (free number keys for testing) |
-| `A` | Run the automatic diagnostic |
-| `Ctrl+N` | Skip the current auto-test step |
-| `Ctrl+C` | Abort the auto test (quits when no test is running) |
-| `Space` | Pause/resume testing |
-| `r` | Reset current test |
-| `R` | Reset all tests |
-| `e` | Export report to JSON |
-| `v` | Send virtual keys (on Virtual view) |
-| `a` | Add last unknown key as FN scancode (on OEM/FN view) |
-| `f` | Cycle FN key mode (on OEM/FN view) |
-| `c` | Clear OEM key mappings (on OEM/FN view) |
-| `S` | Settings |
-| `t` | Toggle dark/light theme |
-| `?` | Show help |
-| `q` / `Esc` | Quit |
+Keys you press while testing never trigger a command by accident: in the test
+views (Polling ... OEM/FN, `2`-`9`) every key is test input except `Tab`,
+`Esc` and `Ctrl` chords. Single-key commands only work on the Dashboard, Auto
+and Help screens.
+
+| Key | Where | Action |
+|-----|-------|--------|
+| `Tab` / `Shift+Tab` | Any view | Next / previous view |
+| `Esc` / `Ctrl+C` | Any view | Quit (`Ctrl+C` aborts a running auto test) |
+| `Ctrl+P` | Any view | Pause/resume testing |
+| `Ctrl+R` | Any view | Reset the current test |
+| `Ctrl+E` | Any view | Export report to JSON |
+| `v` | Virtual view | Send virtual keys |
+| `a` / `f` / `c` | OEM/FN view | Add last unknown key as FN scancode / cycle FN key mode / clear OEM key mappings |
+| `A` | Dashboard, Auto, Help | Run the automatic diagnostic |
+| `Ctrl+N` | Auto test running | Skip the current auto-test step |
+| `1-9`, `0` | Dashboard, Auto, Help | Jump to specific view |
+| `m` | Dashboard, Auto, Help | Toggle menu shortcuts (free number keys for testing) |
+| `Space` | Dashboard, Auto, Help | Pause/resume testing |
+| `r` / `R` | Dashboard, Auto, Help | Reset current test / all tests |
+| `e` | Dashboard, Auto, Help | Export report to JSON |
+| `S` | Dashboard, Auto, Help | Settings (`q`/`Esc` returns) |
+| `t` | Dashboard, Auto, Help | Toggle dark/light theme |
+| `?` | Dashboard, Auto, Help | Show help |
+| `q` | Dashboard, Auto, Help | Quit |
 
 ### Test Views
 
@@ -209,7 +216,7 @@ The Virtual Keyboard test helps isolate issues:
 
 ## Export
 
-Press `e` to export a JSON report with results from all 8 tests (polling, bounce, stickiness, rollover, timing, shortcuts, virtual, and OEM/FN) plus the diagnostic findings:
+Press `Ctrl+E` (or `e` on the Dashboard, Auto and Help screens) to export a JSON report with results from all 8 tests (polling, bounce, stickiness, rollover, timing, shortcuts, virtual, and OEM/FN) plus the diagnostic findings:
 
 ```json
 {

@@ -129,14 +129,16 @@ Config file locations:
 
 ### UI Controls
 
-- Tab/Shift+Tab: Navigate views
-- 1-9, 0: Direct view access (0 = Auto; Help via `?`)
-- A: Start the auto test (Ctrl+N skips a step, Ctrl+C aborts). While it runs,
-  every other key is test input and no shortcuts fire
-- Space: Pause/Resume
-- r/R: Reset current/all tests
-- e: Export JSON report
-- q/Esc/Ctrl+C: Quit
+- Any view: Tab/Shift+Tab navigate, Esc/Ctrl+C quit, Ctrl+P pause,
+  Ctrl+R reset current test, Ctrl+E export JSON report
+- Test views (Polling ... OEM/FN): every other key is test input, except the
+  view's own action keys (v on Virtual; a, f, c on OEM/FN)
+- Dashboard, Auto and Help also take single keys: 1-9, 0 jump to a view,
+  A starts the auto test, Space pause, r/R reset current/all, e export,
+  q quit, S settings, t theme, m number keys, ? help
+- While the auto test runs every key is test input except Ctrl+N (skip a
+  step) and Ctrl+C (abort)
+- Key handling is decided by `command_for_key` in main.rs (unit-tested)
 
 ### Build Profile
 
