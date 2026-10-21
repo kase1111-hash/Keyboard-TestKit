@@ -462,6 +462,10 @@ struct OpenDevice {
     /// Keys the kernel reported down when the device was opened, not yet
     /// handed to the listener
     down_at_open: Vec<u16>,
+    /// A moment before the key state was read: when the keys in
+    /// `down_at_open` are known to have been down. Any event read from the
+    /// device happened after it, so their releases sort after their presses.
+    opened_at: Instant,
     /// Whether the device has delivered key events (see
     /// [`EvdevDeviceChange::Disconnected`])
     typed: bool,
@@ -469,6 +473,7 @@ struct OpenDevice {
 
 /// Open an evdev device for non-blocking reads with monotonic timestamps.
 fn open_device(path: &Path) -> io::Result<OpenDevice> {
+    let opened_at = Instant::now();
     let file = File::open(path)?;
     // Set non-blocking mode
     let fd = file.as_raw_fd();
@@ -502,6 +507,7 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
         clock,
         decoder,
         down_at_open,
+        opened_at,
         typed: false,
     })
 }
@@ -663,18 +669,21 @@ impl EvdevListener {
             typed_names: HashSet::new(),
         };
         for device in devices {
-            listener.add_device(device, Instant::now());
+            listener.add_device(device);
         }
         listener
     }
 
     /// Start reading `device`. Keys it already holds are reported pressed
-    /// at `now` (the moment they were found down).
-    fn add_device(&mut self, mut device: OpenDevice, now: Instant) {
+    /// as of when it was opened: not later, when the listener gets to it (at
+    /// startup only after every other device was opened), or a release read
+    /// meanwhile would sort before its press and leave the key down for good
+    /// (the Enter that launched the app, still held as the keyboard opens).
+    fn add_device(&mut self, mut device: OpenDevice) {
         for code in std::mem::take(&mut device.down_at_open) {
             device.typed = true;
             if self.pressed_keys.insert(code) {
-                self.queued.push((now, code, true));
+                self.queued.push((device.opened_at, code, true));
             }
         }
         if device.typed {
@@ -843,7 +852,7 @@ impl EvdevListener {
                     path: device.path.clone(),
                     name: device.name.clone(),
                 });
-                self.add_device(device, Instant::now());
+                self.add_device(device);
             }
         }
     }
@@ -1260,6 +1269,7 @@ mod tests {
             clock: EventClock::Monotonic,
             decoder: DeviceDecoder::default(),
             down_at_open: Vec::new(),
+            opened_at: Instant::now(),
             typed: false,
         })
     }
@@ -1299,6 +1309,48 @@ mod tests {
             EvdevListener::with_devices(tx, vec![fake_device("/dev/input/event-t2").unwrap()]);
         assert_eq!(listener.poll(), 0);
         assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn a_key_released_while_the_devices_open_is_not_left_down() {
+        // `sudo keyboard-testkit` + Enter: Enter is still down when the
+        // keyboard is opened, and comes up while the other devices are being
+        // opened, before the listener starts. Its release must follow its
+        // press, or the app sees Enter go down for good (a "Stuck key").
+        let mut device = fake_device_holding("/dev/input/event-t3", &[28]);
+        std::thread::sleep(Duration::from_millis(2));
+        let us = monotonic_now_us();
+        let at = |event_type, code, value| InputEvent {
+            tv_sec: (us / 1_000_000) as i64,
+            tv_usec: (us % 1_000_000) as i64,
+            event_type,
+            code,
+            value,
+        };
+        let mut bytes = Vec::new();
+        for ev in [at(EV_KEY, 28, 0), at(EV_SYN, SYN_REPORT, 0)] {
+            // SAFETY: InputEvent is #[repr(C)] plain data, read back the
+            // same way by read_raw_events
+            bytes.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(&ev as *const InputEvent as *const u8, INPUT_EVENT_SIZE)
+            });
+        }
+        let file = std::env::temp_dir().join(format!("kt-evdev-{}", std::process::id()));
+        fs::write(&file, &bytes).unwrap();
+        device.file = File::open(&file).unwrap();
+        let _ = fs::remove_file(&file);
+        // ...more devices are opened before the listener is created
+        std::thread::sleep(Duration::from_millis(2));
+        let (tx, rx) = mpsc::channel();
+        let mut listener = EvdevListener::with_devices(tx, vec![device]);
+        assert_eq!(listener.poll(), 2);
+        let events: Vec<(u16, KeyEventType)> =
+            rx.try_iter().map(|e| (e.key.0, e.event_type)).collect();
+        assert_eq!(
+            events,
+            vec![(28, KeyEventType::Press), (28, KeyEventType::Release)]
+        );
+        assert!(listener.pressed_keys().is_empty());
     }
 
     #[test]
