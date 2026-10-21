@@ -61,15 +61,20 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
 |---------------|---------|
 | Hold Times | Per-key hold durations (needs real key releases) |
 | Release Accuracy | Verify single key-up event on release |
-| Bounce Detection | Same key re-pressed less than 20-40 ms (configurable) after its release, or less than 40 ms after its press; evdev kernel timestamps only |
+| Bounce Detection | Same key re-pressed less than 20-40 ms (configurable) after its release, or less than 40 ms after its press, with the hold before it or the re-press's own hold under 20 ms (judged when the re-press ends); evdev kernel timestamps only |
 | Press Rate | Presses per second of any keys (typing pace) |
 
 **Implementation Requirements:**
 - Display real-time hold duration counter
 - Detect key bounce from kernel timestamps; keys whose releases come from
   the driver (laptop hotkeys with a force-release quirk) are not judged
-- A single bounce is a warning (a delayed wireless report looks the same);
-  a key that bounces again is a fault
+- A fast re-press between two finger-length holds is not a bounce: a
+  wireless link can deliver a late release together with the next press
+- A single bounce is a warning; a key that bounces again is a fault, except
+  on a wireless keyboard (Bluetooth bus type from `EVIOCGID`, a receiver
+  name, or a HID device paired behind a receiver), where a radio stall that
+  delivers a whole keystroke at once looks the same: it stays a warning that
+  says so
 
 > **Current status:** autorepeat rate and delay are not measured (evdev and
 > the terminal listener drop autorepeat events), and there is no waveform

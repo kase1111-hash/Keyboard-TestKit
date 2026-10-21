@@ -881,7 +881,7 @@ fn live_findings_detect_switch_bounce_without_running_auto_test() {
     };
     bounce_at(&mut app, t0);
     app.refresh_findings();
-    // Once may be a delayed wireless report: worth a look, worded as such
+    // Once is worth a look, worded as a condition
     let bounce = app
         .findings
         .iter()
@@ -908,6 +908,51 @@ fn live_findings_detect_switch_bounce_without_running_auto_test() {
     assert!(report.to_csv().contains("Diagnostics,Switch bounce"));
     assert!(report.to_markdown().contains("## Diagnostics"));
     assert!(report.to_text().contains("DIAGNOSTICS"));
+}
+
+#[test]
+fn bounce_on_a_wireless_keyboard_is_worded_for_the_radio_until_reset() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let t0 = Instant::now();
+    let us = Duration::from_micros;
+    // Two radio stalls that each delivered a whole tap of A at once
+    let stall_at = |app: &mut App, at: Instant| {
+        app.note_wireless_keys(&[KeyCode(30)]);
+        let burst = at + Duration::from_millis(150);
+        app.process_event(&timed(30, KeyEventType::Press, at, 0));
+        app.process_event(&timed(30, KeyEventType::Release, burst, 0));
+        app.process_event(&timed(30, KeyEventType::Press, burst + us(80), 0));
+        app.process_event(&timed(30, KeyEventType::Release, burst + us(160), 0));
+    };
+    stall_at(&mut app, t0);
+    stall_at(&mut app, t0 + Duration::from_millis(500));
+    app.refresh_findings();
+    let bounce = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(bounce.severity, Severity::Warning);
+    assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
+
+    // Retested on the cable after a reset: a key that chatters twice is a fault
+    app.reset_all();
+    for at in [t0 + Duration::from_secs(2), t0 + Duration::from_secs(3)] {
+        let ms = Duration::from_millis;
+        app.process_event(&timed(30, KeyEventType::Press, at, 0));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(80), 0));
+        app.process_event(&timed(30, KeyEventType::Press, at + ms(83), 0));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(86), 0));
+    }
+    app.refresh_findings();
+    let bounce = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(bounce.severity, Severity::Critical);
+    assert!(!bounce.advice.contains("wireless"), "{}", bounce.advice);
 }
 
 #[test]

@@ -12,8 +12,9 @@ fn at(key: u16, kind: KeyEventType, when: Instant, delta_us: u64) -> KeyEvent {
 }
 
 /// A worn 'E' switch on a 125 Hz keyboard: one keystroke registers twice,
-/// 16 ms after the release (two reports), plus 30 quick taps for the polling
-/// view. Every event lands on the keyboard's 8 ms report grid.
+/// the contact closing again 16 ms after the release (two reports) for one
+/// report, plus 30 quick taps for the polling view. Every event lands on the
+/// keyboard's 8 ms report grid.
 fn feed_chattering_key_and_taps(app: &mut App) {
     let t0 = Instant::now();
     app.process_event(&at(18, KeyEventType::Press, t0, 0));
@@ -32,8 +33,8 @@ fn feed_chattering_key_and_taps(app: &mut App) {
     app.process_event(&at(
         18,
         KeyEventType::Release,
-        t0 + Duration::from_millis(152),
-        64_000,
+        t0 + Duration::from_millis(96),
+        8_000,
     ));
     let mut when = t0 + Duration::from_millis(400);
     for i in 0..30u64 {

@@ -25,10 +25,43 @@ pub const MIN_BOUNCE_WINDOW_MS: u64 = 20;
 /// healthy key under a quick typist.
 pub const MAX_BOUNCE_WINDOW_MS: u64 = 40;
 
-/// Two presses of the same key closer than this are chatter whatever the
+/// Two presses of the same key closer than this are suspect whatever the
 /// release in between looked like: 40 ms is a 25 Hz tap rate, while the
 /// fastest same-key tapping is ~10-15 Hz (65 ms or more per tap).
 pub const CHATTER_PRESS_GAP_MS: u64 = 40;
+
+/// A key down for less than this was not held by a finger. Deliberate
+/// keystrokes stay down for tens of ms: typists' shortest holds are ~30-40
+/// ms, and even two-finger drumming on one key at ~15 Hz keeps it down
+/// 25 ms or more. Chatter that gets past firmware debounce closes the
+/// contact for one or two reports: 1-15 ms at 1000 Hz (past a ~5 ms
+/// debounce), 8 or 16 ms at 125 Hz.
+///
+/// A suspect re-press is only chatter when the keystroke before it or the
+/// re-press itself is this short. A radio link (Bluetooth, a 2.4 GHz
+/// receiver) can hold a release back and deliver it together with the next
+/// press, so a fast double letter arrives with no gap at all; its two holds
+/// are still a finger's.
+pub const MIN_FINGER_HOLD_MS: u64 = 20;
+
+/// Whether a suspect re-press (see [`is_chatter_press`]) shows a switch
+/// artefact: a contact no finger makes, either the keystroke that ended just
+/// before it (`previous_hold`, a press bounce) or its own (`repress_hold`, a
+/// release bounce). `None` is a hold not known (yet): the re-press is still
+/// down, and one already held [`MIN_FINGER_HOLD_MS`] is a finger's.
+pub fn is_switch_chatter(previous_hold: Option<Duration>, repress_hold: Option<Duration>) -> bool {
+    let short = |hold: Duration| hold < Duration::from_millis(MIN_FINGER_HOLD_MS);
+    previous_hold.is_some_and(short) || repress_hold.is_some_and(short)
+}
+
+/// Whether `bounces` on one key are a switch fault rather than something to
+/// check again. Once is worth a look but not yet a pattern. Over a wireless
+/// link nothing is conclusive: a radio stall that ends by delivering a whole
+/// keystroke (release, press, release) at once has the shape of a release
+/// bounce, and a flaky link stalls again and again.
+pub fn bounces_are_fault(bounces: u32, over_wireless: bool) -> bool {
+    bounces >= 2 && !over_wireless
+}
 
 /// A key whose keystrokes are all shorter than this is released by the
 /// kernel driver, not by the key: laptop keys with an atkbd "force release"
@@ -38,7 +71,9 @@ pub const CHATTER_PRESS_GAP_MS: u64 = 40;
 /// poll 1 ms), so any normal keystroke of a key clears this.
 const MIN_REPORTED_HOLD: Duration = Duration::from_micros(500);
 
-/// Whether a press re-registers the same key too soon to be a new keystroke.
+/// Whether a press re-registers the same key too soon to be a new keystroke
+/// arriving on time: a suspect, which [`is_switch_chatter`] then judges from
+/// the holds around it.
 ///
 /// `last_press` and `last_release` are the previous press and release of the
 /// same key. Only meaningful with device (kernel) timestamps: terminal input
@@ -78,9 +113,16 @@ struct KeyHoldStats {
     last_press: Option<Instant>,
     /// Previous release of this key (for chatter detection)
     last_release: Option<Instant>,
+    /// How long the previous keystroke of this key was held
+    last_hold: Option<Duration>,
     /// Whether the key reports its own releases (a keystroke lasted at least
     /// [`MIN_REPORTED_HOLD`]); keys the driver auto-releases are not judged
     reports_releases: bool,
+    /// The current press is a suspect re-press after a finger-length
+    /// keystroke: chatter only if its own hold turns out short
+    suspect: bool,
+    /// Events of this key came from a wireless keyboard since the last reset
+    over_wireless: bool,
 }
 
 /// Test for hold down, release, and bounce detection
@@ -207,6 +249,22 @@ impl HoldReleaseTest {
             .collect()
     }
 
+    /// Record that events of `keys` came from a wireless keyboard (Bluetooth
+    /// or a 2.4 GHz receiver), whose radio can deliver reports late and
+    /// together. Kept until the next reset, so a retest on the cable starts
+    /// clean.
+    pub fn note_wireless_keys(&mut self, keys: &[KeyCode]) {
+        for key in keys {
+            self.key_stats.entry(*key).or_default().over_wireless = true;
+        }
+    }
+
+    /// Whether events of `key` came from a wireless keyboard since the last
+    /// reset (see [`HoldReleaseTest::note_wireless_keys`]).
+    pub fn key_over_wireless(&self, key: KeyCode) -> bool {
+        self.key_stats.get(&key).is_some_and(|s| s.over_wireless)
+    }
+
     /// Get currently held keys with durations
     pub fn held_keys(&self) -> Vec<(KeyCode, Duration)> {
         let now = Instant::now();
@@ -247,6 +305,7 @@ impl KeyboardTest for HoldReleaseTest {
                 // soon after its release/press. Terminal timestamps are read
                 // times, so this is only judged with device timestamps, and
                 // only for keys whose releases come from the key itself.
+                stats.suspect = false;
                 if check_bounce
                     && stats.reports_releases
                     && is_chatter_press(
@@ -256,8 +315,14 @@ impl KeyboardTest for HoldReleaseTest {
                         bounce_window,
                     )
                 {
-                    stats.bounce_count += 1;
-                    self.total_bounces += 1;
+                    if is_switch_chatter(stats.last_hold, None) {
+                        stats.bounce_count += 1;
+                        self.total_bounces += 1;
+                    } else {
+                        // After a finger's keystroke this may be a release
+                        // the radio delivered late: its own hold decides
+                        stats.suspect = true;
+                    }
                 }
                 stats.last_press = Some(event.timestamp);
                 stats.is_pressed = true;
@@ -293,6 +358,11 @@ impl KeyboardTest for HoldReleaseTest {
                     if hold >= MIN_REPORTED_HOLD {
                         stats.reports_releases = true;
                     }
+                    if std::mem::take(&mut stats.suspect) && is_switch_chatter(None, Some(hold)) {
+                        stats.bounce_count += 1;
+                        self.total_bounces += 1;
+                    }
+                    stats.last_hold = Some(hold);
                     let hold_ms = hold.as_secs_f64() * 1000.0;
                     stats.total_hold_ms += hold_ms;
 
@@ -352,6 +422,16 @@ impl KeyboardTest for HoldReleaseTest {
                 results.push(TestResult::info("Bounces Detected", "not tested yet"));
             } else if self.total_bounces == 0 {
                 results.push(TestResult::ok("Bounces Detected", "None"));
+            } else if self
+                .key_stats
+                .values()
+                .all(|s| s.bounce_count == 0 || s.over_wireless)
+            {
+                // A radio stall can look the same: not a verdict on the switch
+                results.push(TestResult::warning(
+                    "Bounces Detected",
+                    format!("{} (wireless link)", self.total_bounces),
+                ));
             } else {
                 results.push(TestResult::error(
                     "Bounces Detected",
@@ -364,6 +444,14 @@ impl KeyboardTest for HoldReleaseTest {
                     "re-press <{} ms after release or <{} ms after press",
                     self.bounce_window.as_millis(),
                     CHATTER_PRESS_GAP_MS
+                ),
+            ));
+            // A late radio report can close the gap, not shorten a finger's hold
+            results.push(TestResult::info(
+                "Counted only if",
+                format!(
+                    "the hold before or after it is <{} ms (no finger)",
+                    MIN_FINGER_HOLD_MS
                 ),
             ));
         }
@@ -393,10 +481,12 @@ impl KeyboardTest for HoldReleaseTest {
             results.push(TestResult::warning("--- Bouncy Keys ---", ""));
             for (key, count) in bouncy.iter().take(5) {
                 let key_info = keymap::get_key_info(*key);
-                results.push(TestResult::error(
-                    format!("  {}", key_info.name),
-                    format!("{} bounces", count),
-                ));
+                let label = format!("  {}", key_info.name);
+                results.push(if self.key_over_wireless(*key) {
+                    TestResult::warning(label, format!("{} bounces (wireless)", count))
+                } else {
+                    TestResult::error(label, format!("{} bounces", count))
+                });
             }
         }
 
@@ -459,15 +549,16 @@ mod tests {
 
     #[test]
     fn chatter_shortly_after_release_is_detected() {
-        // Worn switch on a 125 Hz keyboard: the re-press shows up two reports
-        // (16 ms) after the release. The old 5 ms window could never see it.
+        // Worn switch on a 125 Hz keyboard: as the key comes up the contact
+        // re-closes two reports (16 ms) after the release, for one report
+        // (8 ms). The old 5 ms window could never see it.
         let mut test = HoldReleaseTest::default();
         let t0 = Instant::now();
         feed(
             &mut test,
             KEY,
             t0,
-            &[(0, true), (70, false), (86, true), (150, false)],
+            &[(0, true), (72, false), (88, true), (96, false)],
         );
         assert_eq!(test.total_bounces(), 1);
         assert_eq!(test.bouncy_keys(), vec![(KEY, 1)]);
@@ -490,6 +581,82 @@ mod tests {
             &[(0, true), (15, false), (38, true), (100, false)],
         );
         assert_eq!(test.total_bounces(), 1);
+    }
+
+    #[test]
+    fn release_and_press_bounce_are_detected_at_1000_and_125_hz() {
+        // (events, what happened): every timeline is one keystroke whose
+        // switch closed again for a moment, on a 1 ms or an 8 ms report grid
+        let cases: [(&[(u64, bool)], &str); 6] = [
+            (
+                &[(0, true), (85, false), (88, true), (91, false)],
+                "1000 Hz release bounce: re-closed 3 ms after the release, for 3 ms",
+            ),
+            (
+                &[(0, true), (3, false), (7, true), (90, false)],
+                "1000 Hz press bounce: opened 3 ms after the press, for 4 ms",
+            ),
+            (
+                &[(0, true), (12, false), (18, true), (95, false)],
+                "1000 Hz bottom-out chatter 12 ms into the press",
+            ),
+            (
+                &[(0, true), (72, false), (80, true), (88, false)],
+                "125 Hz release bounce, one report each",
+            ),
+            (
+                &[(0, true), (72, false), (88, true), (104, false)],
+                "125 Hz release bounce, two reports each",
+            ),
+            (
+                &[(0, true), (8, false), (16, true), (96, false)],
+                "125 Hz press bounce",
+            ),
+        ];
+        for (events, what) in cases {
+            let mut test = HoldReleaseTest::default();
+            feed(&mut test, KEY, Instant::now(), events);
+            assert_eq!(test.bouncy_keys(), vec![(KEY, 1)], "{}", what);
+        }
+    }
+
+    #[test]
+    fn a_fast_re_press_is_judged_when_it_ends() {
+        // A re-press 2 ms after a 80 ms keystroke: a release bounce if it
+        // ends at once, a late radio report if a finger holds it
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        feed(&mut test, KEY, t0, &[(0, true), (80, false), (82, true)]);
+        assert_eq!(test.total_bounces(), 0, "not judged while down");
+        feed(&mut test, KEY, t0, &[(85, false)]);
+        assert_eq!(test.total_bounces(), 1);
+
+        let mut test = HoldReleaseTest::default();
+        feed(
+            &mut test,
+            KEY,
+            t0,
+            &[(0, true), (80, false), (82, true), (140, false)],
+        );
+        assert_eq!(test.total_bounces(), 0);
+        // A chain of blips counts every extra registration
+        let mut test = HoldReleaseTest::default();
+        feed(
+            &mut test,
+            KEY,
+            t0,
+            &[
+                (0, true),
+                (60, false),
+                (62, true),
+                (64, false),
+                (66, true),
+                (68, false),
+                (70, true),
+                (130, false),
+            ],
+        );
+        assert_eq!(test.total_bounces(), 3);
     }
 
     #[test]
@@ -554,6 +721,128 @@ mod tests {
     }
 
     #[test]
+    fn radio_bunched_double_tap_is_not_bounce() {
+        // "ee" typed on a Bluetooth keyboard: the first release was held
+        // back by the radio and arrived 0.2 ms before the next press. Both
+        // keystrokes are a finger's (60+ ms down), so nothing chattered.
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        let us = Duration::from_micros;
+        test.process_event(&press_at(KEY, t0, 0));
+        test.process_event(&release_at(KEY, t0 + us(109_800)));
+        test.process_event(&press_at(KEY, t0 + us(110_000), 0));
+        test.process_event(&release_at(KEY, t0 + ms(175)));
+        assert_eq!(test.total_bounces(), 0, "{:?}", test.bouncy_keys());
+
+        // The same over a 125 Hz 2.4 GHz receiver, which hands over one
+        // queued report per poll: release and press 8 ms apart
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(1000),
+            &[(0, true), (112, false), (120, true), (184, false)],
+        );
+        assert_eq!(test.total_bounces(), 0, "{:?}", test.bouncy_keys());
+        // Whatever the link: the same timeline on any keyboard is not judged
+        test.note_wireless_keys(&[KEY]);
+        assert_eq!(
+            row(&test.get_results(), "Bounces Detected").status,
+            ResultStatus::Ok
+        );
+    }
+
+    #[test]
+    fn radio_bunched_fast_drumming_is_not_bounce() {
+        // Two fingers drumming one key at 15 Hz (67 ms per tap, 27 ms down),
+        // about the fastest anyone repeats a key, over a radio that delivers
+        // every release late, with the next press (0.1 ms before it). Each
+        // tap shows up as a 67 ms hold with no gap.
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        let us = Duration::from_micros;
+        for i in 0..30u64 {
+            let down = t0 + ms(i * 67);
+            test.process_event(&press_at(KEY, down, 0));
+            let up = if i % 3 == 2 {
+                down + ms(27) // this one came through on time
+            } else {
+                down + ms(67) - us(100)
+            };
+            test.process_event(&release_at(KEY, up));
+        }
+        assert_eq!(test.total_bounces(), 0, "{:?}", test.bouncy_keys());
+    }
+
+    #[test]
+    fn a_radio_stall_that_delivers_a_whole_keystroke_is_not_a_verdict() {
+        // A 2.4 GHz link stalls for ~110 ms during fast tapping and then
+        // delivers release, press and release together. That has the shape
+        // of a release bounce, so it is counted, but over a wireless link it
+        // is only something to check, never a fault however often it happens.
+        let mut test = HoldReleaseTest::default();
+        test.note_wireless_keys(&[KEY]);
+        let t0 = Instant::now();
+        let us = Duration::from_micros;
+        for stall in 0..3u64 {
+            let s = t0 + ms(stall * 1000);
+            test.process_event(&press_at(KEY, s, 0));
+            test.process_event(&release_at(KEY, s + ms(150)));
+            test.process_event(&press_at(KEY, s + ms(150) + us(80), 0));
+            test.process_event(&release_at(KEY, s + ms(150) + us(160)));
+        }
+        assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
+        assert!(test.key_over_wireless(KEY));
+        assert!(!bounces_are_fault(3, true));
+        let results = test.get_results();
+        let bounces = row(&results, "Bounces Detected");
+        assert_eq!(bounces.status, ResultStatus::Warning);
+        assert!(bounces.value.contains("wireless"), "{:?}", bounces);
+        assert!(!results.iter().any(|r| r.status == ResultStatus::Error));
+
+        // A key typed on a wired keyboard next to it is still judged
+        feed(
+            &mut test,
+            KeyCode(30),
+            t0 + ms(5000),
+            &[(0, true), (80, false), (82, true), (84, false)],
+        );
+        feed(
+            &mut test,
+            KeyCode(30),
+            t0 + ms(5300),
+            &[(0, true), (2, false), (5, true), (84, false)],
+        );
+        assert!(!test.key_over_wireless(KeyCode(30)));
+        assert_eq!(
+            row(&test.get_results(), "Bounces Detected").status,
+            ResultStatus::Error
+        );
+
+        // Reset (a retest on the cable) forgets the link
+        test.reset();
+        assert!(!test.key_over_wireless(KEY));
+    }
+
+    #[test]
+    fn switch_chatter_rules() {
+        let short = Some(ms(MIN_FINGER_HOLD_MS - 1));
+        let finger = Some(ms(MIN_FINGER_HOLD_MS));
+        // press bounce: the keystroke before the re-press was a blip
+        assert!(is_switch_chatter(short, None));
+        // release bounce: the re-press itself is a blip
+        assert!(is_switch_chatter(finger, short));
+        // two holds a finger makes, however close together they arrived
+        assert!(!is_switch_chatter(finger, finger));
+        // still down, after a finger's keystroke: nothing to say yet
+        assert!(!is_switch_chatter(finger, None));
+        assert!(!is_switch_chatter(None, None));
+
+        assert!(!bounces_are_fault(1, false));
+        assert!(bounces_are_fault(2, false));
+        assert!(!bounces_are_fault(2, true));
+    }
+
+    #[test]
     fn driver_auto_released_keys_are_not_bounce() {
         // A laptop volume key with an atkbd force-release quirk, held for a
         // second: typematic make codes every 33 ms, each released by the
@@ -588,7 +877,12 @@ mod tests {
         let mut test = HoldReleaseTest::new(5);
         assert_eq!(test.bounce_window_ms(), MIN_BOUNCE_WINDOW_MS);
         let t0 = Instant::now();
-        feed(&mut test, KEY, t0, &[(0, true), (70, false), (82, true)]);
+        feed(
+            &mut test,
+            KEY,
+            t0,
+            &[(0, true), (70, false), (82, true), (90, false)],
+        );
         assert_eq!(test.total_bounces(), 1);
     }
 
@@ -601,7 +895,12 @@ mod tests {
         assert_eq!(test.bounce_window_ms(), 30);
         let t0 = Instant::now();
         // 25 ms release -> re-press: inside a 30 ms window, outside the default
-        feed(&mut test, KEY, t0, &[(0, true), (60, false), (85, true)]);
+        feed(
+            &mut test,
+            KEY,
+            t0,
+            &[(0, true), (60, false), (85, true), (93, false)],
+        );
         assert_eq!(test.total_bounces(), 1);
 
         test.set_bounce_window_ms(500);

@@ -32,7 +32,7 @@ src/
 │   ├── keymap.rs        # Key codes & names
 │   ├── layout.rs        # ANSI/ISO/JIS layout detection & rows
 │   ├── remap.rs         # OEM/FN key remapping
-│   └── evdev_listener.rs # Linux evdev support (reconnects, SYN_DROPPED)
+│   └── evdev_listener.rs # Linux evdev support (reconnects, SYN_DROPPED, wireless keyboards)
 ├── tests/               # Test implementations
 │   ├── mod.rs           # KeyboardTest trait & common structures
 │   ├── polling.rs       # Report-rate estimate from timestamp quantization
@@ -120,7 +120,9 @@ trait KeyboardTest {
 4. **EventTimingTest** - Gaps between key events: typing rhythm, never a
    keyboard rating (the poll interval comes from PollingRateTest)
 5. **HoldReleaseTest** - Hold times & switch chatter (same-key re-press
-   < 20-40 ms after release or < 40 ms after press, evdev only)
+   < 20-40 ms after release or < 40 ms after press, counted only with a
+   hold < 20 ms on either side, evdev only; keys typed on a wireless
+   keyboard, `App::note_wireless_keys`, are never judged a fault)
 6. **ShortcutTest** - Modifier combos and known system shortcuts (n/a when
    the source does not report modifier keys)
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison

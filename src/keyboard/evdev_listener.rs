@@ -140,6 +140,76 @@ const fn eviocgkey(len: usize) -> u64 {
         | 0x18
 }
 
+/// `EVIOCGID`: read the device's `struct input_id` (bus type, vendor,
+/// product, version: four `u16`s).
+const fn eviocgid() -> u64 {
+    (IOC_READ << (IOC_NRBITS + IOC_TYPEBITS + IOC_SIZEBITS))
+        | (8 << (IOC_NRBITS + IOC_TYPEBITS))
+        | ((b'E' as u64) << IOC_NRBITS)
+        | 0x02
+}
+
+/// `BUS_USB` and `BUS_BLUETOOTH` from `linux/input.h`.
+const BUS_USB: u16 = 0x03;
+const BUS_BLUETOOTH: u16 = 0x05;
+
+/// Words in the names of 2.4 GHz receivers and of keyboards paired to them:
+/// "Logitech USB Receiver", "Logitech Wireless Keyboard PID:4023",
+/// "Microsoft Nano Transceiver", "2.4G Wireless Receiver", "... Dongle".
+const RECEIVER_NAME_HINTS: [&str; 7] = [
+    "receiver",
+    "transceiver",
+    "unifying",
+    "lightspeed",
+    "wireless",
+    "2.4g",
+    "dongle",
+];
+
+/// The device's bus type (`BUS_*`), read with `EVIOCGID`.
+fn read_bus_type(file: &File) -> Option<u16> {
+    let mut id = [0u16; 4];
+    // SAFETY: EVIOCGID writes one struct input_id (four u16s, the size of
+    // `id`) to the pointer we pass; the fd is an open evdev device.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), eviocgid() as _, id.as_mut_ptr()) };
+    (rc >= 0).then_some(id[0])
+}
+
+/// Whether a sysfs path component names a HID device ("0003:046D:C52B.0003":
+/// bus, vendor, product, instance).
+fn is_hid_device_dir(component: &str) -> bool {
+    let b = component.as_bytes();
+    b.len() == 19
+        && b.iter().enumerate().all(|(i, c)| match i {
+            4 | 9 => *c == b':',
+            14 => *c == b'.',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// Whether a keyboard reaches the computer over a radio link, whose reports
+/// can be held back and delivered late and together. `sysfs_path` is where
+/// its event node really lives (`/sys/class/input/eventN`, resolved).
+///
+/// Bluetooth keyboards have the Bluetooth bus type, also LE ones that
+/// bluetoothd feeds in through uhid. A 2.4 GHz receiver is a USB device: it
+/// shows in its name or its keyboard's, or (Logitech Unifying, Bolt and
+/// Lightspeed receivers) the paired keyboard is a HID device under the
+/// receiver's own. A receiver that does neither is taken for a cable.
+fn is_wireless_link(bus_type: Option<u16>, name: &str, sysfs_path: &Path) -> bool {
+    let name = name.to_lowercase();
+    let paired_behind_receiver = || {
+        sysfs_path
+            .iter()
+            .filter(|c| c.to_str().is_some_and(is_hid_device_dir))
+            .count()
+            >= 2
+    };
+    bus_type == Some(BUS_BLUETOOTH)
+        || RECEIVER_NAME_HINTS.iter().any(|hint| name.contains(hint))
+        || (bus_type == Some(BUS_USB) && paired_behind_receiver())
+}
+
 /// Which clock a device's event timestamps are expressed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventClock {
@@ -469,6 +539,8 @@ struct OpenDevice {
     /// Whether the device has delivered key events (see
     /// [`EvdevDeviceChange::Disconnected`])
     typed: bool,
+    /// The device is a wireless keyboard (see [`is_wireless_link`])
+    wireless: bool,
 }
 
 /// Open an evdev device for non-blocking reads with monotonic timestamps.
@@ -500,15 +572,20 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
         pressed: down_at_open.iter().copied().collect(),
         ..DeviceDecoder::default()
     };
+    let name = device_name(path);
+    let node = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let sysfs_path = fs::canonicalize(format!("/sys/class/input/{}", node)).unwrap_or_default();
+    let wireless = is_wireless_link(read_bus_type(&file), &name, &sysfs_path);
     Ok(OpenDevice {
         file,
         path: path.to_path_buf(),
-        name: device_name(path),
+        name,
         clock,
         decoder,
         down_at_open,
         opened_at,
         typed: false,
+        wireless,
     })
 }
 
@@ -629,6 +706,9 @@ pub struct EvdevListener {
     queued: Vec<(Instant, u16, bool)>,
     /// Names of the devices that delivered key events this session
     typed_names: HashSet<String>,
+    /// Keys whose events came from a wireless keyboard since the last
+    /// `take_wireless_keys`
+    wireless_keys: Vec<KeyCode>,
 }
 
 impl EvdevListener {
@@ -667,6 +747,7 @@ impl EvdevListener {
             changes: Vec::new(),
             queued: Vec::new(),
             typed_names: HashSet::new(),
+            wireless_keys: Vec::new(),
         };
         for device in devices {
             listener.add_device(device);
@@ -735,6 +816,16 @@ impl EvdevListener {
         std::mem::take(&mut self.changes)
     }
 
+    /// Keys whose events since the last call came from a wireless keyboard
+    /// (Bluetooth or a 2.4 GHz receiver), each once. The radio can deliver
+    /// their reports late and together, which timing checks need to know.
+    pub fn take_wireless_keys(&mut self) -> Vec<KeyCode> {
+        let mut keys = std::mem::take(&mut self.wireless_keys);
+        keys.sort_unstable_by_key(|k| k.0);
+        keys.dedup();
+        keys
+    }
+
     /// Poll for keyboard events
     /// Returns the number of events generated
     ///
@@ -768,6 +859,13 @@ impl EvdevListener {
             if pending.len() > before && !device.typed {
                 device.typed = true;
                 self.typed_names.insert(device.name.clone());
+            }
+            if device.wireless {
+                self.wireless_keys.extend(
+                    pending[before..]
+                        .iter()
+                        .map(|(_, code, _)| KeyCode::new(*code)),
+                );
             }
             if read == DeviceRead::Gone {
                 gone.push(index);
@@ -992,6 +1090,110 @@ mod tests {
         assert_eq!(eviocgkey(96), 0x8060_4518);
         // The bitmap covers KEY_CNT bits in 96 bytes on every word size
         assert_eq!(KEY_WORDS * std::mem::size_of::<libc::c_ulong>(), 96);
+    }
+
+    #[test]
+    fn eviocgid_matches_kernel_value_on_common_arches() {
+        // EVIOCGID == _IOR('E', 0x02, struct input_id) == 0x80084502
+        #[cfg(not(any(
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        )))]
+        assert_eq!(eviocgid(), 0x8008_4502);
+    }
+
+    #[test]
+    fn wireless_keyboards_are_told_from_wired_ones() {
+        let wireless = |bus, name, sysfs: &str| is_wireless_link(bus, name, Path::new(sysfs));
+        // Bluetooth classic, and LE through bluetoothd's uhid device
+        assert!(wireless(
+            Some(BUS_BLUETOOTH),
+            "Keychron K2",
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-10/1-10:1.0/bluetooth/hci0/\
+             hci0:256/0005:05AC:024F.000A/input/input31/event22"
+        ));
+        assert!(wireless(
+            Some(BUS_BLUETOOTH),
+            "MX Keys Mini",
+            "/sys/devices/virtual/misc/uhid/0005:046D:B369.0009/input/input30/event21"
+        ));
+        // A Logitech receiver's paired keyboard, renamed by hid-logitech-hidpp
+        // so that its name gives nothing away: a HID device under another
+        assert!(wireless(
+            Some(BUS_USB),
+            "Logitech K270",
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.2/0003:046D:C52B.0003/\
+             0003:046D:4003.0004/input/input20/event7"
+        ));
+        // Receivers known by name
+        for name in [
+            "Logitech USB Receiver",
+            "Compx 2.4G Receiver",
+            "Microsoft Microsoft® Nano Transceiver v2.0",
+            "Logitech Wireless Keyboard PID:4023",
+            "Razer Razer Dongle",
+        ] {
+            assert!(
+                wireless(
+                    Some(BUS_USB),
+                    name,
+                    "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3/1-3:1.0/\
+                     0003:1A2C:2124.0005/input/input9/event5"
+                ),
+                "{}",
+                name
+            );
+        }
+        // Cables: a USB keyboard and a laptop's own
+        assert!(!wireless(
+            Some(BUS_USB),
+            "Holtek USB Keyboard",
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0/0003:04D9:0169.0001/\
+             input/input5/event3"
+        ));
+        assert!(!wireless(
+            Some(0x11),
+            "AT Translated Set 2 keyboard",
+            "/sys/devices/platform/i8042/serio0/input/input3/event2"
+        ));
+        // Nothing known about the device: not called wireless
+        assert!(!wireless(None, "/dev/input/event9", ""));
+        assert!(is_hid_device_dir("0003:046D:C52B.0003"));
+        assert!(!is_hid_device_dir("1-2:1.2"));
+        assert!(!is_hid_device_dir("0003:046D:C52B:0003"));
+    }
+
+    #[test]
+    fn keys_typed_on_a_wireless_keyboard_are_reported() {
+        let file = std::env::temp_dir().join(format!("kt-evdev-bt-{}", std::process::id()));
+        let raw = [
+            key(30, 1, 1_000),
+            syn(SYN_REPORT, 1_000),
+            key(30, 0, 60_000),
+            syn(SYN_REPORT, 60_000),
+            key(48, 1, 90_000),
+            syn(SYN_REPORT, 90_000),
+        ];
+        fs::write(&file, event_bytes(&raw)).unwrap();
+        let mut bluetooth = fake_device("/dev/input/event-bt").unwrap();
+        bluetooth.file = File::open(&file).unwrap();
+        bluetooth.wireless = true;
+        let _ = fs::remove_file(&file);
+        let cable = fake_device("/dev/input/event-usb").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut listener = EvdevListener::with_devices(tx, vec![cable, bluetooth]);
+        assert_eq!(listener.poll(), 3);
+        assert_eq!(
+            listener.take_wireless_keys(),
+            vec![KeyCode::new(30), KeyCode::new(48)]
+        );
+        // Handed out once
+        listener.poll();
+        assert!(listener.take_wireless_keys().is_empty());
     }
 
     fn ev(event_type: u16, code: u16, value: i32, usec: i64) -> InputEvent {
@@ -1271,6 +1473,7 @@ mod tests {
             down_at_open: Vec::new(),
             opened_at: Instant::now(),
             typed: false,
+            wireless: false,
         })
     }
 
