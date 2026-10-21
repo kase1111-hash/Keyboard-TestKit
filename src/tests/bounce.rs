@@ -101,10 +101,12 @@ pub struct HoldReleaseTest {
     held_keys: Vec<(KeyCode, Instant)>,
     /// Test start time
     start_time: Option<Instant>,
-    /// Last event for repeat rate detection
+    /// Last press of any key (for the press rate)
     last_event_time: Option<Instant>,
-    /// Repeat events detected (same key pressed rapidly)
-    repeat_intervals: VecDeque<u64>,
+    /// Gaps under 500 ms between presses of any keys. This is how fast keys
+    /// are pressed, not autorepeat: evdev and the terminal listener drop
+    /// autorepeat, so holding a key adds nothing here.
+    press_intervals: VecDeque<u64>,
 }
 
 impl HoldReleaseTest {
@@ -124,7 +126,7 @@ impl HoldReleaseTest {
             held_keys: Vec::new(),
             start_time: None,
             last_event_time: None,
-            repeat_intervals: VecDeque::new(),
+            press_intervals: VecDeque::new(),
         }
     }
 
@@ -163,13 +165,14 @@ impl HoldReleaseTest {
         Some(total / self.total_presses as f64)
     }
 
-    /// Calculate repeat rate in keys per second
-    pub fn repeat_rate_hz(&self) -> Option<f64> {
-        if self.repeat_intervals.len() < 2 {
+    /// Presses per second (of any keys) while keys are pressed in quick
+    /// succession: typing pace, not the keyboard's autorepeat rate.
+    pub fn press_rate_hz(&self) -> Option<f64> {
+        if self.press_intervals.len() < 2 {
             return None;
         }
         let avg_interval_us =
-            self.repeat_intervals.iter().sum::<u64>() as f64 / self.repeat_intervals.len() as f64;
+            self.press_intervals.iter().sum::<u64>() as f64 / self.press_intervals.len() as f64;
         if avg_interval_us > 0.0 {
             Some(1_000_000.0 / avg_interval_us)
         } else {
@@ -267,14 +270,14 @@ impl KeyboardTest for HoldReleaseTest {
                     self.held_keys.push((event.key, event.timestamp));
                 }
 
-                // Track repeat intervals
+                // Track press intervals (pauses of 500 ms or more are not
+                // part of a burst of presses)
                 if let Some(last) = self.last_event_time {
                     let interval = event.timestamp.duration_since(last).as_micros() as u64;
                     if interval < 500_000 {
-                        // Only track intervals < 500ms
-                        self.repeat_intervals.push_back(interval);
-                        if self.repeat_intervals.len() > 100 {
-                            self.repeat_intervals.pop_front();
+                        self.press_intervals.push_back(interval);
+                        if self.press_intervals.len() > 100 {
+                            self.press_intervals.pop_front();
                         }
                     }
                 }
@@ -375,11 +378,12 @@ impl KeyboardTest for HoldReleaseTest {
             results.push(TestResult::info("Avg Hold Time", format!("{:.1} ms", avg)));
         }
 
-        // Repeat rate
-        if let Some(rate) = self.repeat_rate_hz() {
+        // How fast keys were pressed (typing pace: autorepeat is not
+        // reported by any input path, so this is not a repeat rate)
+        if let Some(rate) = self.press_rate_hz() {
             results.push(TestResult::info(
-                "Repeat Rate",
-                format!("{:.1} keys/sec", rate),
+                "Press Rate (any keys)",
+                format!("{:.1} presses/sec", rate),
             ));
         }
 
@@ -419,7 +423,7 @@ impl KeyboardTest for HoldReleaseTest {
         self.held_keys.clear();
         self.start_time = None;
         self.last_event_time = None;
-        self.repeat_intervals.clear();
+        self.press_intervals.clear();
     }
 }
 
@@ -672,6 +676,33 @@ mod tests {
         assert_eq!(test.total_presses(), 0);
         assert_eq!(test.bounce_window_ms(), 30);
         assert!(!test.bounce_measurable());
+    }
+
+    #[test]
+    fn press_rate_is_typing_pace_not_autorepeat() {
+        // Typing three different keys 100 ms apart: 10 presses per second,
+        // labelled as what it is
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        for (i, key) in [30u16, 31, 32].iter().enumerate() {
+            feed(
+                &mut test,
+                KeyCode(*key),
+                t0 + ms(i as u64 * 100),
+                &[(0, true), (50, false)],
+            );
+        }
+        assert!((test.press_rate_hz().unwrap() - 10.0).abs() < 0.01);
+        let results = test.get_results();
+        assert_eq!(
+            row(&results, "Press Rate (any keys)").value,
+            "10.0 presses/sec"
+        );
+        assert!(!results.iter().any(|r| r.label.contains("Repeat")));
+        // Holding a key adds nothing: its autorepeat never arrives
+        let mut test = HoldReleaseTest::default();
+        feed(&mut test, KEY, t0, &[(0, true), (1500, false)]);
+        assert!(test.press_rate_hz().is_none());
     }
 
     #[test]
