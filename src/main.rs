@@ -844,9 +844,9 @@ const HELD_KEY_WINDOW: Duration = Duration::from_millis(750);
 /// per repeat and holding Ctrl+C would abort the auto test and then quit.
 ///
 /// A press identical to the previous report (same key and modifiers) within
-/// [`HELD_KEY_WINDOW`] of it, with no release in between, is that key still
-/// held. The cost, on terminals without release events, is that pressing
-/// the same command key twice within 750 ms counts once.
+/// [`HELD_KEY_WINDOW`] of it, with no release of that key in between, is
+/// that key still held. The cost, on terminals without release events, is
+/// that pressing the same command key twice within 750 ms counts once.
 #[derive(Debug, Default)]
 struct HeldKeyFilter {
     /// The latest report of a key and when it arrived
@@ -862,7 +862,14 @@ impl HeldKeyFilter {
         };
         match key.kind {
             KeyEventKind::Release => {
-                if self.last.as_ref().is_some_and(same) {
+                // The key came up, whatever is still held: the Ctrl of Ctrl+N
+                // is often let go first ('n' comes up alone), and Shift+R
+                // comes up as 'r' once Shift is up
+                if self
+                    .last
+                    .as_ref()
+                    .is_some_and(|(code, _, _)| same_key(*code, key.code))
+                {
                     self.last = None;
                 }
                 false
@@ -879,6 +886,14 @@ impl HeldKeyFilter {
                 held
             }
         }
+    }
+}
+
+/// Whether two key codes are the same key, whatever the case of a letter.
+fn same_key(a: CtKeyCode, b: CtKeyCode) -> bool {
+    match (a, b) {
+        (CtKeyCode::Char(a), CtKeyCode::Char(b)) => a.to_lowercase().eq(b.to_lowercase()),
+        _ => a == b,
     }
 }
 
@@ -1474,6 +1489,40 @@ mod tests {
             &[(0, plain(' ')), (90, release), (200, plain(' '))],
         );
         assert_eq!(app.state, AppState::Running);
+
+        // The release ends the keystroke also when it comes after the
+        // modifier was let go (kitty, Windows console): Ctrl+N up as a
+        // plain 'n', Shift+R up as 'r'. Two quick Ctrl+N skip two steps.
+        let up = |c| {
+            CtKeyEvent::new_with_kind(
+                CtKeyCode::Char(c),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )
+        };
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(
+            &mut app,
+            &[(0, ctrl('n')), (120, up('n')), (350, ctrl('n'))],
+        );
+        assert_eq!(
+            commands,
+            vec![Command::SkipAutoStep, Command::None, Command::SkipAutoStep]
+        );
+        let mut app = App::default();
+        let commands = commands_for(
+            &mut app,
+            &[
+                (0, legacy_shift('R')),
+                (100, up('r')),
+                (300, legacy_shift('R')),
+            ],
+        );
+        assert_eq!(
+            commands,
+            vec![Command::ResetAll, Command::None, Command::ResetAll]
+        );
 
         // Holding Tab or an arrow key keeps moving
         let mut app = App::default();
