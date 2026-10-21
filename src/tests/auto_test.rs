@@ -299,15 +299,18 @@ pub const CHATTER_RELEASE_GAP_US: u64 = 20_000;
 /// the USB boot-protocol limit, so every keyboard should reach it.
 pub const GOOD_ROLLOVER: usize = 6;
 
-/// Keys a healthy keyboard may simply not have: the ISO and JIS extra keys
-/// (expected from the configured layout, not the hardware) and Right Ctrl
-/// (missing on MacBooks and on laptops where the Copilot key replaced it).
+/// Keys a healthy keyboard may simply not have or not send: the ISO and JIS
+/// extra keys (expected from the configured layout, not the hardware), Right
+/// Ctrl (missing on MacBooks and on laptops where the Copilot key replaced it)
+/// and the Windows key (missing on some keyboards, and switched off by the
+/// game-mode lock of many gaming keyboards).
 const KEYS_NOT_ON_EVERY_KEYBOARD: &[KeyCode] = &[
     KeyCode(86), // ISO key left of Z
     KeyCode(92), // Henkan
     KeyCode(93), // Katakana/Hiragana
     KeyCode(94), // Muhenkan
     keymap::KEY_RCTRL,
+    keymap::KEY_LSUPER,
 ];
 
 /// Whether a press is switch chatter rather than a human re-press, given when
@@ -1564,9 +1567,9 @@ fn missing_key_findings(source: InputSource, missing: &[KeyCode]) -> Vec<Finding
                     optional.len()
                 ),
                 keys(&optional),
-                "Many laptops have no Right Ctrl, and ISO/JIS-only keys depend on the \
-                 physical layout. If your keyboard has them and you pressed them, the \
-                 switch is faulty.",
+                "Many laptops have no Right Ctrl, gaming keyboards switch the Windows key \
+                 off in game mode, and ISO/JIS-only keys depend on the physical layout. \
+                 If your keyboard has them and you pressed them, the switch is faulty.",
             ));
         }
         return findings;
@@ -1592,7 +1595,8 @@ fn missing_key_findings(source: InputSource, missing: &[KeyCode]) -> Vec<Finding
             ),
             keys(&definite),
             format!(
-                "If you pressed them, the keys may be dead; check them in a text editor.{}",
+                "If you pressed them, the keys may be dead (unless a non-Latin layout such \
+                 as Cyrillic was active); check them in a text editor.{}",
                 better
             ),
         ));
@@ -2682,7 +2686,7 @@ mod tests {
     #[test]
     fn evdev_sweep_timeout_separates_keys_not_every_keyboard_has() {
         let mut t = AutoTest::new(InputSource::Evdev);
-        t.set_expected_keys(vec![KeyCode(30), KeyCode(97), KeyCode(86)]);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(97), KeyCode(86), KeyCode(125)]);
         let t0 = Instant::now();
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION);
@@ -2697,11 +2701,12 @@ mod tests {
             .find(|f| f.category == "Not registered")
             .unwrap();
         assert_eq!(optional.severity, Severity::Warning);
-        assert_eq!(optional.detail, "Keys: IsoBackslash, RightCtrl");
+        assert_eq!(optional.detail, "Keys: IsoBackslash, LeftMeta, RightCtrl");
 
-        // A healthy laptop without Right Ctrl: no critical finding
+        // A healthy laptop without Right Ctrl, or a gaming keyboard with its
+        // Windows key locked: no critical finding
         let mut t = AutoTest::new(InputSource::Evdev);
-        t.set_expected_keys(vec![KeyCode(30), KeyCode(97)]);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(97), KeyCode(125)]);
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION);
         t.process_event(&evt(
