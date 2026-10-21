@@ -929,7 +929,7 @@ impl AutoTest {
             _ => {}
         }
 
-        // --- Sweep step: dead / unreleased keys ---------------------------
+        // --- Sweep step: dead keys ----------------------------------------
         match self.outcome_of(StepKind::Sweep) {
             Some(StepOutcome::TimedOut) => {
                 // A key held down through the sweep (jammed, or down since
