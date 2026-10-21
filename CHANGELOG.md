@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Renamed "Latency" view to "Timing": it measures the time between key events, not end-to-end input latency
 
 ### Fixed
+- Switch chatter is judged from contact durations instead of timing alone: a fast same-key re-press counts as a bounce only when a contact or gap is shorter than a finger can make (under 20 ms), when the contact drops out under a held key, or on a built-in keyboard that cannot be on a radio. A double letter whose release arrived late over Bluetooth or a 2.4 GHz receiver is no longer called chatter. Wireless keyboards are recognised (Bluetooth bus, receivers by name and sysfs nesting, not tri-mode keyboards on their cable); bounces that came over a radio are worded as a possible radio delay and are never a fault on their own. The Bounce view and exported rows follow the same rule as the finding, so one bounce is a warning everywhere
+- Windows console: holding a shifted or AltGr symbol past the autorepeat delay and letting go of Shift first left the key looking held (also at slow repeat rates)
+- `Ctrl+R` in the NKRO view counted its own keys as rollover input (on layouts with R in its US position)
+- After an auto test ended or was aborted, plain keys turned back into single-key commands after a 2 s pause (so `r` could wipe the result); they now stay test input until you press Enter or leave the view
+- Press-only terminals: press counts and rates on the Dashboard and in the Bounce, Polling and Rollover views are marked approximate, like the rapid-tap count
 - Auto test false alarms on healthy keyboards:
   - Holding a key for 2 s or more and releasing it (the Rollover step asks for exactly that) was a permanent Critical "Stuck key". Only a key that is still down is stuck now; long holds are informational
   - The evdev copy of the keystroke that starts the test (or of `Ctrl+N`), and the autorepeat of a held start key on terminals, were recorded as phantom input
