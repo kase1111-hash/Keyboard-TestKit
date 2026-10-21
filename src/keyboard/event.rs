@@ -107,6 +107,14 @@ struct KeyTrack {
     /// Another key code this key's autorepeat now arrives as, because Shift
     /// or AltGr was let go while it repeated (see [`KeyboardListener`])
     alias: Option<KeyCode>,
+    /// Gap between the key's last two autorepeat reports (release reporting:
+    /// repeated presses), which sets its repeat window (see
+    /// [`KeyTrack::repeat_window`])
+    repeat_interval: Option<Duration>,
+    /// The key was a held-back press settled as a key of its own (see
+    /// [`HeldBack`]): the key down whose autorepeat it may still have been.
+    /// The two come up together.
+    repeat_of: Option<KeyCode>,
 }
 
 impl KeyTrack {
@@ -123,7 +131,20 @@ impl KeyTrack {
             shifted: false,
             latest_shifted: false,
             alias: None,
+            repeat_interval: None,
+            repeat_of: None,
         }
+    }
+
+    /// How long after its last report the key may still be repeating:
+    /// [`AUTO_RELEASE_TIMEOUT`], or one and a half of its repeat interval when
+    /// it repeats slower (the slow end of the Windows repeat-rate setting is
+    /// ~400 ms between repeats, Filter Keys up to 2 s).
+    fn repeat_window(&self) -> Duration {
+        self.repeat_interval
+            .map_or(AUTO_RELEASE_TIMEOUT, |interval| {
+                AUTO_RELEASE_TIMEOUT.max(interval * 3 / 2)
+            })
     }
 
     /// A key typed as `ct_key` with `shifted` (Shift/AltGr) going down.
@@ -149,6 +170,9 @@ struct HeldBack {
     of: KeyCode,
     /// When it was reported
     at: Instant,
+    /// How long the next report may take to show it was `of`'s autorepeat
+    /// (see [`KeyTrack::repeat_window`])
+    window: Duration,
     /// What it typed, should it be a key of its own
     track: KeyTrack,
 }
@@ -203,18 +227,24 @@ fn midpoint(a: Instant, b: Instant) -> Instant {
 /// and letting go of Shift first makes the repeats type `2`, another key
 /// code. A press of a new key code that drops Shift/AltGr while the key
 /// pressed last typed a non-letter with them and is still repeating (its
-/// last report less than [`AUTO_RELEASE_TIMEOUT`] ago), or is due to start
-/// repeating (down for an autorepeat delay), is therefore held back: if the new
-/// code is reported again, or comes up, within [`AUTO_RELEASE_TIMEOUT`] it
-/// is that key's autorepeat (a key that has just gone down cannot repeat
-/// before the autorepeat delay), and the key stays one keystroke until it
+/// last report less than its repeat window ago: [`AUTO_RELEASE_TIMEOUT`], or
+/// one and a half repeat intervals at slow repeat rates), or is due to start
+/// repeating (down for an autorepeat delay), is therefore held back: if,
+/// within that window, the new code is reported again or comes up, or the
+/// held key is reported at its own code again (Shift/AltGr back down), the
+/// new code was that key's autorepeat (a key that has just gone down cannot
+/// repeat before the autorepeat delay, and a key going down ends the
+/// autorepeat of the one before), and the key stays one keystroke until it
 /// comes up. Otherwise it is a key of its own, reported with the time it
-/// went down. The cost: a different key tapped shorter than that while such
-/// a symbol key is still down (Shift already up), repeating or down for an
-/// autorepeat delay, is taken for the symbol key's last repeat, which is
-/// better than leaving that key down for good (a stuck key on a healthy
-/// keyboard). Terminals using the kitty protocol name the key itself
-/// whatever Shift/AltGr types, so presses are never held back there.
+/// went down, but it and the held key come up together: whichever character
+/// the physical key comes up as, neither is left down. The cost: a
+/// different key tapped shorter than that window while such a symbol key is
+/// still down (Shift already up), repeating or down for an autorepeat delay,
+/// is taken for the symbol key's last repeat, and one held longer comes up
+/// together with it, which is better than leaving a key down for good (a
+/// stuck key on a healthy keyboard). Terminals using the kitty protocol name
+/// the key itself whatever Shift/AltGr types, so presses are never held back
+/// there.
 pub struct KeyboardListener {
     /// Timestamp of the last event that was emitted (for `delta_us`)
     last_event: Option<Instant>,
@@ -386,15 +416,16 @@ impl KeyboardListener {
         match self.held_back {
             // The held-back key code comes up before the next autorepeat
             // would have shown which it is: the held key's last repeat
-            // (the key let go right after Shift)
+            // (the key let go right after Shift), or the held key comes up
+            // at its own code (Shift back down), after its last repeat
             Some(h)
                 if key.0 != 0
-                    && h.key == key
-                    && now.saturating_duration_since(h.at) < AUTO_RELEASE_TIMEOUT =>
+                    && (h.key == key || h.of == key)
+                    && now.saturating_duration_since(h.at) < h.window =>
             {
                 self.held_back = None;
                 if let Some(t) = self.keys.get_mut(&h.of) {
-                    t.alias = Some(key);
+                    t.alias = Some(h.key);
                 }
             }
             _ => {
@@ -414,10 +445,26 @@ impl KeyboardListener {
         else {
             return false;
         };
-        if !track.down || track.silent {
-            return false;
+        // A held-back press settled as a key of its own and the key whose
+        // autorepeat it may have been are one physical key at most: whichever
+        // comes up, the other does too (see [`KeyTrack::repeat_of`])
+        let linked: Vec<KeyCode> = self
+            .keys
+            .iter()
+            .filter(|(k, t)| t.down && (t.repeat_of == Some(key) || track.repeat_of == Some(**k)))
+            .map(|(k, _)| *k)
+            .collect();
+        let mut out = Vec::new();
+        for (k, t) in std::iter::once((key, track)).chain(
+            linked
+                .into_iter()
+                .filter_map(|k| self.keys.remove(&k).map(|t| (k, t))),
+        ) {
+            if t.down && !t.silent {
+                out.push((now, k, KeyEventType::Release));
+            }
         }
-        self.emit(key, KeyEventType::Release, now)
+        self.emit_all(out) > 0
     }
 
     /// The key down whose autorepeat arrives as `key` (see
@@ -464,13 +511,18 @@ impl KeyboardListener {
         }
         let shifted = level_shifted(modifiers);
         if let Some(h) = self.held_back {
-            if h.key == key && now.saturating_duration_since(h.at) < AUTO_RELEASE_TIMEOUT {
+            if (h.key == key || h.of == key) && now.saturating_duration_since(h.at) < h.window {
                 // Reported again this soon: autorepeat, which a key that
                 // has just gone down cannot produce yet. It is the held
                 // key, typing another character since Shift/AltGr came up.
+                // Or the held key repeats at its own code again (Shift/AltGr
+                // back down), which a key going down would have ended: the
+                // held-back report was its repeat.
                 self.held_back = None;
                 if let Some(t) = self.keys.get_mut(&h.of) {
-                    t.alias = Some(key);
+                    t.alias = Some(h.key);
+                    t.repeat_interval = Some(now.saturating_duration_since(h.at));
+                    t.repeated = true;
                     t.last_report = now;
                     t.latest_shifted = shifted;
                 }
@@ -484,17 +536,21 @@ impl KeyboardListener {
             .find(|(k, t)| t.down && (**k == key || t.alias == Some(key)));
         if let Some((_, track)) = repeat {
             // Already down: this is a terminal key repeat, not a new press.
+            if track.repeated {
+                track.repeat_interval = Some(now.saturating_duration_since(track.last_report));
+            }
             track.last_report = now;
             track.repeated = true;
             track.latest_shifted = shifted;
             return false;
         }
         let track = KeyTrack::typed(ct_key, shifted, now);
-        if let Some(of) = self.repeating_shifted_symbol(now, shifted) {
+        if let Some((of, window)) = self.repeating_shifted_symbol(now, shifted) {
             self.held_back = Some(HeldBack {
                 key,
                 of,
                 at: now,
+                window,
                 track,
             });
             return false;
@@ -512,8 +568,9 @@ impl KeyboardListener {
     /// and was last reported at that level, and either is still repeating
     /// (as presses, as only the Windows console reports them) or has been
     /// down for as long as an autorepeat delay (Shift let go before the
-    /// first repeat).
-    fn repeating_shifted_symbol(&self, now: Instant, shifted: bool) -> Option<KeyCode> {
+    /// first repeat). Also returns how long the next report may take to
+    /// show it (see [`KeyTrack::repeat_window`]).
+    fn repeating_shifted_symbol(&self, now: Instant, shifted: bool) -> Option<(KeyCode, Duration)> {
         if shifted || !self.keys_by_character {
             return None;
         }
@@ -522,13 +579,14 @@ impl KeyboardListener {
         if !(t.symbol && t.latest_shifted) {
             return None;
         }
+        let window = t.repeat_window();
         let repeating = if t.repeated {
-            now.saturating_duration_since(t.last_report) < AUTO_RELEASE_TIMEOUT
+            now.saturating_duration_since(t.last_report) < window
         } else {
             (MIN_AUTOREPEAT_DELAY..MAX_AUTOREPEAT_DELAY)
                 .contains(&now.saturating_duration_since(t.pressed_at))
         };
-        repeating.then_some(key)
+        repeating.then_some((key, window))
     }
 
     /// A held-back press (see [`KeyboardListener`]) turned out to be a key
@@ -538,7 +596,11 @@ impl KeyboardListener {
         let Some(h) = self.held_back.take() else {
             return false;
         };
-        self.keys.insert(h.key, h.track);
+        let track = KeyTrack {
+            repeat_of: Some(h.of),
+            ..h.track
+        };
+        self.keys.insert(h.key, track);
         self.last_pressed = Some(h.key);
         self.emit(h.key, KeyEventType::Press, h.at)
     }
@@ -731,7 +793,7 @@ impl KeyboardListener {
         if self.release_reporting {
             let due = self
                 .held_back
-                .is_some_and(|h| now.saturating_duration_since(h.at) >= AUTO_RELEASE_TIMEOUT);
+                .is_some_and(|h| now.saturating_duration_since(h.at) >= h.window);
             return usize::from(due && self.settle_held_back());
         }
         let mut out = Vec::new();
@@ -1503,6 +1565,110 @@ mod tests {
                 "delay {delay} ms"
             );
         }
+    }
+
+    #[test]
+    fn a_single_repeat_typed_without_shift_leaves_no_key_down() {
+        let shift = KeyModifiers::SHIFT;
+        let none = KeyModifiers::NONE;
+        let one_keystroke = vec![(40, KeyEventType::Press), (40, KeyEventType::Release)];
+        // German Shift+2 ('"') repeating; Shift lifts for one repeat (a hand
+        // moving, a worn Shift chattering open), so one repeat types '2'
+        // (key 3), then Shift is down again and the repeats type '"'
+        let mut reports = console_hold('"', shift, 0, 800);
+        reports.extend([
+            (830, true, '2', none),
+            (863, true, '"', shift),
+            (896, true, '"', shift),
+            (920, false, '"', shift),
+        ]);
+        let (events, down) = console_at(&reports);
+        assert!(down.is_empty(), "{down:?} still down");
+        assert_eq!(summary(&events), one_keystroke);
+
+        // Shift lifts for one repeat and goes down again, and the key is let
+        // go a moment later, with Shift still down: '"' comes up
+        let mut reports = console_hold('"', shift, 0, 800);
+        reports.extend([(830, true, '2', none), (880, false, '"', shift)]);
+        let (events, down) = console_at(&reports);
+        assert!(down.is_empty(), "{down:?} still down");
+        assert_eq!(summary(&events), one_keystroke);
+
+        // Shift going down again ends the key's autorepeat (the last key
+        // pressed repeats), so nothing follows the '2' until the key comes
+        // up, as '"' with Shift down or as '2' with Shift let go first
+        for (release, modifiers) in [('"', shift), ('2', none)] {
+            let mut reports = console_hold('"', shift, 0, 800);
+            reports.extend([(830, true, '2', none), (1300, false, release, modifiers)]);
+            let (events, down) = console_at(&reports);
+            assert!(
+                down.is_empty(),
+                "released as {release}: {down:?} still down"
+            );
+            let last = events.last().unwrap();
+            assert_eq!(
+                last.timestamp - events[0].timestamp,
+                Duration::from_millis(1300),
+                "released as {release}: {events:?}"
+            );
+        }
+
+        // Another key pressed while the symbol key is still held after its
+        // one '2' repeat: it registers, and the symbol key still comes up
+        let mut reports = console_hold('"', shift, 0, 800);
+        reports.extend([
+            (830, true, '2', none),
+            (850, true, 'x', none),
+            (920, false, 'x', none),
+            (1100, false, '2', none),
+        ]);
+        let (events, down) = console_at(&reports);
+        assert!(down.is_empty(), "{down:?} still down");
+        let x: Vec<_> = summary(&events)
+            .into_iter()
+            .filter(|(key, _)| *key == 45)
+            .collect();
+        assert_eq!(
+            x,
+            vec![(45, KeyEventType::Press), (45, KeyEventType::Release)]
+        );
+    }
+
+    #[test]
+    fn a_slow_repeat_rate_still_keeps_the_symbol_key_one_keystroke() {
+        let shift = KeyModifiers::SHIFT;
+        let none = KeyModifiers::NONE;
+        // Windows repeat rate at the slow end (400 ms between repeats, 1 s
+        // delay): Shift+2 ('"') repeats, Shift is let go, the next repeats
+        // type '2' 400 ms apart, and the key comes up as '2'
+        let (events, down) = console_at(&[
+            (0, true, '"', shift),
+            (1000, true, '"', shift),
+            (1400, true, '"', shift),
+            (1800, true, '2', none),
+            (2200, true, '2', none),
+            (2300, false, '2', none),
+        ]);
+        assert!(down.is_empty(), "{down:?} still down");
+        assert_eq!(
+            summary(&events),
+            vec![(40, KeyEventType::Press), (40, KeyEventType::Release)]
+        );
+        assert_eq!(
+            events[1].timestamp - events[0].timestamp,
+            Duration::from_millis(2300)
+        );
+
+        // Shift let go before the first repeat: no interval known yet, but
+        // the symbol key is not left down either
+        let (_, down) = console_at(&[
+            (0, true, '"', shift),
+            (1000, true, '2', none),
+            (1400, true, '2', none),
+            (1800, true, '2', none),
+            (1900, false, '2', none),
+        ]);
+        assert!(down.is_empty(), "{down:?} still down");
     }
 
     #[test]
