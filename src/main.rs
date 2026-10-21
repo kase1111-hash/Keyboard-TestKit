@@ -673,8 +673,9 @@ const NO_KEYBOARD_STATUS: &str =
 /// and record disconnects as a finding (Dashboard, report, exit summary).
 #[cfg(target_os = "linux")]
 fn report_device_changes(app: &mut App, evdev: &mut EvdevListener) {
+    let mut batch = DeviceBatch::default();
     for change in evdev.take_device_changes() {
-        apply_device_change(app, change, evdev.device_count());
+        apply_device_change(app, change, evdev.device_count(), &mut batch);
     }
     // Keep saying so while nothing is connected (other messages expire)
     if evdev.device_count() == 0 && app.get_status().is_none() {
@@ -682,39 +683,63 @@ fn report_device_changes(app: &mut App, evdev: &mut EvdevListener) {
     }
 }
 
+/// What the device changes read in one poll did so far: unplugging one
+/// keyboard removes several nodes at once.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct DeviceBatch {
+    /// A keyboard that was typed on went away
+    keyboard_lost: bool,
+    /// That stopped the auto test
+    stopped: bool,
+}
+
 /// Handle one device appearing or disappearing; `devices_left` are still open.
 ///
 /// A keyboard that was typed on going away is a disconnect: a finding, and
 /// it stops a running auto test, whose steps would otherwise time out and
 /// blame the missing input on dead keys. A node nothing was typed on (a
-/// YubiKey, the keyboard interface of a mouse) is only mentioned.
+/// YubiKey, the keyboard interface of a mouse) is only mentioned, unless a
+/// keyboard went away with it.
 #[cfg(target_os = "linux")]
-fn apply_device_change(app: &mut App, change: EvdevDeviceChange, devices_left: usize) {
+fn apply_device_change(
+    app: &mut App,
+    change: EvdevDeviceChange,
+    devices_left: usize,
+    batch: &mut DeviceBatch,
+) {
     match change {
         EvdevDeviceChange::Disconnected {
             name, typed: true, ..
         } => {
             app.keyboard_disconnected(&name);
-            let stopped = if app.auto_test_running() {
+            batch.keyboard_lost = true;
+            if app.auto_test_running() {
                 app.abort_auto_test();
-                " - auto test stopped"
-            } else {
-                ""
-            };
+                batch.stopped = true;
+            }
             let left = match devices_left {
                 0 => "no keyboard left".to_string(),
                 n => format!("{} device(s) left", n),
             };
             app.set_status(format!(
                 "Keyboard disconnected: {} ({}){}",
-                name, left, stopped
+                name,
+                left,
+                if batch.stopped {
+                    " - auto test stopped"
+                } else {
+                    ""
+                }
             ));
         }
         EvdevDeviceChange::Disconnected { name, .. } => {
-            app.set_status(format!(
-                "Input device removed: {} (nothing was typed on it)",
-                name
-            ));
+            if !batch.keyboard_lost {
+                app.set_status(format!(
+                    "Input device removed: {} (nothing was typed on it)",
+                    name
+                ));
+            }
         }
         EvdevDeviceChange::Connected { name, .. } => {
             app.keyboard_connected();
@@ -1638,17 +1663,28 @@ mod tests {
         let mut app = App::default();
         app.set_input_source(InputSource::Evdev);
         app.start_auto_test();
-        apply_device_change(&mut app, gone("Yubico YubiKey OTP+FIDO+CCID", false), 2);
+        let mut batch = DeviceBatch::default();
+        let yubikey = gone("Yubico YubiKey OTP+FIDO+CCID", false);
+        apply_device_change(&mut app, yubikey, 2, &mut batch);
         assert!(app.auto_test_running());
         assert_eq!(app.keyboard_disconnects(), 0);
         assert!(app.get_status().unwrap().contains("YubiKey"));
 
-        // The keyboard being typed on going away stops the run and is a finding
-        apply_device_change(&mut app, gone("USB Keyboard", true), 1);
+        // The keyboard being typed on going away (with its media-key node,
+        // never typed on, in the same poll) stops the run and is a finding
+        let mut batch = DeviceBatch::default();
+        apply_device_change(&mut app, gone("USB Keyboard", true), 2, &mut batch);
+        let media = gone("USB Keyboard Consumer Control", false);
+        apply_device_change(&mut app, media, 1, &mut batch);
         assert!(!app.auto_test_running());
         assert_eq!(app.keyboard_disconnects(), 1);
         assert!(app.findings.iter().any(|f| f.category == "Connection"));
-        assert!(app.get_status().unwrap().ends_with("auto test stopped"));
+        let status = app.get_status().unwrap();
+        assert!(
+            status.starts_with("Keyboard disconnected: USB Keyboard"),
+            "{status}"
+        );
+        assert!(status.ends_with("auto test stopped"), "{status}");
     }
 
     #[test]
