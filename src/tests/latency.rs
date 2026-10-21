@@ -1,11 +1,13 @@
 //! Event timing measurement test module
 //!
-//! Measures inter-event timing (time between consecutive poll cycles that
-//! detect key events). This reflects the poll-to-poll interval, **not** true
-//! end-to-end input latency from physical switch actuation to application
-//! delivery. True input latency requires external hardware measurement.
+//! Records the gap between each key press and the key event before it (any
+//! key). Between different keys that gap is set by the typist (50-300 ms when
+//! typing), not by the keyboard, so the results are informational statistics
+//! and never rate the keyboard. The keyboard's own report interval is
+//! estimated by the polling test from timestamp quantization; true
+//! end-to-end input latency requires external hardware measurement.
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{KeyboardTest, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use crate::utils::MinMaxExt;
 use std::collections::HashMap;
@@ -36,9 +38,9 @@ impl KeyTimingStats {
 
 /// Test for measuring inter-event timing
 ///
-/// Measures the time between consecutive keyboard events as observed by the
-/// polling loop. This is the poll-to-detection interval — not true end-to-end
-/// input latency, which would require external hardware measurement.
+/// Measures the time between each key press and the previous key event. This
+/// reflects typing rhythm, not keyboard speed or latency, so nothing here is
+/// colour-coded as good or bad.
 pub struct EventTimingTest {
     /// Per-key timing measurements (based on delta from event)
     key_stats: HashMap<KeyCode, KeyTimingStats>,
@@ -82,15 +84,14 @@ impl EventTimingTest {
         self.global_avg_us().map(|us| us / 1000.0)
     }
 
-    /// Get timing rating based on average
+    /// Describe what the average gap means.
+    ///
+    /// Deliberately not a quality rating: the gaps between key events are set
+    /// by the typist, so a "poor" value would only say how fast someone typed.
     pub fn timing_rating(&self) -> &'static str {
         match self.global_avg_ms() {
             None => "Not measured",
-            Some(ms) if ms < 5.0 => "Excellent (<5ms)",
-            Some(ms) if ms < 10.0 => "Great (<10ms)",
-            Some(ms) if ms < 20.0 => "Good (<20ms)",
-            Some(ms) if ms < 50.0 => "Acceptable (<50ms)",
-            Some(_) => "Poor (>50ms)",
+            Some(_) => "Typing rhythm (not a keyboard rating)",
         }
     }
 
@@ -141,7 +142,7 @@ impl KeyboardTest for EventTimingTest {
     }
 
     fn description(&self) -> &'static str {
-        "Measures inter-event timing (poll-to-detection interval per key)"
+        "Measures inter-event timing (gap before each key press; informational)"
     }
 
     fn process_event(&mut self, event: &KeyEvent) {
@@ -156,8 +157,7 @@ impl KeyboardTest for EventTimingTest {
 
         self.total_events += 1;
 
-        // Use delta_us from the event as our timing measurement
-        // This represents the time since the last poll cycle
+        // delta_us is the time since the previous key event of any key
         let timing_us = event.delta_us;
 
         // Record global sample
@@ -186,20 +186,20 @@ impl KeyboardTest for EventTimingTest {
 
         results.push(TestResult::info("--- What This Measures ---", ""));
         results.push(TestResult::info(
-            "Inter-event timing = poll",
-            "interval when key detected",
+            "Gap before each press",
+            "since the previous key event",
+        ));
+        results.push(TestResult::info(
+            "Set by your typing rhythm,",
+            "not by the keyboard",
+        ));
+        results.push(TestResult::info(
+            "Keyboard report interval:",
+            "see Polling view (Est. Poll Rate)",
         ));
         results.push(TestResult::info(
             "NOT true input latency",
             "(requires hardware probe)",
-        ));
-        results.push(TestResult::info(
-            "Affected by: polling rate,",
-            "USB interval, CPU load",
-        ));
-        results.push(TestResult::info(
-            "Look for: <10ms excellent,",
-            "<20ms good, >50ms poor",
         ));
         results.push(TestResult::info("", ""));
 
@@ -208,37 +208,23 @@ impl KeyboardTest for EventTimingTest {
             format!("{}", self.global_samples.len()),
         ));
 
-        // Average timing
+        // Statistics only: none of these say anything about keyboard quality.
         if let Some(avg_ms) = self.global_avg_ms() {
-            let status = if avg_ms < 10.0 {
-                ResultStatus::Ok
-            } else if avg_ms < 20.0 {
-                ResultStatus::Warning
-            } else {
-                ResultStatus::Error
-            };
-            results.push(TestResult::new(
-                "Avg Event Timing",
-                format!("{:.2} ms", avg_ms),
-                status,
-            ));
+            results.push(TestResult::info("Avg Gap", format!("{:.2} ms", avg_ms)));
         }
-
-        // Min/Max
         if let Some(min) = self.global_min_us {
+            // 0 ms is normal: keys sent in the same USB report share a timestamp
             results.push(TestResult::info(
-                "Min Timing",
+                "Shortest Gap",
                 format!("{:.2} ms", min as f64 / 1000.0),
             ));
         }
         if let Some(max) = self.global_max_us {
             results.push(TestResult::info(
-                "Max Timing",
+                "Longest Gap",
                 format!("{:.2} ms", max as f64 / 1000.0),
             ));
         }
-
-        // Standard deviation
         if let Some(std_dev) = self.std_dev_us() {
             results.push(TestResult::info(
                 "Std Dev",
@@ -246,22 +232,19 @@ impl KeyboardTest for EventTimingTest {
             ));
         }
 
-        // Rating
-        results.push(TestResult::info("Rating", self.timing_rating().to_string()));
-
-        // Fastest/Slowest keys
+        // Per-key averages show which keys you reach quickly, not slow keys
         if let Some((key, timing)) = self.fastest_key() {
             let key_info = keymap::get_key_info(key);
-            results.push(TestResult::ok(
-                "Fastest Key",
-                format!("{}: {:.2}ms", key_info.name, timing / 1000.0),
+            results.push(TestResult::info(
+                "Shortest Avg Gap",
+                format!("{}: {:.2} ms", key_info.name, timing / 1000.0),
             ));
         }
         if let Some((key, timing)) = self.slowest_key() {
             let key_info = keymap::get_key_info(key);
-            results.push(TestResult::warning(
-                "Slowest Key",
-                format!("{}: {:.2}ms", key_info.name, timing / 1000.0),
+            results.push(TestResult::info(
+                "Longest Avg Gap",
+                format!("{}: {:.2} ms", key_info.name, timing / 1000.0),
             ));
         }
 
@@ -301,38 +284,41 @@ mod tests {
     }
 
     #[test]
-    fn timing_rating_excellent() {
-        let mut test = EventTimingTest::new();
-        test.global_samples = vec![4000, 4000, 4000];
-        assert_eq!(test.timing_rating(), "Excellent (<5ms)");
+    fn timing_rating_is_not_a_quality_verdict() {
+        // Gaps of 4 ms or 60 ms only describe how someone typed
+        for gap in [4000u64, 15000, 60000, 150000] {
+            let mut test = EventTimingTest::new();
+            test.global_samples = vec![gap; 3];
+            let rating = test.timing_rating();
+            for verdict in ["Excellent", "Great", "Good", "Acceptable", "Poor"] {
+                assert!(!rating.contains(verdict), "{}", rating);
+            }
+        }
     }
 
     #[test]
-    fn timing_rating_great() {
+    fn normal_typing_is_not_rated_as_a_slow_keyboard() {
+        // A healthy 1000 Hz keyboard under a normal typist: 50-300 ms gaps,
+        // plus two keys that arrived in the same USB report (0 ms).
         let mut test = EventTimingTest::new();
-        test.global_samples = vec![8000, 8000, 8000];
-        assert_eq!(test.timing_rating(), "Great (<10ms)");
-    }
-
-    #[test]
-    fn timing_rating_good() {
-        let mut test = EventTimingTest::new();
-        test.global_samples = vec![15000, 15000, 15000];
-        assert_eq!(test.timing_rating(), "Good (<20ms)");
-    }
-
-    #[test]
-    fn timing_rating_acceptable() {
-        let mut test = EventTimingTest::new();
-        test.global_samples = vec![30000, 30000, 30000];
-        assert_eq!(test.timing_rating(), "Acceptable (<50ms)");
-    }
-
-    #[test]
-    fn timing_rating_poor() {
-        let mut test = EventTimingTest::new();
-        test.global_samples = vec![60000, 60000, 60000];
-        assert_eq!(test.timing_rating(), "Poor (>50ms)");
+        for (i, gap) in [90_000u64, 120_000, 0, 75_000, 280_000, 150_000]
+            .iter()
+            .enumerate()
+        {
+            test.process_event(&make_press(KeyCode(30 + i as u16), *gap));
+        }
+        let results = test.get_results();
+        let judged: Vec<&TestResult> = results
+            .iter()
+            .filter(|r| r.status != crate::tests::ResultStatus::Info)
+            .collect();
+        assert!(judged.is_empty(), "{:?}", judged);
+        assert!(!results.iter().any(|r| r.value.contains("Poor")));
+        assert!(results
+            .iter()
+            .any(|r| r.label == "Avg Gap" && r.value.starts_with("119.17")));
+        // Points to the real keyboard measurement
+        assert!(results.iter().any(|r| r.value.contains("Polling view")));
     }
 
     #[test]

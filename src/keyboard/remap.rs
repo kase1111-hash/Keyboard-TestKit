@@ -331,7 +331,7 @@ impl KeyRemapper {
     /// Get recently captured keys sorted by timestamp (most recent first)
     pub fn recent_captured(&self, count: usize) -> Vec<&CapturedKey> {
         let mut keys: Vec<_> = self.captured_keys.values().collect();
-        keys.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        keys.sort_by_key(|k| std::cmp::Reverse(k.timestamp));
         keys.into_iter().take(count).collect()
     }
 

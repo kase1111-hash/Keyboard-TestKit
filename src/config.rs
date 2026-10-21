@@ -11,6 +11,10 @@
 //! | macOS | `~/Library/Application Support/keyboard-testkit/config.toml` |
 //! | Windows | `%APPDATA%\keyboard-testkit\config.toml` |
 //!
+//! On Linux, run with `sudo`, `~` is the home of the user who ran sudo, not
+//! root's (sudo resets `HOME`); files created there are given to that user.
+//! `--config <path>` picks another file.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -30,7 +34,7 @@ use crate::keyboard::remap::FnKeyMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Error type for configuration operations
@@ -92,7 +96,12 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 
     // Create directory if it doesn't exist
     if !app_dir.exists() {
+        let config_dir_existed = config_dir.exists();
         fs::create_dir_all(&app_dir)?;
+        if !config_dir_existed {
+            give_to_invoking_user(&config_dir);
+        }
+        give_to_invoking_user(&app_dir);
     }
 
     Ok(app_dir.join("config.toml"))
@@ -102,15 +111,11 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 fn platform_config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        // $XDG_CONFIG_HOME or ~/.config
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg));
-            }
-        }
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".config"))
+        linux_config_dir(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            std::env::var("HOME").ok().map(PathBuf::from),
+            sudo_user().map(|u| u.home),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -130,8 +135,155 @@ fn platform_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// The Linux config directory: `$XDG_CONFIG_HOME` or `~/.config`.
+///
+/// Under sudo (`sudo_home` is the invoking user's home) `HOME` is root's:
+/// the user's own file is meant, as the app tells users to run it with sudo
+/// for evdev. sudo drops `XDG_CONFIG_HOME` unless told to keep the
+/// environment, and then it is the user's.
+#[cfg(target_os = "linux")]
+fn linux_config_dir(
+    xdg_config_home: Option<String>,
+    home: Option<PathBuf>,
+    sudo_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(xdg));
+    }
+    sudo_home.or(home).map(|h| h.join(".config"))
+}
+
+/// The user who ran this process through sudo.
+#[cfg(target_os = "linux")]
+struct SudoUser {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: PathBuf,
+}
+
+/// The user who ran this process through sudo, if it runs as root via sudo
+/// on behalf of another user.
+#[cfg(target_os = "linux")]
+fn sudo_user() -> Option<SudoUser> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let name = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|n| !n.is_empty() && n != "root")?;
+    let name = CString::new(name).ok()?;
+    // SAFETY: getpwnam gets a NUL-terminated name and returns null or a
+    // pointer to a passwd record in static storage, which is copied out
+    // below before any other passwd lookup can overwrite it.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: `pw` is a valid passwd record (checked above); pw_dir is
+    // null or a NUL-terminated string.
+    let (uid, gid, dir) = unsafe { ((*pw).pw_uid, (*pw).pw_gid, (*pw).pw_dir) };
+    if dir.is_null() {
+        return None;
+    }
+    // SAFETY: `dir` is a non-null NUL-terminated string (see above).
+    let home = OsStr::from_bytes(unsafe { CStr::from_ptr(dir) }.to_bytes());
+    Some(SudoUser {
+        uid,
+        gid,
+        home: PathBuf::from(home),
+    })
+}
+
+/// Under sudo, hand a file or directory created in the invoking user's
+/// config directory to that user: owned by root, it could not be saved
+/// again by a run without sudo.
+fn give_to_invoking_user(path: &Path) {
+    #[cfg(target_os = "linux")]
+    if let Some(user) = sudo_user() {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            // SAFETY: chown gets a NUL-terminated path; a failure only
+            // leaves the file owned by root, as before.
+            unsafe {
+                libc::chown(path.as_ptr(), user.uid, user.gid);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+}
+
+// ----------------------------------------------------------------------------
+// Allowed ranges. A hand-edited config.toml is clamped to these on load (see
+// `Config::sanitize`); the Settings view stays within them.
+// ----------------------------------------------------------------------------
+
+/// Shortest polling run. The Settings view steps in 5 s; a shorter run does
+/// not collect enough keystrokes for a rate estimate (0 ends before it starts).
+pub const POLLING_DURATION_SECS_MIN: u64 = 5;
+/// Longest polling run. Nobody types for an hour to measure a poll rate.
+pub const POLLING_DURATION_SECS_MAX: u64 = 3600;
+/// Polling sample window: at least one 125 Hz poll interval (8 ms, rounded
+/// up to 10 ms)...
+pub const SAMPLE_WINDOW_MS_MIN: u64 = 10;
+/// ...and at most 10 s (the default polling run); a longer window is in
+/// effect the whole-run average.
+pub const SAMPLE_WINDOW_MS_MAX: u64 = 10_000;
+/// Lowest stuck-key threshold. A keystroke lasts 50-150 ms, so anything
+/// shorter would flag ordinary typing; 250 ms is also the Settings view step.
+/// A lower value in a config file gets the default instead (see `sanitize`).
+pub const STUCK_THRESHOLD_MS_MIN: u64 = 250;
+/// Highest stuck-key threshold. Past a minute the check would practically
+/// never fire during a test session.
+pub const STUCK_THRESHOLD_MS_MAX: u64 = 60_000;
+/// Bounce (release -> re-press) window: the bounce test's own limits, so the
+/// saved value, the Settings view and the running test always agree. Below
+/// 20 ms a 125 Hz keyboard's chatter (one or two 8 ms reports after the
+/// release) is missed; older files saved 5 ms, which now loads as 20...
+pub const BOUNCE_WINDOW_MS_MIN: u64 = crate::tests::MIN_BOUNCE_WINDOW_MS;
+/// ...and above 40 ms fast same-key drumming (key up ~30-40 ms) would count
+/// as bounce.
+pub const BOUNCE_WINDOW_MS_MAX: u64 = crate::tests::MAX_BOUNCE_WINDOW_MS;
+/// UI refresh rate. Below 10 Hz the screen and the stuck-key check visibly
+/// lag (0 would divide by zero)...
+pub const REFRESH_RATE_HZ_MIN: u32 = 10;
+/// ...and displays (so terminal emulators) rarely refresh faster than 240 Hz,
+/// so a higher rate only burns CPU.
+pub const REFRESH_RATE_HZ_MAX: u32 = 240;
+/// Shortcut overlay duration: 0 would hide it immediately...
+pub const WARNING_DURATION_SECS_MIN: u32 = 1;
+/// ...and a huge value would leave it covering the results.
+pub const WARNING_DURATION_SECS_MAX: u32 = 30;
+
+/// Readers for the numeric settings that accept any TOML integer. A
+/// hand-edited value the field's type cannot hold (negative, or too large)
+/// saturates to the nearest one and `Config::sanitize` then clamps it,
+/// instead of failing the whole file and silently dropping every other
+/// setting (key mappings included) back to its default.
+mod saturating {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        // TOML integers are i64, so this covers every value a file can hold
+        Ok(i64::deserialize(deserializer)?.max(0) as u64)
+    }
+
+    pub fn u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+        let value = i64::deserialize(deserializer)?;
+        Ok(value.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+}
+
 /// Main application configuration
+///
+/// Missing sections or fields fall back to their defaults, so a partly
+/// hand-written config.toml still loads.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Config {
     /// Polling rate test settings
     pub polling: PollingConfig,
@@ -148,10 +300,13 @@ pub struct Config {
 
 /// Polling rate test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PollingConfig {
     /// Test duration in seconds
+    #[serde(deserialize_with = "saturating::u64")]
     pub test_duration_secs: u64,
     /// Sample window for averaging (in milliseconds)
+    #[serde(deserialize_with = "saturating::u64")]
     pub sample_window_ms: u64,
 }
 
@@ -166,8 +321,10 @@ impl Default for PollingConfig {
 
 /// Stickiness detection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StickinessConfig {
     /// Threshold in ms after which a key is considered stuck
+    #[serde(deserialize_with = "saturating::u64")]
     pub stuck_threshold_ms: u64,
 }
 
@@ -184,17 +341,25 @@ impl Default for StickinessConfig {
 
 /// Hold and release test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HoldReleaseConfig {
-    /// Bounce detection window in ms
+    /// Bounce detection window in ms: a press of a key this soon after its
+    /// release is a bounce (clamped to `BOUNCE_WINDOW_MS_MIN`..=`_MAX`, 20-40)
+    #[serde(deserialize_with = "saturating::u64")]
     pub bounce_window_ms: u64,
-    /// Minimum hold time to register as intentional
+    /// Minimum hold time to register as intentional.
+    /// Not used by any test yet; kept so existing config files still load.
+    #[serde(deserialize_with = "saturating::u64")]
     pub min_hold_ms: u64,
 }
 
 impl Default for HoldReleaseConfig {
     fn default() -> Self {
         Self {
-            bounce_window_ms: 5,
+            // A finger needs 30+ ms to re-press a key; chatter re-registers
+            // within one or two reports (8-16 ms at 125 Hz). The old 5 ms
+            // could never see it on a 125 Hz keyboard.
+            bounce_window_ms: crate::tests::DEFAULT_BOUNCE_WINDOW_MS,
             min_hold_ms: 10,
         }
     }
@@ -202,10 +367,13 @@ impl Default for HoldReleaseConfig {
 
 /// UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// Refresh rate for UI updates (in Hz)
+    #[serde(deserialize_with = "saturating::u32")]
     pub refresh_rate_hz: u32,
     /// Show warning overlay duration in seconds
+    #[serde(deserialize_with = "saturating::u32")]
     pub warning_duration_secs: u32,
     /// Color theme (dark/light)
     pub theme: Theme,
@@ -230,8 +398,9 @@ pub enum Theme {
 
 /// OEM key and remapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OemKeyConfig {
-    /// Enable OEM key capture and remapping
+    /// Apply the custom `key_mappings` (FN handling is set by `fn_mode`)
     pub enabled: bool,
     /// FN key handling mode
     pub fn_mode: FnKeyMode,
@@ -244,9 +413,12 @@ pub struct OemKeyConfig {
     /// Custom FN+key combinations: (key_scancode, result_scancode)
     #[serde(default)]
     pub fn_combos: Vec<(u16, u16)>,
-    /// Capture unknown/unmapped keys for analysis
+    /// Capture unknown/unmapped keys for analysis.
+    /// Not used yet (unknown keys are always captured); kept so existing
+    /// config files still load.
     pub capture_unknown: bool,
-    /// Show OEM key notifications
+    /// Show OEM key notifications.
+    /// Not used yet; kept so existing config files still load.
     pub show_notifications: bool,
 }
 
@@ -300,7 +472,84 @@ impl OemKeyConfig {
     }
 }
 
+/// What reading the config file gave: the settings in effect, and what the
+/// user has to be told about the file. A file that fails to load must not
+/// pass silently: the app then runs on defaults, and saving would replace
+/// the file (and the key mappings in it) with them.
+#[derive(Debug, Default)]
+pub struct ConfigLoad {
+    /// The settings in effect (the defaults if the file could not be used)
+    pub config: Config,
+    /// The file read and saved to (`None` without a config directory)
+    pub path: Option<PathBuf>,
+    /// Out-of-range values that were clamped or replaced (see `sanitize`)
+    pub adjusted: Vec<String>,
+    /// Why the file could not be used; the defaults are in effect
+    pub error: Option<String>,
+}
+
+impl ConfigLoad {
+    /// Whether a config file exists that could not be used, so saving over
+    /// it would lose what it holds (see [`Config::save_to_backing_up`]).
+    pub fn unreadable(&self) -> bool {
+        self.error.is_some() && self.path.as_deref().is_some_and(Path::exists)
+    }
+
+    /// One line per thing the user should know about the file.
+    pub fn notes(&self) -> Vec<String> {
+        let file = self
+            .path
+            .as_deref()
+            .map_or("config file".to_string(), |p| p.display().to_string());
+        let mut notes = Vec::new();
+        if let Some(error) = &self.error {
+            notes.push(format!(
+                "{}: not used, defaults in effect ({})",
+                file, error
+            ));
+        }
+        notes.extend(self.adjusted.iter().map(|a| format!("{}: {}", file, a)));
+        notes
+    }
+}
+
 impl Config {
+    /// Load the config file like [`Config::load`], but keep what went wrong
+    /// (a file that does not parse, values that were clamped) for the user.
+    pub fn load_reporting() -> ConfigLoad {
+        match config_path() {
+            Ok(path) => Self::load_reporting_from(&path),
+            Err(e) => ConfigLoad {
+                error: Some(e.to_string()),
+                ..ConfigLoad::default()
+            },
+        }
+    }
+
+    /// [`Config::load_reporting`] for a specific file. A missing file gives
+    /// the defaults without a note.
+    pub fn load_reporting_from(path: &Path) -> ConfigLoad {
+        let mut load = ConfigLoad {
+            path: Some(path.to_path_buf()),
+            ..ConfigLoad::default()
+        };
+        if !path.exists() {
+            return load;
+        }
+        let parsed = fs::read_to_string(path)
+            .map_err(ConfigError::from)
+            .and_then(|contents| toml::from_str::<Config>(&contents).map_err(ConfigError::from));
+        match parsed {
+            Ok(mut config) => {
+                load.adjusted = config.sanitize();
+                load.config = config;
+            }
+            // toml errors quote the offending line over several lines
+            Err(e) => load.error = Some(e.to_string().replace('\n', " ")),
+        }
+        load
+    }
+
     /// Load configuration from the default config file.
     ///
     /// Returns the default configuration if the file doesn't exist.
@@ -323,18 +572,82 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let contents = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&contents)?;
-        Ok(config)
+        Self::load_from(&path)
     }
 
     /// Load configuration from a specific path.
     ///
-    /// Useful for testing or using custom config locations.
+    /// Useful for testing or using custom config locations. Out-of-range
+    /// values are clamped (see `sanitize`).
     pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.sanitize();
         Ok(config)
+    }
+
+    /// Clamp every value to the range the app can work with, so a
+    /// hand-edited config.toml cannot crash the app (refresh rate 0) or
+    /// silently break a test (stuck threshold 0 flags every keystroke).
+    ///
+    /// Returns a description of each value that was changed.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let mut changes = Vec::new();
+        clamp_field(
+            &mut changes,
+            "polling.test_duration_secs",
+            &mut self.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MIN,
+            POLLING_DURATION_SECS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "polling.sample_window_ms",
+            &mut self.polling.sample_window_ms,
+            SAMPLE_WINDOW_MS_MIN,
+            SAMPLE_WINDOW_MS_MAX,
+        );
+        // Files saved while the default was 50 ms (the Settings view then
+        // went down to 10 ms) carry a threshold below the minimum. Raising
+        // it to the minimum would still flag a Shift held for a capital
+        // letter as stuck, so use the default instead.
+        if self.stickiness.stuck_threshold_ms < STUCK_THRESHOLD_MS_MIN {
+            let default = StickinessConfig::default().stuck_threshold_ms;
+            changes.push(format!(
+                "stickiness.stuck_threshold_ms = {} is below {}, using the default {}",
+                self.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN, default
+            ));
+            self.stickiness.stuck_threshold_ms = default;
+        }
+        clamp_field(
+            &mut changes,
+            "stickiness.stuck_threshold_ms",
+            &mut self.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MIN,
+            STUCK_THRESHOLD_MS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "hold_release.bounce_window_ms",
+            &mut self.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MIN,
+            BOUNCE_WINDOW_MS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "ui.refresh_rate_hz",
+            &mut self.ui.refresh_rate_hz,
+            REFRESH_RATE_HZ_MIN,
+            REFRESH_RATE_HZ_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "ui.warning_duration_secs",
+            &mut self.ui.warning_duration_secs,
+            WARNING_DURATION_SECS_MIN,
+            WARNING_DURATION_SECS_MAX,
+        );
+        changes
     }
 
     /// Save configuration to the default config file.
@@ -360,13 +673,53 @@ impl Config {
     /// Useful for testing or using custom config locations.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
+        let existed = path.exists();
         fs::write(path, &contents)?;
+        if !existed {
+            give_to_invoking_user(path);
+        }
         Ok(())
+    }
+
+    /// Save over a file that could not be loaded, keeping the old file as
+    /// `<name>.bak` first (its key mappings would be lost otherwise).
+    /// Returns where the old file was kept. Nothing is written if it cannot
+    /// be kept.
+    pub fn save_to_backing_up(&self, path: &PathBuf) -> Result<PathBuf, ConfigError> {
+        let mut backup = path.clone().into_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        let existed = backup.exists();
+        fs::copy(path, &backup)?;
+        if !existed {
+            give_to_invoking_user(&backup);
+        }
+        self.save_to(path)?;
+        Ok(backup)
     }
 
     /// Get UI refresh interval as Duration
     pub fn refresh_interval(&self) -> Duration {
-        Duration::from_micros(1_000_000 / self.ui.refresh_rate_hz as u64)
+        let hz = self
+            .ui
+            .refresh_rate_hz
+            .clamp(REFRESH_RATE_HZ_MIN, REFRESH_RATE_HZ_MAX);
+        Duration::from_micros(1_000_000 / hz as u64)
+    }
+}
+
+/// Clamp `value` to `min..=max`, noting the change in `changes`.
+fn clamp_field<T>(changes: &mut Vec<String>, name: &str, value: &mut T, min: T, max: T)
+where
+    T: Copy + Ord + std::fmt::Display,
+{
+    let clamped = (*value).clamp(min, max);
+    if clamped != *value {
+        changes.push(format!(
+            "{} = {} is outside {}..={}, using {}",
+            name, value, min, max, clamped
+        ));
+        *value = clamped;
     }
 }
 
@@ -375,17 +728,13 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn temp_config_path() -> PathBuf {
-        env::temp_dir().join(format!("keyboard-testkit-test-{}.toml", std::process::id()))
-    }
-
     #[test]
     fn config_default_values() {
         let config = Config::default();
         assert_eq!(config.polling.test_duration_secs, 10);
         assert_eq!(config.polling.sample_window_ms, 100);
         assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
-        assert_eq!(config.hold_release.bounce_window_ms, 5);
+        assert_eq!(config.hold_release.bounce_window_ms, 20);
         assert_eq!(config.hold_release.min_hold_ms, 10);
         assert_eq!(config.ui.refresh_rate_hz, 60);
         assert_eq!(config.ui.theme, Theme::Dark);
@@ -409,7 +758,7 @@ mod tests {
 
     #[test]
     fn config_save_and_load_roundtrip() {
-        let path = temp_config_path();
+        let path = temp_path("roundtrip");
 
         // Create non-default config
         let mut config = Config::default();
@@ -504,6 +853,34 @@ theme = "Light"
         assert!(path.to_string_lossy().ends_with("config.toml"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sudo_reads_the_invoking_users_config() {
+        let user = PathBuf::from("/home/alice");
+        let root = PathBuf::from("/root");
+        // sudo: HOME is root's, the invoking user's home is meant
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), Some(user.clone())),
+            Some(user.join(".config"))
+        );
+        // Without sudo, and for root itself
+        assert_eq!(
+            linux_config_dir(None, Some(user.clone()), None),
+            Some(user.join(".config"))
+        );
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), None),
+            Some(root.join(".config"))
+        );
+        // XDG_CONFIG_HOME wins (sudo only keeps it when told to keep the
+        // user's environment)
+        assert_eq!(
+            linux_config_dir(Some("/cfg".into()), Some(root), Some(user)),
+            Some(PathBuf::from("/cfg"))
+        );
+        assert_eq!(linux_config_dir(Some(String::new()), None, None), None);
+    }
+
     #[test]
     fn theme_equality() {
         assert_eq!(Theme::Dark, Theme::Dark);
@@ -527,7 +904,7 @@ theme = "Light"
 
     #[test]
     fn config_load_malformed_toml_returns_parse_error() {
-        let path = temp_config_path();
+        let path = temp_path("malformed");
         fs::write(&path, "this is not [valid toml").unwrap();
         let result = Config::load_from(&path);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
@@ -546,5 +923,302 @@ theme = "Light"
     fn config_error_is_std_error() {
         let err: Box<dyn std::error::Error> = Box::new(ConfigError::NoConfigDir);
         assert!(!err.to_string().is_empty());
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "keyboard-testkit-test-{}-{}.toml",
+            name,
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn default_config_is_already_in_range() {
+        let mut config = Config::default();
+        assert!(config.sanitize().is_empty());
+    }
+
+    #[test]
+    fn sanitize_clamps_zero_and_absurd_values() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 0;
+        config.ui.warning_duration_secs = u32::MAX;
+        config.stickiness.stuck_threshold_ms = 0;
+        config.polling.test_duration_secs = 0;
+        config.polling.sample_window_ms = u64::MAX;
+        config.hold_release.bounce_window_ms = 0;
+
+        let changes = config.sanitize();
+        assert_eq!(changes.len(), 6, "{:?}", changes);
+        assert!(changes[0].contains("polling.test_duration_secs"));
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(config.ui.warning_duration_secs, WARNING_DURATION_SECS_MAX);
+        assert_eq!(
+            config.stickiness.stuck_threshold_ms,
+            StickinessConfig::default().stuck_threshold_ms
+        );
+        assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
+        assert_eq!(config.polling.sample_window_ms, SAMPLE_WINDOW_MS_MAX);
+        assert_eq!(config.hold_release.bounce_window_ms, BOUNCE_WINDOW_MS_MIN);
+
+        config.ui.refresh_rate_hz = 100_000;
+        config.sanitize();
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MAX);
+    }
+
+    #[test]
+    fn sanitize_keeps_in_range_user_values() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 144;
+        config.stickiness.stuck_threshold_ms = 5000;
+        config.polling.test_duration_secs = 30;
+        assert!(config.sanitize().is_empty());
+        assert_eq!(config.ui.refresh_rate_hz, 144);
+        assert_eq!(config.stickiness.stuck_threshold_ms, 5000);
+        assert_eq!(config.polling.test_duration_secs, 30);
+    }
+
+    #[test]
+    fn refresh_interval_never_divides_by_zero() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 0;
+        assert_eq!(
+            config.refresh_interval(),
+            Duration::from_micros(1_000_000 / REFRESH_RATE_HZ_MIN as u64)
+        );
+    }
+
+    #[test]
+    fn load_clamps_hand_edited_values() {
+        let path = temp_path("clamp");
+        fs::write(
+            &path,
+            r#"
+[polling]
+test_duration_secs = 0
+sample_window_ms = 100
+
+[stickiness]
+stuck_threshold_ms = 0
+
+[hold_release]
+bounce_window_ms = 5
+min_hold_ms = 10
+
+[ui]
+refresh_rate_hz = 0
+warning_duration_secs = 3
+theme = "Dark"
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("config with out-of-range values must still load");
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(
+            config.stickiness.stuck_threshold_ms,
+            StickinessConfig::default().stuck_threshold_ms
+        );
+        assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
+        assert!(config.refresh_interval() > Duration::ZERO);
+    }
+
+    #[test]
+    fn load_old_saved_config_gets_the_current_stuck_threshold() {
+        // Written by Settings -> Save before the default was raised from
+        // 50 ms. 50 ms flags ordinary keystrokes, and the 250 ms minimum
+        // would still flag a held Shift.
+        let path = temp_path("old");
+        fs::write(
+            &path,
+            r#"[polling]
+test_duration_secs = 10
+sample_window_ms = 100
+
+[stickiness]
+stuck_threshold_ms = 50
+
+[hold_release]
+bounce_window_ms = 5
+min_hold_ms = 10
+
+[ui]
+refresh_rate_hz = 60
+warning_duration_secs = 3
+theme = "Light"
+
+[oem_keys]
+enabled = true
+fn_mode = "CaptureOnly"
+fn_scancodes = []
+key_mappings = []
+fn_combos = []
+capture_unknown = true
+show_notifications = true
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("old config must load");
+        assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
+        assert_eq!(config.ui.theme, Theme::Light);
+        // The old 5 ms bounce window could never see chatter on a 125 Hz
+        // keyboard; it loads as the window the test actually uses
+        assert_eq!(config.hold_release.bounce_window_ms, 20);
+
+        // The lowest value the Settings view offers is kept as chosen
+        let mut config = Config::default();
+        config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MIN;
+        assert!(config.sanitize().is_empty());
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+    }
+
+    #[test]
+    fn bounce_window_range_is_the_one_the_test_uses() {
+        use crate::tests::HoldReleaseTest;
+        // What the file is clamped to is exactly what the test runs with, so
+        // the Settings view, the saved value and the test never disagree
+        assert_eq!(
+            HoldReleaseTest::new(0).bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            HoldReleaseTest::new(u64::MAX).bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MAX
+        );
+        for ms in [0, 5, 20, 33, 40, 100, 5000] {
+            let mut config = Config::default();
+            config.hold_release.bounce_window_ms = ms;
+            config.sanitize();
+            assert_eq!(
+                config.hold_release.bounce_window_ms,
+                HoldReleaseTest::new(ms).bounce_window_ms(),
+                "{} ms",
+                ms
+            );
+        }
+    }
+
+    #[test]
+    fn load_clamps_negative_and_oversized_values_keeping_the_rest() {
+        // A typo such as a minus sign must not throw away the whole file
+        let path = temp_path("negative");
+        fs::write(
+            &path,
+            r#"
+[stickiness]
+stuck_threshold_ms = 100000000000
+
+[hold_release]
+bounce_window_ms = -5
+min_hold_ms = -1
+
+[ui]
+refresh_rate_hz = -60
+warning_duration_secs = 5000000000
+theme = "Light"
+
+[oem_keys]
+enabled = true
+fn_mode = "CaptureOnly"
+key_mappings = [[100, 97]]
+capture_unknown = true
+show_notifications = true
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("config with negative values must still load");
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(config.ui.warning_duration_secs, WARNING_DURATION_SECS_MAX);
+        assert_eq!(config.hold_release.bounce_window_ms, BOUNCE_WINDOW_MS_MIN);
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MAX);
+        // The rest of the file is kept
+        assert_eq!(config.ui.theme, Theme::Light);
+        assert_eq!(config.oem_keys.key_mappings, vec![(100, 97)]);
+    }
+
+    #[test]
+    fn a_file_that_does_not_load_is_reported_not_silently_replaced() {
+        // Hand edits the README invites: a lowercase theme, a float
+        for (name, contents) in [
+            (
+                "lowercase",
+                "[ui]\ntheme = \"light\"\n[oem_keys]\nkey_mappings = [[148, 125]]\n",
+            ),
+            ("float", "[stickiness]\nstuck_threshold_ms = 2000.0\n"),
+        ] {
+            let path = temp_path(name);
+            fs::write(&path, contents).unwrap();
+            let load = Config::load_reporting_from(&path);
+            assert!(load.error.is_some(), "{name}");
+            assert!(load.unreadable());
+            let notes = load.notes();
+            assert_eq!(notes.len(), 1);
+            assert!(
+                notes[0].contains("not used, defaults in effect"),
+                "{:?}",
+                notes
+            );
+            assert!(!notes[0].contains('\n'), "{:?}", notes);
+
+            // Saving keeps the user's file instead of overwriting it
+            let backup = load.config.save_to_backing_up(&path).unwrap();
+            assert_eq!(fs::read_to_string(&backup).unwrap(), contents);
+            assert!(Config::load_from(&path).is_ok());
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&backup);
+        }
+    }
+
+    #[test]
+    fn clamped_values_are_reported() {
+        let path = temp_path("clamp-report");
+        fs::write(&path, "[ui]\nrefresh_rate_hz = 0\n").unwrap();
+        let load = Config::load_reporting_from(&path);
+        let _ = fs::remove_file(&path);
+        assert!(load.error.is_none());
+        assert!(!load.unreadable());
+        assert_eq!(load.config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(load.adjusted.len(), 1);
+        assert!(load.notes()[0].contains("ui.refresh_rate_hz = 0"));
+
+        // A missing file is the defaults, nothing to report
+        let load = Config::load_reporting_from(&temp_path("missing"));
+        assert!(load.error.is_none() && load.notes().is_empty());
+    }
+
+    #[test]
+    fn load_partial_config_uses_defaults_for_missing_values() {
+        let path = temp_path("partial");
+        fs::write(&path, "[ui]\nrefresh_rate_hz = 120\n").unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("partial config must load");
+        assert_eq!(config.ui.refresh_rate_hz, 120);
+        assert_eq!(config.ui.theme, Theme::Dark);
+        assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
+        assert!(config.oem_keys.enabled);
+    }
+
+    #[test]
+    fn load_existing_full_config_file_unchanged() {
+        // A file written by an earlier version (every field present)
+        let path = temp_path("full");
+        let mut original = Config::default();
+        original.oem_keys.add_mapping(100, 97);
+        original.oem_keys.capture_unknown = false;
+        original.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("existing config must load");
+        assert_eq!(
+            toml::to_string_pretty(&config).unwrap(),
+            toml::to_string_pretty(&original).unwrap()
+        );
     }
 }

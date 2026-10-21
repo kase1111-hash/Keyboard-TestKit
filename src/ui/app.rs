@@ -1,25 +1,89 @@
 //! Main application state and logic
 
-use crate::config::{Config, Theme};
+use crate::config::{
+    config_path, Config, ConfigLoad, Theme, BOUNCE_WINDOW_MS_MAX, BOUNCE_WINDOW_MS_MIN,
+    POLLING_DURATION_SECS_MAX, POLLING_DURATION_SECS_MIN, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN,
+    STUCK_THRESHOLD_MS_MAX, STUCK_THRESHOLD_MS_MIN, WARNING_DURATION_SECS_MAX,
+    WARNING_DURATION_SECS_MIN,
+};
 use crate::keyboard::layout::KeyboardLayout;
 use crate::keyboard::remap::FnKeyMode;
-use crate::keyboard::{KeyEvent, KeyboardState};
+use crate::keyboard::{KeyEvent, KeyEventType, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
-    expected_keys_for_layout, AnalysisContext, AutoTest, EventTimingTest, Finding, HoldReleaseTest,
-    InputSource, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest, ShortcutTest, StepKind,
-    StickinessTest, TestResult, VirtualKeyboardTest,
+    expected_keys_for_layout, issues_status, AnalysisContext, AutoTest, EventTimingTest, Finding,
+    HoldReleaseTest, InputSource, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest,
+    ShortcutTest, StepKind, StickinessTest, TestResult, VirtualKeyboardTest,
 };
 use crate::ui::theme::ThemeColors;
 use crate::ui::widgets::SettingsItem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How often the live diagnostic findings are recomputed.
 const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Stuck-key threshold applied while the auto test asks the user to hold a key.
+/// Stuck-key threshold applied while the auto test asks the user to hold keys
+/// (Hold and Rollover steps). Getting 6-10 keys down for the rollover step
+/// takes a few seconds; 15 s leaves room for a slow attempt without flagging
+/// it, while a key that really stays down is still caught once the step ends.
 const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
+
+/// After the auto test ends (completed, or stopped), plain keys stay test
+/// input until the keyboard has been quiet this long. The rapid-tap step
+/// ends on a timer while the user is still tapping, and a run stopped by a
+/// disconnect ends mid-sweep: the next few keys would otherwise run the Auto
+/// view's single-key commands (`r` resets the run, `q` quits, Space pauses).
+pub const AFTER_RUN_GRACE: Duration = Duration::from_secs(2);
+
+/// Keyboard device nodes lost this close together are one unplug: one
+/// keyboard usually has several event nodes (keys, media keys, an NKRO
+/// interface) that all vanish when it is unplugged.
+const DISCONNECT_MERGE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Keyboard disconnects seen since the tests were last reset.
+#[derive(Debug, Default)]
+struct DisconnectLog {
+    /// Separate disconnects so far
+    count: u32,
+    /// When the last node disappeared (cleared when a keyboard comes back)
+    last: Option<Instant>,
+    /// Names of the devices that went away, without repeats
+    devices: Vec<String>,
+}
+
+impl DisconnectLog {
+    /// Record that the node of `device` disappeared at `now`.
+    fn node_lost(&mut self, device: &str, now: Instant) {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= DISCONNECT_MERGE_WINDOW)
+        {
+            self.count += 1;
+        }
+        self.last = Some(now);
+        if !self.devices.iter().any(|d| d == device) {
+            self.devices.push(device.to_string());
+        }
+    }
+
+    /// A keyboard came back: the next node lost is a new disconnect.
+    fn node_found(&mut self) {
+        self.last = None;
+    }
+}
+
+/// Stuck-key threshold (ms) to use during `step` of the auto test, given the
+/// configured threshold. Steps that ask the user to hold keys get a relaxed
+/// threshold; every other step (and no run at all) uses the configured one.
+fn stuck_threshold_for_step(step: Option<StepKind>, configured_ms: u64) -> u64 {
+    match step {
+        Some(StepKind::Hold | StepKind::Rollover) => {
+            configured_ms.max(HOLD_STEP_STUCK_THRESHOLD_MS)
+        }
+        _ => configured_ms,
+    }
+}
 
 /// Current view/tab in the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +241,19 @@ pub struct App {
     findings_updated: Option<Instant>,
     /// Auto-test step observed on the previous tick (for step transitions)
     last_auto_step: Option<StepKind>,
+    /// Keyboard disconnects since the tests were last reset
+    disconnects: DisconnectLog,
+    /// Latest key press the tests saw (see [`App::auto_test_just_ended`])
+    last_key_press: Option<Instant>,
+    /// The keyboard has been quiet since the auto test ended: the after-run
+    /// grace is over until the next run
+    after_run_quiet: bool,
+    /// The config file Settings > Save writes (the default location if None)
+    config_path: Option<PathBuf>,
+    /// The config file exists but could not be used: saving keeps a backup
+    config_unreadable: bool,
+    /// What the user should know about the config file (see [`ConfigLoad::notes`])
+    config_notes: Vec<String>,
 }
 
 impl App {
@@ -184,6 +261,7 @@ impl App {
         // Set up OEM test with config settings
         let mut oem_test = OemKeyTest::new();
         oem_test.set_fn_mode(config.oem_keys.fn_mode);
+        oem_test.remapper_mut().set_enabled(config.oem_keys.enabled);
 
         // Load custom FN scancodes
         for scancode in &config.oem_keys.fn_scancodes {
@@ -203,11 +281,13 @@ impl App {
         let theme_colors = ThemeColors::from_theme(config.ui.theme);
         let keyboard_layout = KeyboardLayout::detect();
 
+        // Assume the least capable source until `set_input_source` says
+        // otherwise; every test is told the same thing (below)
         let input_source = InputSource::TerminalPressOnly;
         let mut auto_test = AutoTest::new(input_source);
         auto_test.set_expected_keys(expected_keys_for_layout(keyboard_layout));
 
-        Self {
+        let mut app = Self {
             view: AppView::Dashboard,
             state: AppState::Running,
             config: config.clone(),
@@ -239,13 +319,73 @@ impl App {
             findings: Vec::new(),
             findings_updated: None,
             last_auto_step: None,
+            disconnects: DisconnectLog::default(),
+            last_key_press: None,
+            after_run_quiet: false,
+            config_path: None,
+            config_unreadable: false,
+            config_notes: Vec::new(),
+        };
+        app.set_input_source(input_source);
+        app
+    }
+
+    /// Tell the app how loading its config went (`App::new` got the
+    /// resulting settings): where to save, and what to tell the user. A
+    /// file that could not be used is announced in the status line, on the
+    /// Dashboard and on exit, and saving over it keeps it as a backup.
+    pub fn set_config_load(&mut self, load: &ConfigLoad) {
+        self.config_path = load.path.clone();
+        self.config_unreadable = load.unreadable();
+        self.config_notes = load.notes();
+        if load.error.is_some() {
+            self.set_status("config.toml not used: defaults in effect - see Dashboard".to_string());
+        } else if !load.adjusted.is_empty() {
+            self.set_status(format!(
+                "config.toml: {} value(s) out of range were adjusted - see Dashboard",
+                load.adjusted.len()
+            ));
         }
+    }
+
+    /// What the user should know about the config file, one line each.
+    pub fn config_notes(&self) -> &[String] {
+        &self.config_notes
+    }
+
+    /// Record that an input device of the keyboard went away (unplugged,
+    /// wireless link lost). It is reported as a finding until the tests are
+    /// reset or the auto test is started.
+    pub fn keyboard_disconnected(&mut self, device: &str) {
+        self.keyboard_disconnected_at(device, Instant::now());
+    }
+
+    fn keyboard_disconnected_at(&mut self, device: &str, now: Instant) {
+        self.disconnects.node_lost(device, now);
+        self.refresh_findings();
+    }
+
+    /// Record that a keyboard (re)appeared.
+    pub fn keyboard_connected(&mut self) {
+        self.disconnects.node_found();
+    }
+
+    /// Separate keyboard disconnects since the tests were last reset.
+    pub fn keyboard_disconnects(&self) -> u32 {
+        self.disconnects.count
     }
 
     /// Tell the app where key events come from. Call once at startup.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
         self.auto_test.set_input_source(source);
+        // The manual views must not show results the source cannot measure
+        self.polling_test.set_input_source(source);
+        self.hold_release_test.set_input_source(source);
+        self.stickiness_test.set_input_source(source);
+        self.rollover_test.set_input_source(source);
+        self.shortcut_test.set_input_source(source);
+        self.virtual_test.set_input_source(source);
     }
 
     /// Returns mutable references to all 8 test modules for batch operations.
@@ -293,11 +433,25 @@ impl App {
 
     /// Process a keyboard event through all active tests
     pub fn process_event(&mut self, event: &KeyEvent) {
-        if self.state != AppState::Running {
-            return;
+        match self.state {
+            AppState::Running => {}
+            // Paused: record nothing new, but let keys that went down before
+            // the pause come back up. Otherwise a key released while paused
+            // (often the very key that was held when Space was pressed) would
+            // look held, and later stuck, after resuming.
+            AppState::Paused if self.completes_recorded_keystroke(event) => {}
+            _ => return,
         }
 
         self.total_events += 1;
+        if event.event_type == KeyEventType::Press {
+            // A press after a quiet spell is not the tail of the run
+            self.end_after_run_grace_if_quiet(event.timestamp);
+            self.last_key_press = Some(
+                self.last_key_press
+                    .map_or(event.timestamp, |t| t.max(event.timestamp)),
+            );
+        }
         self.keyboard_state.process_event(event);
 
         // Dispatch to all tests
@@ -315,7 +469,15 @@ impl App {
             }
         }
 
-        self.check_stuck_keys();
+        if self.state == AppState::Running {
+            self.check_stuck_keys();
+        }
+    }
+
+    /// Whether `event` is the release of a key the tests saw go down.
+    fn completes_recorded_keystroke(&self, event: &KeyEvent) -> bool {
+        event.event_type == KeyEventType::Release
+            && self.keyboard_state.pressed_keys().contains(&event.key)
     }
 
     /// Flag keys held past the stickiness threshold in the status bar.
@@ -336,9 +498,12 @@ impl App {
         if self.state == AppState::Running {
             self.check_stuck_keys();
         }
+        // Settle a physical-vs-virtual check once its wait is over
+        self.virtual_test.tick();
 
         let finished = self.auto_test.tick();
         self.apply_auto_step_transition();
+        self.end_after_run_grace_if_quiet(Instant::now());
 
         let stale = self
             .findings_updated
@@ -347,38 +512,32 @@ impl App {
             self.refresh_findings();
         }
         if finished {
-            let issues = self.findings.iter().filter(|f| f.is_issue()).count();
             self.view = AppView::AutoTest;
-            self.set_status(if issues == 0 {
-                "Auto test complete: no issues detected".to_string()
-            } else {
-                format!("Auto test complete: {} issue(s) found", issues)
-            });
+            self.set_completion_status();
         }
     }
 
-    /// Relax the stuck-key threshold while the user is asked to hold a key,
+    /// Say in the status line how the finished auto test went.
+    fn set_completion_status(&mut self) {
+        let issues = self.issue_count();
+        self.set_status(if issues == 0 {
+            "Auto test complete: no issues detected".to_string()
+        } else {
+            format!("Auto test complete: {} issue(s) found", issues)
+        });
+    }
+
+    /// Relax the stuck-key threshold while the user is asked to hold keys,
     /// and restore it afterwards.
     fn apply_auto_step_transition(&mut self) {
         let step = self.auto_test.current_step();
         if step == self.last_auto_step {
             return;
         }
-        match (self.last_auto_step, step) {
-            (_, Some(StepKind::Hold)) => {
-                self.stickiness_test.set_threshold(
-                    self.config
-                        .stickiness
-                        .stuck_threshold_ms
-                        .max(HOLD_STEP_STUCK_THRESHOLD_MS),
-                );
-            }
-            (Some(StepKind::Hold), _) => {
-                self.stickiness_test
-                    .set_threshold(self.config.stickiness.stuck_threshold_ms);
-            }
-            _ => {}
-        }
+        self.stickiness_test.set_threshold(stuck_threshold_for_step(
+            step,
+            self.config.stickiness.stuck_threshold_ms,
+        ));
         self.last_auto_step = step;
     }
 
@@ -399,6 +558,8 @@ impl App {
             virtual_detect: &self.virtual_test,
             oem_keys: &self.oem_test,
             keyboard_state: &self.keyboard_state,
+            keyboard_disconnects: self.disconnects.count,
+            disconnected_devices: &self.disconnects.devices,
         }
     }
 
@@ -407,17 +568,51 @@ impl App {
         self.findings.iter().filter(|f| f.is_issue()).count()
     }
 
-    /// Start the automatic diagnostic and switch to its view.
-    pub fn start_auto_test(&mut self) {
-        // Give the run a clean slate so old data does not pollute the findings
+    /// Presses of the keys that are down right now, with their original
+    /// times. A key that is down sends no new press (evdev and the terminal
+    /// listener drop autorepeat), so a reset that forgot it would hide a
+    /// jammed key for good: the Sticky view would say "None detected" and a
+    /// later sweep would call the key dead. Resets carry these presses over
+    /// to the trackers of held keys.
+    fn held_key_presses(&self) -> Vec<KeyEvent> {
+        self.keyboard_state
+            .pressed_keys()
+            .iter()
+            .filter_map(|&key| {
+                let pressed_at = self.keyboard_state.get_key_state(key)?.last_press?;
+                Some(KeyEvent::new(key, KeyEventType::Press, pressed_at, 0))
+            })
+            .collect()
+    }
+
+    /// Clear the keyboard state and every test, keeping the keys that are
+    /// still down (see [`App::held_key_presses`]).
+    fn reset_tests_keeping_held_keys(&mut self) {
+        let held = self.held_key_presses();
         self.keyboard_state.reset();
         for test in self.all_tests_mut() {
             test.reset();
         }
+        for press in &held {
+            self.keyboard_state.process_event(press);
+            self.stickiness_test.process_event(press);
+            self.rollover_test.process_event(press);
+        }
+    }
+
+    /// Start the automatic diagnostic and switch to its view.
+    pub fn start_auto_test(&mut self) {
+        // Give the run a clean slate so old data does not pollute the findings
+        // (a keyboard replugged before the run is not a fault of the run).
+        // Keys down right now (a jammed key, the Shift used to type 'A') are
+        // kept: the idle step is there to catch a key stuck before the run.
+        self.reset_tests_keeping_held_keys();
+        self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
         self.last_auto_step = None;
+        self.after_run_quiet = false;
         self.auto_test.start();
         self.state = AppState::Running;
         self.view = AppView::AutoTest;
@@ -444,8 +639,7 @@ impl App {
             if self.auto_test.is_complete() {
                 self.apply_auto_step_transition();
                 self.refresh_findings();
-                let issues = self.issue_count();
-                self.set_status(format!("Auto test complete: {} issue(s) found", issues));
+                self.set_completion_status();
             }
         }
     }
@@ -453,6 +647,35 @@ impl App {
     /// Whether the guided auto test is currently running.
     pub fn auto_test_running(&self) -> bool {
         self.auto_test.is_running()
+    }
+
+    /// Whether the auto test ended so recently that plain keys are still
+    /// test input: less than [`AFTER_RUN_GRACE`] has passed since the run
+    /// ended and since the latest key press after that. Once the keyboard
+    /// has been quiet that long the grace is over until the next run.
+    pub fn auto_test_just_ended(&self) -> bool {
+        self.auto_test_just_ended_at(Instant::now())
+    }
+
+    fn auto_test_just_ended_at(&self, now: Instant) -> bool {
+        let Some(ended) = self.auto_test.finished_at() else {
+            return false;
+        };
+        if self.after_run_quiet {
+            return false;
+        }
+        let last = self.last_key_press.map_or(ended, |t| t.max(ended));
+        now.saturating_duration_since(last) < AFTER_RUN_GRACE
+    }
+
+    /// End the after-run grace for good once the keyboard has been quiet for
+    /// [`AFTER_RUN_GRACE`] since the run ended: keys typed later (in a test
+    /// view before pressing Tab, arrows in Settings) are not the tail of the
+    /// run, and must not turn the next command key into test input.
+    fn end_after_run_grace_if_quiet(&mut self, now: Instant) {
+        if self.auto_test.finished_at().is_some() && !self.auto_test_just_ended_at(now) {
+            self.after_run_quiet = true;
+        }
     }
 
     /// Switch to the next view
@@ -505,16 +728,14 @@ impl App {
         self.state = AppState::Quitting;
     }
 
-    /// Reset all tests
+    /// Reset all tests. Keys that are still down stay down.
     pub fn reset_all(&mut self) {
-        self.keyboard_state.reset();
-        for test in self.all_tests_mut() {
-            test.reset();
-        }
+        self.reset_tests_keeping_held_keys();
         self.auto_test.reset();
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
         self.last_auto_step = None;
+        self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.refresh_findings();
         self.set_status("All tests reset".to_string());
@@ -524,7 +745,8 @@ impl App {
     pub fn reset_current(&mut self) {
         if self.view == AppView::AutoTest {
             self.auto_test.reset();
-            self.last_auto_step = None;
+            // Restores the stuck-key threshold if a step had relaxed it
+            self.apply_auto_step_transition();
             self.refresh_findings();
             self.set_status("Auto test reset".to_string());
             return;
@@ -532,6 +754,16 @@ impl App {
         if let Some(idx) = Self::test_index_for_view(self.view) {
             let name = self.all_tests()[idx].name().to_string();
             self.all_tests_mut()[idx].reset();
+            // The Sticky and NKRO views track keys that are down: a jammed
+            // key reset away would read "None detected" while still down
+            let held = self.held_key_presses();
+            for press in &held {
+                match self.view {
+                    AppView::Stickiness => self.stickiness_test.process_event(press),
+                    AppView::Rollover => self.rollover_test.process_event(press),
+                    _ => {}
+                }
+            }
             self.set_status(format!("{} reset", name));
         }
     }
@@ -585,9 +817,15 @@ impl App {
             format!("{}", self.keyboard_state.current_rollover()),
         ));
 
+        // Press-only terminal input guesses releases, so how many keys were
+        // down at once is not known (see RolloverTest)
         results.push(TestResult::info(
             "Max Rollover",
-            format!("{}", self.keyboard_state.max_rollover()),
+            if self.rollover_test.rollover_measurable() {
+                self.rollover_test.peak_summary()
+            } else {
+                "n/a (terminal input)".to_string()
+            },
         ));
 
         if let Some(rate) = self.keyboard_state.global_polling_rate_hz() {
@@ -607,15 +845,27 @@ impl App {
 
         results.push(TestResult::info("Input", self.input_source.name()));
 
+        if !self.config_notes.is_empty() {
+            results.push(TestResult::info("", ""));
+            results.push(TestResult::info("--- Config File ---", ""));
+            if self.config_unreadable {
+                results.push(TestResult::warning(
+                    "Config",
+                    "not used: defaults in effect; Save keeps it as .bak",
+                ));
+            }
+            for note in self.config_notes.iter().take(4) {
+                results.push(TestResult::info("", note.clone()));
+            }
+        }
+
         // Live diagnostics summary
         results.push(TestResult::info("", ""));
         results.push(TestResult::info("--- Auto Diagnostics ---", ""));
         let issues = self.issue_count();
-        let issue_status = if issues == 0 {
-            crate::tests::ResultStatus::Ok
-        } else {
-            crate::tests::ResultStatus::Error
-        };
+        // Warnings are worded as conditions (a sleeping wireless keyboard, a
+        // key the laptop does not have): only a Critical finding is red
+        let issue_status = issues_status(&self.findings);
         results.push(TestResult::new(
             "Issues Found",
             if self.auto_test.is_running() {
@@ -648,27 +898,31 @@ impl App {
 
     /// Generate a session report
     pub fn generate_report(&self) -> SessionReport {
-        SessionReport::new(
-            ReportInput {
-                start_time: self.start_time,
-                total_events: self.total_events,
-                polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
-                polling: self.polling_test.get_results(),
-                hold_release: self.hold_release_test.get_results(),
-                stickiness: self.stickiness_test.get_results(),
-                rollover: self.rollover_test.get_results(),
-                event_timing: self.event_timing_test.get_results(),
-                shortcuts: self.shortcut_test.get_results(),
-                virtual_detect: self.virtual_test.get_results(),
-                oem_keys: self.oem_test.get_results(),
-                diagnostics: self.findings.iter().flat_map(|f| f.to_results()).collect(),
-            },
-            &self.keyboard_state,
-        )
+        SessionReport::new(ReportInput {
+            start_time: self.start_time,
+            total_events: self.total_events,
+            max_rollover: self
+                .rollover_test
+                .rollover_measurable()
+                .then(|| self.rollover_test.max_keys()),
+            polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
+            polling: self.polling_test.get_results(),
+            hold_release: self.hold_release_test.get_results(),
+            stickiness: self.stickiness_test.get_results(),
+            rollover: self.rollover_test.get_results(),
+            event_timing: self.event_timing_test.get_results(),
+            shortcuts: self.shortcut_test.get_results(),
+            virtual_detect: self.virtual_test.get_results(),
+            oem_keys: self.oem_test.get_results(),
+            diagnostics: self.findings.iter().flat_map(|f| f.to_results()).collect(),
+        })
     }
 
     /// Export session report to JSON file
     pub fn export_report(&mut self, filename: &str) -> Result<String, std::io::Error> {
+        // The live findings are only refreshed every 500 ms; the file must
+        // match what was typed up to the moment of the export
+        self.refresh_findings();
         let report = self.generate_report();
         let path = Path::new(filename);
         report.export_json(path)?;
@@ -709,6 +963,8 @@ impl App {
             FnKeyMode::RestoreWithModifier => FnKeyMode::Disabled,
         };
         self.oem_test.set_fn_mode(next_mode);
+        // Settings > Save writes the config: keep the mode in it
+        self.config.oem_keys.fn_mode = next_mode;
         let mode_name = match next_mode {
             FnKeyMode::Disabled => "Disabled",
             FnKeyMode::CaptureOnly => "Capture Only",
@@ -753,8 +1009,9 @@ impl App {
                 editable: true,
             },
             SettingsItem {
-                label: "Bounce Window (ms)".to_string(),
-                value: format!("{}", self.config.hold_release.bounce_window_ms),
+                // Shows the window in effect (old configs held 5 ms, raised to 20)
+                label: "Bounce: release->press (ms)".to_string(),
+                value: format!("{}", self.hold_release_test.bounce_window_ms()),
                 editable: true,
             },
             SettingsItem {
@@ -795,16 +1052,22 @@ impl App {
             0 => {
                 // Polling duration
                 if increase {
-                    self.config.polling.test_duration_secs =
-                        self.config.polling.test_duration_secs.saturating_add(5);
+                    self.config.polling.test_duration_secs = self
+                        .config
+                        .polling
+                        .test_duration_secs
+                        .saturating_add(5)
+                        .min(POLLING_DURATION_SECS_MAX);
                 } else {
                     self.config.polling.test_duration_secs = self
                         .config
                         .polling
                         .test_duration_secs
                         .saturating_sub(5)
-                        .max(5);
+                        .max(POLLING_DURATION_SECS_MIN);
                 }
+                self.polling_test
+                    .set_duration_secs(self.config.polling.test_duration_secs);
             }
             1 => {
                 // Stuck threshold
@@ -813,40 +1076,49 @@ impl App {
                         .config
                         .stickiness
                         .stuck_threshold_ms
-                        .saturating_add(250);
+                        .saturating_add(250)
+                        .min(STUCK_THRESHOLD_MS_MAX);
                 } else {
                     self.config.stickiness.stuck_threshold_ms = self
                         .config
                         .stickiness
                         .stuck_threshold_ms
                         .saturating_sub(250)
-                        .max(250);
+                        .max(STUCK_THRESHOLD_MS_MIN);
                 }
                 self.stickiness_test
                     .set_threshold(self.config.stickiness.stuck_threshold_ms);
             }
             2 => {
-                // Bounce window
-                if increase {
-                    self.config.hold_release.bounce_window_ms =
-                        self.config.hold_release.bounce_window_ms.saturating_add(1);
+                // Bounce window, stepped from the value in effect (an old
+                // config's 5 ms runs, and is shown, as 20)
+                let current = self.hold_release_test.bounce_window_ms();
+                let next = if increase {
+                    current.saturating_add(1)
                 } else {
-                    self.config.hold_release.bounce_window_ms = self
-                        .config
-                        .hold_release
-                        .bounce_window_ms
-                        .saturating_sub(1)
-                        .max(1);
-                }
+                    current.saturating_sub(1)
+                };
+                self.config.hold_release.bounce_window_ms =
+                    next.clamp(BOUNCE_WINDOW_MS_MIN, BOUNCE_WINDOW_MS_MAX);
+                self.hold_release_test
+                    .set_bounce_window_ms(self.config.hold_release.bounce_window_ms);
             }
             3 => {
                 // Refresh rate
                 if increase {
-                    self.config.ui.refresh_rate_hz =
-                        self.config.ui.refresh_rate_hz.saturating_add(10).min(240);
+                    self.config.ui.refresh_rate_hz = self
+                        .config
+                        .ui
+                        .refresh_rate_hz
+                        .saturating_add(10)
+                        .min(REFRESH_RATE_HZ_MAX);
                 } else {
-                    self.config.ui.refresh_rate_hz =
-                        self.config.ui.refresh_rate_hz.saturating_sub(10).max(10);
+                    self.config.ui.refresh_rate_hz = self
+                        .config
+                        .ui
+                        .refresh_rate_hz
+                        .saturating_sub(10)
+                        .max(REFRESH_RATE_HZ_MIN);
                 }
             }
             4 => {
@@ -865,23 +1137,47 @@ impl App {
                         .ui
                         .warning_duration_secs
                         .saturating_add(1)
-                        .min(30);
+                        .min(WARNING_DURATION_SECS_MAX);
                 } else {
                     self.config.ui.warning_duration_secs = self
                         .config
                         .ui
                         .warning_duration_secs
                         .saturating_sub(1)
-                        .max(1);
+                        .max(WARNING_DURATION_SECS_MIN);
                 }
             }
             _ => {}
         }
     }
 
-    /// Save current config to disk
+    /// Save current config to disk. A file that could not be loaded is kept
+    /// as `config.toml.bak` first: it holds the user's settings and key
+    /// mappings, which the defaults in effect would otherwise replace.
     pub fn save_config(&mut self) {
-        match self.config.save() {
+        let path = match self.config_path.clone().map_or_else(config_path, Ok) {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_status(format!("Save failed: {}", e));
+                return;
+            }
+        };
+        if self.config_unreadable {
+            match self.config.save_to_backing_up(&path) {
+                Ok(backup) => {
+                    self.config_unreadable = false;
+                    self.set_status(format!(
+                        "Config saved; the file that could not be read is kept as {}",
+                        backup.display()
+                    ));
+                }
+                Err(e) => {
+                    self.set_status(format!("Not saved (could not keep the old file): {}", e))
+                }
+            }
+            return;
+        }
+        match self.config.save_to(&path) {
             Ok(()) => self.set_status("Config saved".to_string()),
             Err(e) => self.set_status(format!("Save failed: {}", e)),
         }
@@ -980,11 +1276,14 @@ mod tests {
         let mut app = App::default();
         app.process_event(&press(30, 1000));
         app.process_event(&press(31, 1000));
-        assert_eq!(app.total_events, 2);
+        app.process_event(&release(30, 1000));
+        app.process_event(&release(31, 1000));
+        assert_eq!(app.total_events, 4);
 
         app.reset_all();
         assert_eq!(app.total_events, 0);
         assert_eq!(app.keyboard_state.current_rollover(), 0);
+        assert_eq!(app.keyboard_state.max_rollover(), 0);
     }
 
     #[test]
@@ -1121,6 +1420,8 @@ mod tests {
     #[test]
     fn app_shortcut_detection_via_pipeline() {
         let mut app = App::default();
+        // A bare Ctrl press only arrives through evdev (or the kitty protocol)
+        app.set_input_source(InputSource::Evdev);
 
         // Press Ctrl (scancode 29 = Left Ctrl)
         app.process_event(&press(29, 1000));
@@ -1182,5 +1483,449 @@ mod tests {
         let app = App::default();
         // No shortcut detected yet
         assert!(app.shortcut_overlay().is_none());
+    }
+
+    /// An instant `ago` in the past (falls back to now on a freshly booted clock).
+    fn ago(ago: Duration) -> Instant {
+        Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+    }
+
+    fn event_at(key: u16, kind: KeyEventType, at: Instant) -> KeyEvent {
+        KeyEvent::new(KeyCode(key), kind, at, 1000)
+    }
+
+    /// Run the auto test (with real releases) up to `step`.
+    fn app_at_auto_step(step: StepKind) -> App {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        app.tick();
+        while app.auto_test.current_step() != Some(step) {
+            app.skip_auto_step();
+            app.tick();
+        }
+        app
+    }
+
+    #[test]
+    fn stuck_threshold_relaxed_for_hold_and_rollover_steps() {
+        let configured = Duration::from_millis(Config::default().stickiness.stuck_threshold_ms);
+        let relaxed = Duration::from_millis(HOLD_STEP_STUCK_THRESHOLD_MS);
+
+        let mut app = app_at_auto_step(StepKind::Sweep);
+        assert_eq!(app.stickiness_test.threshold(), configured);
+
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::Hold));
+        assert_eq!(app.stickiness_test.threshold(), relaxed);
+
+        // Hold -> Rollover must keep the relaxed threshold: the user is asked
+        // to hold as many keys as possible, which takes a few seconds.
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::Rollover));
+        assert_eq!(app.stickiness_test.threshold(), relaxed);
+
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::RapidTap));
+        assert_eq!(app.stickiness_test.threshold(), configured);
+    }
+
+    #[test]
+    fn stuck_threshold_restored_when_aborted_during_rollover() {
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        app.abort_auto_test();
+        assert_eq!(
+            app.stickiness_test.threshold(),
+            Duration::from_millis(app.config.stickiness.stuck_threshold_ms)
+        );
+    }
+
+    #[test]
+    fn stuck_threshold_for_step_policy() {
+        assert_eq!(stuck_threshold_for_step(None, 2000), 2000);
+        assert_eq!(stuck_threshold_for_step(Some(StepKind::Sweep), 2000), 2000);
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Hold), 2000),
+            HOLD_STEP_STUCK_THRESHOLD_MS
+        );
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Rollover), 2000),
+            HOLD_STEP_STUCK_THRESHOLD_MS
+        );
+        // A user threshold above the relaxed one is never lowered
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Rollover), 30_000),
+            30_000
+        );
+    }
+
+    #[test]
+    fn rollover_step_long_hold_is_not_flagged() {
+        // The user takes 3 s to get 6 keys down, then lets go.
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        let t0 = ago(Duration::from_secs(3));
+        for key in 30..36 {
+            app.process_event(&event_at(key, KeyEventType::Press, t0));
+        }
+        app.tick();
+        assert!(app.stickiness_test.flagged_keys().is_empty());
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+        for key in 30..36 {
+            app.process_event(&event_at(key, KeyEventType::Release, Instant::now()));
+        }
+        app.tick();
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+    }
+
+    #[test]
+    fn key_still_down_after_rollover_step_is_stuck() {
+        // A key that never comes back up is still caught once the step is over.
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(3)),
+        ));
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::RapidTap));
+        let stuck: Vec<KeyCode> = app
+            .stickiness_test
+            .stuck_keys()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(stuck, vec![KeyCode(30)]);
+    }
+
+    #[test]
+    fn release_during_pause_is_not_lost() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        // Down for 1 s (below the 2 s threshold) when Space pauses the app
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(1)),
+        ));
+        app.toggle_pause();
+        // Key released while paused (e.g. the user lets go after pausing)
+        app.process_event(&event_at(30, KeyEventType::Release, Instant::now()));
+        app.toggle_pause();
+        // Time passing after the resume, simulated with a shorter threshold:
+        // a key the tests still thought was down would now be flagged.
+        app.stickiness_test.set_threshold(250);
+        app.tick();
+
+        assert_eq!(app.keyboard_state.current_rollover(), 0);
+        assert_eq!(app.rollover_test.current_count(), 0);
+        assert!(app.stickiness_test.held_keys().is_empty());
+        assert!(app.stickiness_test.flagged_keys().is_empty());
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+    }
+
+    #[test]
+    fn pause_still_ignores_new_keystrokes() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.toggle_pause();
+        app.process_event(&press(30, 1000));
+        app.process_event(&release(30, 1000));
+        // A release for a key the tests never saw go down is not recorded
+        app.process_event(&release(31, 1000));
+        assert_eq!(app.total_events, 0);
+        assert_eq!(app.keyboard_state.total_events(), 0);
+    }
+
+    #[test]
+    fn key_held_through_pause_is_still_detected_as_stuck() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(3)),
+        ));
+        app.toggle_pause();
+        app.toggle_pause();
+        app.tick();
+        assert_eq!(app.stickiness_test.stuck_keys().len(), 1);
+    }
+
+    #[test]
+    fn stuck_threshold_setting_is_bounded() {
+        // Settings view uses the same bounds a loaded config is clamped to
+        let mut app = App {
+            settings_selected: 1,
+            ..App::default()
+        };
+        app.config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MAX;
+        app.adjust_setting(true);
+        assert_eq!(
+            app.config.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MAX
+        );
+        assert_eq!(
+            app.stickiness_test.threshold(),
+            Duration::from_millis(STUCK_THRESHOLD_MS_MAX)
+        );
+
+        app.config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MIN;
+        app.adjust_setting(false);
+        assert_eq!(
+            app.config.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MIN
+        );
+    }
+
+    #[test]
+    fn one_unplug_of_a_multi_node_keyboard_is_one_disconnect() {
+        let mut app = App::default();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Keyboard, consumer-control and NKRO nodes vanish together
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(0));
+        app.keyboard_disconnected_at("Gaming Keyboard Consumer Control", ms(3));
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(20));
+        assert_eq!(app.keyboard_disconnects(), 1);
+        // It comes back and drops out again: a second disconnect
+        app.keyboard_connected();
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(900));
+        assert_eq!(app.keyboard_disconnects(), 2);
+        // A later, separate drop without a reconnect seen in between
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(10_000));
+        assert_eq!(app.keyboard_disconnects(), 3);
+        // Each device is named once
+        let connection = app
+            .findings
+            .iter()
+            .find(|f| f.category == "Connection")
+            .unwrap();
+        assert!(connection.title.contains("3 time(s)"));
+        assert!(connection
+            .detail
+            .starts_with("Gaming Keyboard, Gaming Keyboard Consumer Control. "));
+    }
+
+    #[test]
+    fn keys_typed_as_the_auto_test_ends_stay_test_input() {
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        assert!(!app.auto_test_just_ended());
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let ms = |n: u64| ended + Duration::from_millis(n);
+        assert!(app.auto_test_just_ended_at(ms(100)));
+        // The user keeps tapping for a while after the step ends
+        for t in [80, 240, 400, 560] {
+            app.process_event(&event_at(30, KeyEventType::Press, ms(t)));
+            app.process_event(&event_at(30, KeyEventType::Release, ms(t + 40)));
+        }
+        assert!(app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE - Duration::from_millis(1)));
+        // Once the keyboard has been quiet for the grace period, commands work
+        assert!(!app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE));
+
+        // A run that ends while nobody is typing frees the keys after the
+        // grace period, and a fresh app has no run to protect
+        let mut app = app_at_auto_step(StepKind::Sweep);
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        assert!(!app.auto_test_just_ended_at(ended + AFTER_RUN_GRACE));
+        assert!(!App::default().auto_test_just_ended());
+    }
+
+    #[test]
+    fn keys_are_commands_for_good_once_the_keyboard_went_quiet_after_a_run() {
+        // The grace is for the keys still being typed as the run ends. Once
+        // the keyboard has been quiet, typing later (in a test view, then
+        // Tab; Down, Down in Settings; t, t on the Dashboard) must not make
+        // the next key within 2 s test input again, for the whole session.
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let ms = |n: u64| ended + Duration::from_millis(n);
+        // Ten seconds later the user types in the Polling view
+        for t in [10_000, 10_150, 10_300] {
+            app.process_event(&event_at(31, KeyEventType::Press, ms(t)));
+            app.process_event(&event_at(31, KeyEventType::Release, ms(t + 60)));
+        }
+        // ...and presses Tab half a second after the last key
+        assert!(!app.auto_test_just_ended_at(ms(10_800)));
+
+        // The quiet spell noticed by the main loop's tick ends it too
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        app.abort_auto_test();
+        let quiet = app.auto_test.finished_at().unwrap() + AFTER_RUN_GRACE;
+        app.end_after_run_grace_if_quiet(quiet);
+        let first_key = quiet + Duration::from_millis(10);
+        app.process_event(&event_at(31, KeyEventType::Press, first_key));
+        assert!(!app.auto_test_just_ended_at(first_key + Duration::from_millis(500)));
+
+        // A new run brings the grace back for its own end
+        app.start_auto_test();
+        app.abort_auto_test();
+        assert!(app.auto_test_just_ended());
+    }
+
+    #[test]
+    fn resets_keep_a_jammed_key_down() {
+        // Backspace jammed 5 s ago; "potentially stuck" makes the user reset
+        // to re-check. The key sends no new press, so it must not vanish.
+        let jammed = || {
+            let mut app = App::default();
+            app.set_input_source(InputSource::Evdev);
+            app.process_event(&event_at(
+                14,
+                KeyEventType::Press,
+                ago(Duration::from_secs(5)),
+            ));
+            app.process_event(&press(30, 1000));
+            app.process_event(&release(30, 1000));
+            app.tick();
+            app
+        };
+        let stuck = |app: &App| -> Vec<KeyCode> {
+            app.stickiness_test
+                .stuck_keys()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect()
+        };
+
+        let mut app = jammed();
+        app.reset_all();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+        assert_eq!(app.keyboard_state.pressed_keys(), &[KeyCode(14)]);
+        assert_eq!(app.rollover_test.current_count(), 1);
+        app.refresh_findings();
+        assert!(app.findings.iter().any(|f| f.category == "Stuck key"));
+        // ...and an auto test started after it still knows the key is down
+        app.start_auto_test();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+
+        // Ctrl+R in the Sticky view
+        let mut app = jammed();
+        app.view = AppView::Stickiness;
+        app.reset_current();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+        // Released keys are forgotten as before
+        assert_eq!(app.stickiness_test.held_keys().len(), 1);
+
+        // Ctrl+R in the NKRO view keeps the current count right
+        let mut app = jammed();
+        app.view = AppView::Rollover;
+        app.reset_current();
+        assert_eq!(app.rollover_test.current_count(), 1);
+        assert_eq!(app.rollover_test.max_rollover(), 1);
+    }
+
+    #[test]
+    fn fn_mode_changes_reach_the_saved_config() {
+        let mut app = App::default();
+        let before = app.config.oem_keys.fn_mode;
+        app.settings_selected = 5;
+        app.adjust_setting(true);
+        assert_ne!(app.oem_test.fn_mode(), before);
+        assert_eq!(app.config.oem_keys.fn_mode, app.oem_test.fn_mode());
+        // 'f' in the OEM/FN view cycles the same way
+        app.cycle_fn_mode();
+        assert_eq!(app.config.oem_keys.fn_mode, app.oem_test.fn_mode());
+    }
+
+    #[test]
+    fn unreadable_config_is_announced_and_kept_on_save() {
+        // A hand-edited file with a lowercase theme does not parse: the app
+        // runs on defaults. Saving after fixing the theme in Settings must
+        // not silently replace the user's key mappings.
+        let dir = std::env::temp_dir().join(format!("kt-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "[ui]\ntheme = \"light\"\n[oem_keys]\nkey_mappings = [[148, 125]]\n";
+        std::fs::write(&path, original).unwrap();
+        let load = Config::load_reporting_from(&path);
+        let mut app = App::new(load.config.clone());
+        app.set_config_load(&load);
+        assert!(app.get_status().unwrap().contains("not used"));
+        assert_eq!(app.config_notes().len(), 1);
+        let dash = app.current_results();
+        let row = dash
+            .iter()
+            .find(|r| r.label == "Config")
+            .expect("config row");
+        assert_eq!(row.status, crate::tests::ResultStatus::Warning);
+
+        app.toggle_theme();
+        app.save_config();
+        assert!(
+            app.get_status().unwrap().contains(".bak"),
+            "{:?}",
+            app.get_status()
+        );
+        let backup = dir.join("config.toml.bak");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(Config::load_from(&path).unwrap().ui.theme, Theme::Light);
+        // The next save is an ordinary one (the backup is not overwritten)
+        app.save_config();
+        assert_eq!(app.get_status(), Some("Config saved"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A healthy file: no notes, no Config rows
+        let app = App::default();
+        assert!(app.config_notes().is_empty());
+        assert!(!app.current_results().iter().any(|r| r.label == "Config"));
+    }
+
+    #[test]
+    fn polling_duration_and_bounce_window_settings_are_bounded() {
+        // Holding an arrow key in the Settings view must not walk a value
+        // out of the range a loaded config is clamped to
+        let mut app = App {
+            settings_selected: 0,
+            ..App::default()
+        };
+        app.config.polling.test_duration_secs = POLLING_DURATION_SECS_MAX;
+        app.adjust_setting(true);
+        assert_eq!(
+            app.config.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MAX
+        );
+        assert_eq!(app.polling_test.duration_secs(), POLLING_DURATION_SECS_MAX);
+        app.config.polling.test_duration_secs = POLLING_DURATION_SECS_MIN;
+        app.adjust_setting(false);
+        assert_eq!(
+            app.config.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MIN
+        );
+
+        app.settings_selected = 2;
+        for _ in 0..100 {
+            app.adjust_setting(true);
+        }
+        assert_eq!(
+            app.config.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MAX
+        );
+        assert_eq!(
+            app.hold_release_test.bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MAX
+        );
+        for _ in 0..100 {
+            app.adjust_setting(false);
+        }
+        assert_eq!(
+            app.config.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            app.hold_release_test.bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            app.settings_items()[2].value,
+            BOUNCE_WINDOW_MS_MIN.to_string()
+        );
     }
 }

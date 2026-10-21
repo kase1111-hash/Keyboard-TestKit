@@ -3,12 +3,16 @@
 //! Detects modifier key combos in real-time and enumerates known
 //! system-registered hotkeys (desktop environment shortcuts on Linux).
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
-/// Common shortcuts that might cause conflicts
+/// Common shortcuts that might cause conflicts.
+///
+/// Combos are written the way [`ShortcutTest`] builds them: modifiers in
+/// Ctrl/Alt/Shift/Super order followed by the key's keymap name ("Delete",
+/// "Escape", "PrintScreen"), so they can be matched exactly.
 const COMMON_CONFLICTS: &[(&str, &[&str])] = &[
     ("Ctrl+W", &["Close tab/window"]),
     ("Ctrl+Q", &["Quit application"]),
@@ -20,9 +24,10 @@ const COMMON_CONFLICTS: &[(&str, &[&str])] = &[
     ("Alt+Tab", &["Switch window"]),
     ("Alt+F4", &["Close window"]),
     ("Super+L", &["Lock screen"]),
-    ("Ctrl+Alt+Del", &["System menu"]),
-    ("Ctrl+Shift+Esc", &["Task manager"]),
-    ("PrtSc", &["Screenshot"]),
+    ("Ctrl+Alt+Delete", &["System menu"]),
+    ("Ctrl+Shift+Escape", &["Task manager"]),
+    // Works without a modifier, so it is recorded even when pressed alone
+    ("PrintScreen", &["Screenshot"]),
 ];
 
 /// A system-registered shortcut discovered by enumeration
@@ -223,6 +228,9 @@ pub struct ShortcutTest {
     last_shortcut: Option<ShortcutEvent>,
     /// System-registered shortcuts discovered at startup
     system_shortcuts: Vec<SystemShortcut>,
+    /// Whether the input source reports modifier keys. Legacy terminals and
+    /// the Windows console never do, so no combo can be recorded there.
+    modifiers_reported: bool,
 }
 
 impl ShortcutTest {
@@ -237,7 +245,14 @@ impl ShortcutTest {
             start_time: None,
             last_shortcut: None,
             system_shortcuts,
+            modifiers_reported: true,
         }
+    }
+
+    /// Tell the test where events come from: combos need modifier keys,
+    /// which only evdev and the kitty keyboard protocol report.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.modifiers_reported = source.can_report(keymap::KEY_LSHIFT);
     }
 
     /// Get system-registered shortcuts
@@ -276,15 +291,15 @@ impl ShortcutTest {
     /// Record a shortcut event
     fn record_shortcut(&mut self, key: KeyCode, timestamp: Instant) {
         let prefix = self.modifiers.to_prefix();
-        if prefix.is_empty() {
-            return; // No modifiers held, not a shortcut
-        }
-
         let key_name = Self::get_key_name(key);
         let combo = format!("{}{}", prefix, key_name);
 
         let description = Self::check_known_conflict(&combo);
         let is_known = description.is_some();
+        // Without a modifier only a known system hotkey (PrintScreen) counts
+        if prefix.is_empty() && !is_known {
+            return;
+        }
 
         let event = ShortcutEvent {
             combo: combo.clone(),
@@ -351,9 +366,8 @@ impl KeyboardTest for ShortcutTest {
                     self.update_modifiers(event.key, true);
                 } else {
                     // Non-modifier key pressed while modifiers held = shortcut
-                    if self.modifiers.any_held() {
-                        self.record_shortcut(event.key, event.timestamp);
-                    }
+                    // (record_shortcut also takes lone system hotkeys)
+                    self.record_shortcut(event.key, event.timestamp);
                     self.pressed_keys.insert(event.key);
                 }
             }
@@ -381,27 +395,40 @@ impl KeyboardTest for ShortcutTest {
             TestResult::info("", ""),
         ];
 
-        // Current modifier state
-        let mod_status = if self.modifiers.any_held() {
-            self.modifiers.to_prefix().trim_end_matches('+').to_string()
-        } else {
-            "None".to_string()
-        };
-        results.push(TestResult::info("Modifiers Held", mod_status));
-
-        // Stats
-        results.push(TestResult::info(
-            "Total Shortcuts",
-            format!("{}", self.total_shortcuts),
-        ));
-
-        if self.conflict_count > 0 {
-            results.push(TestResult::warning(
-                "Known Conflicts",
-                format!("{}", self.conflict_count),
+        if !self.modifiers_reported {
+            // Ctrl+W arrives as a plain W: "0 conflicts" would be a result
+            // this input cannot produce
+            results.push(TestResult::info("Known Conflicts", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Modifier keys",
+                "are not reported by this terminal;",
+            ));
+            results.push(TestResult::info(
+                "combos need evdev",
+                "(Linux) or the kitty protocol",
             ));
         } else {
-            results.push(TestResult::ok("Known Conflicts", "0"));
+            // Current modifier state
+            let mod_status = if self.modifiers.any_held() {
+                self.modifiers.to_prefix().trim_end_matches('+').to_string()
+            } else {
+                "None".to_string()
+            };
+            results.push(TestResult::info("Modifiers Held", mod_status));
+
+            // Stats
+            results.push(TestResult::info(
+                "Total Shortcuts",
+                format!("{}", self.total_shortcuts),
+            ));
+            if self.conflict_count > 0 {
+                results.push(TestResult::warning(
+                    "Known Conflicts",
+                    format!("{}", self.conflict_count),
+                ));
+            } else {
+                results.push(TestResult::ok("Known Conflicts", "0"));
+            }
         }
 
         // Last shortcut
@@ -478,5 +505,110 @@ impl KeyboardTest for ShortcutTest {
         self.start_time = None;
         self.last_shortcut = None;
         // system_shortcuts preserved — they don't change during a session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard::keymap::{KEY_LALT, KEY_LCTRL, KEY_LSHIFT, KEY_LSUPER, KEY_PRINT};
+    use crate::tests::test_helpers::{press, release};
+
+    fn chord(test: &mut ShortcutTest, keys: &[KeyCode]) {
+        for &k in keys {
+            test.process_event(&press(k));
+        }
+        for &k in keys.iter().rev() {
+            test.process_event(&release(k));
+        }
+    }
+
+    /// Key events that produce `combo` (modifier names, then a keymap name).
+    fn keys_for_combo(combo: &str) -> Vec<KeyCode> {
+        combo
+            .split('+')
+            .map(|part| match part {
+                "Ctrl" => KEY_LCTRL,
+                "Alt" => KEY_LALT,
+                "Shift" => KEY_LSHIFT,
+                "Super" => KEY_LSUPER,
+                name => (1u16..=255)
+                    .map(KeyCode)
+                    .find(|k| keymap::get_key_info(*k).name == name)
+                    .unwrap_or_else(|| panic!("no key named {} (in {})", name, combo)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_known_conflict_entry_can_match() {
+        // Each table entry must be reachable from real key events; the old
+        // "Ctrl+Alt+Del", "Ctrl+Shift+Esc" and "PrtSc" entries never were.
+        for (combo, descriptions) in COMMON_CONFLICTS {
+            let mut test = ShortcutTest::new();
+            chord(&mut test, &keys_for_combo(combo));
+            let recent = test.recent_shortcuts(1);
+            let last = recent.first().expect("shortcut recorded");
+            assert_eq!(last.combo, *combo);
+            assert!(last.is_known_conflict, "{} not recognised", combo);
+            assert_eq!(last.description.as_deref(), Some(descriptions[0]));
+            assert_eq!(test.conflict_count(), 1);
+        }
+        assert_eq!(keys_for_combo("Ctrl+Alt+Delete")[2], KeyCode(111));
+        assert_eq!(keys_for_combo("PrintScreen"), vec![KEY_PRINT]);
+    }
+
+    #[test]
+    fn plain_typing_is_not_a_shortcut() {
+        let mut test = ShortcutTest::new();
+        for key in [30u16, 31, 32, 111, 1] {
+            chord(&mut test, &[KeyCode(key)]);
+        }
+        assert_eq!(test.total_shortcuts(), 0);
+        assert_eq!(test.conflict_count(), 0);
+    }
+
+    #[test]
+    fn terminal_without_modifier_keys_does_not_claim_no_conflicts() {
+        // Ctrl+W through a legacy terminal or the Windows console arrives
+        // as a plain W: nothing can be recorded, so no green "0"
+        let mut sources = vec![InputSource::TerminalPressOnly];
+        if cfg!(windows) {
+            // The console API reports releases but not Shift/Ctrl/Alt
+            sources.push(InputSource::TerminalWithRelease);
+        }
+        for source in sources {
+            let mut test = ShortcutTest::new();
+            test.set_input_source(source);
+            chord(&mut test, &[KeyCode(17)]);
+            let results = test.get_results();
+            let conflicts = results
+                .iter()
+                .find(|r| r.label == "Known Conflicts")
+                .unwrap();
+            assert_eq!(conflicts.status, ResultStatus::Info);
+            assert!(conflicts.value.contains("n/a"), "{:?}", conflicts);
+            assert!(!results.iter().any(|r| r.status == ResultStatus::Ok));
+        }
+        // Evdev (and the kitty protocol) report modifiers: a real count
+        let mut test = ShortcutTest::new();
+        test.set_input_source(InputSource::Evdev);
+        chord(&mut test, &[KEY_LCTRL, KeyCode(17)]);
+        let results = test.get_results();
+        let conflicts = results
+            .iter()
+            .find(|r| r.label == "Known Conflicts")
+            .unwrap();
+        assert_eq!(conflicts.status, ResultStatus::Warning);
+        assert_eq!(conflicts.value, "1");
+    }
+
+    #[test]
+    fn unknown_combo_is_recorded_but_not_a_conflict() {
+        let mut test = ShortcutTest::new();
+        chord(&mut test, &[KEY_LCTRL, KEY_LSHIFT, KeyCode(30)]);
+        assert_eq!(test.total_shortcuts(), 1);
+        assert_eq!(test.conflict_count(), 0);
+        assert_eq!(test.recent_shortcuts(1)[0].combo, "Ctrl+Shift+A");
     }
 }

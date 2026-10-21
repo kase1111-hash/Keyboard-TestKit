@@ -1,16 +1,29 @@
 //! N-Key Rollover and Ghosting test module
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::auto_test::GOOD_ROLLOVER;
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashSet;
 use std::time::Instant;
 
-/// Test for N-Key Rollover and ghosting detection
+/// Test for N-Key Rollover: how many keys register at once.
+///
+/// The rating counts keys other than modifiers, as a keyboard's rollover
+/// limit does: a USB boot-protocol keyboard reports 6 keys plus 8 modifier
+/// bits, so 6 letters held with Ctrl, Shift, Alt and Win is still 6KRO.
+/// Modifiers are shown next to it.
+///
+/// Ghost keys are shown (Active Keys) but not detected automatically: a ghost
+/// arrives as an ordinary press (see [`RolloverTest::ghost_count`]).
 pub struct RolloverTest {
     /// Currently pressed keys
     pressed_keys: HashSet<KeyCode>,
-    /// Maximum simultaneous keys achieved
+    /// Maximum simultaneous keys achieved, modifiers included
     max_simultaneous: usize,
+    /// Maximum simultaneous keys other than modifiers (what the rating uses)
+    max_keys: usize,
+    /// Modifiers held when `max_keys` was reached
+    peak_modifiers: usize,
     /// History of simultaneous key counts
     rollover_history: Vec<usize>,
     /// Detected ghost keys (keys registered without being pressed)
@@ -21,6 +34,13 @@ pub struct RolloverTest {
     start_time: Option<Instant>,
     /// Expected keys (for ghost detection - set by user)
     expected_keys: HashSet<KeyCode>,
+    /// Whether key releases are real. With press-only terminal input releases
+    /// are synthesized on a timer, so the number of keys "down" at once is
+    /// a guess.
+    real_releases: bool,
+    /// Whether the input source reports modifier keys (the Windows console
+    /// does not, so they cannot be counted there)
+    modifiers_reported: bool,
 }
 
 /// A detected ghosting event
@@ -35,12 +55,29 @@ impl RolloverTest {
         Self {
             pressed_keys: HashSet::new(),
             max_simultaneous: 0,
+            max_keys: 0,
+            peak_modifiers: 0,
             rollover_history: Vec::new(),
             ghost_detections: Vec::new(),
             total_events: 0,
             start_time: None,
             expected_keys: HashSet::new(),
+            real_releases: true,
+            modifiers_reported: true,
         }
+    }
+
+    /// Tell the test where events come from. Without real releases the peak
+    /// count is not a measurement and is not shown.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.real_releases = source.has_release_events();
+        self.modifiers_reported = source.can_report(keymap::KEY_LSHIFT);
+    }
+
+    /// Whether the peak rollover is a measurement with the current input
+    /// source (key releases are real).
+    pub fn rollover_measurable(&self) -> bool {
+        self.real_releases
     }
 
     /// Get current number of pressed keys
@@ -48,21 +85,40 @@ impl RolloverTest {
         self.pressed_keys.len()
     }
 
-    /// Get maximum achieved rollover
+    /// Get maximum achieved rollover, modifiers included
     pub fn max_rollover(&self) -> usize {
         self.max_simultaneous
     }
 
-    /// Get the rollover rating string
+    /// Most keys other than modifiers registered at once: the rollover
+    /// rating's number.
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
+    }
+
+    /// The peak as shown on the Dashboard: "6", or "6 + 4 modifiers".
+    pub fn peak_summary(&self) -> String {
+        match self.peak_modifiers {
+            0 => format!("{}", self.max_keys),
+            n => format!("{} + {} modifier(s)", self.max_keys, n),
+        }
+    }
+
+    /// Get the rollover rating string (modifiers are not counted)
     pub fn rollover_rating(&self) -> String {
-        match self.max_simultaneous {
+        match self.max_keys {
             0 => "Not tested".to_string(),
             n if n >= 10 => "NKRO".to_string(),
             n => format!("{}KRO", n),
         }
     }
 
-    /// Number of ghost key events detected
+    /// Number of ghost key events detected.
+    ///
+    /// Ghosting is not detected automatically: a ghost key arrives as an
+    /// ordinary press, and telling it apart needs to know which keys the user
+    /// is holding (`expected_keys`), which nothing sets yet. This is 0 unless
+    /// that information is supplied.
     pub fn ghost_count(&self) -> usize {
         self.ghost_detections.len()
     }
@@ -142,6 +198,18 @@ impl KeyboardTest for RolloverTest {
                 if count > self.max_simultaneous {
                     self.max_simultaneous = count;
                 }
+                let modifiers = self
+                    .pressed_keys
+                    .iter()
+                    .filter(|k| keymap::is_modifier(**k))
+                    .count();
+                let keys = count - modifiers;
+                if keys > self.max_keys
+                    || (keys == self.max_keys && modifiers > self.peak_modifiers)
+                {
+                    self.max_keys = keys;
+                    self.peak_modifiers = modifiers;
+                }
             }
             KeyEventType::Release => {
                 self.pressed_keys.remove(&event.key);
@@ -164,12 +232,12 @@ impl KeyboardTest for RolloverTest {
             "pressed simultaneously",
         ));
         results.push(TestResult::info(
-            "Ghosting = false key press",
-            "from matrix limitations",
+            "Ghosting = extra key that",
+            "you did not press shows up",
         ));
         results.push(TestResult::info(
             "Look for: 6KRO+ gaming,",
-            "NKRO for pro, no ghosts",
+            "NKRO for pro, no extra keys",
         ));
         results.push(TestResult::info("", ""));
 
@@ -180,32 +248,74 @@ impl KeyboardTest for RolloverTest {
         ));
 
         // Max rollover
-        // 1-2 keys is not enough evidence either way (hold more keys to test)
-        let status = match self.max_simultaneous {
-            0..=2 => ResultStatus::Info,
-            3..=5 => ResultStatus::Warning,
-            _ => ResultStatus::Ok,
-        };
-        results.push(TestResult::new(
-            "Max Rollover",
-            self.rollover_rating(),
-            status,
-        ));
+        if !self.real_releases {
+            // Releases are guessed: a tap stays "down" for up to 750 ms, so
+            // fast typing looks like several keys held at once, while the
+            // keys of a held chord are let go once autorepeat moves on to
+            // the last one. The peak is neither an upper nor a lower bound.
+            results.push(TestResult::info("Max Rollover", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Terminal reports",
+                "presses only; releases guessed",
+            ));
+            results.push(TestResult::info(
+                "rollover needs",
+                "releases: evdev or kitty protocol",
+            ));
+        } else {
+            // 1-2 keys is not enough evidence either way (hold more keys to
+            // test). 3-5 may be the keyboard's limit or just the number of
+            // keys the user held, which the test cannot tell apart.
+            let status = match self.max_keys {
+                0..=2 => ResultStatus::Info,
+                n if n < GOOD_ROLLOVER => ResultStatus::Warning,
+                _ => ResultStatus::Ok,
+            };
+            results.push(TestResult::new(
+                "Max Rollover",
+                self.rollover_rating(),
+                status,
+            ));
+            results.push(TestResult::info(
+                "Peak Keys",
+                match self.peak_modifiers {
+                    0 => format!("{} simultaneous", self.max_keys),
+                    n => format!("{} keys + {} modifier(s)", self.max_keys, n),
+                },
+            ));
+            if !self.modifiers_reported {
+                results.push(TestResult::info(
+                    "  Shift/Ctrl/Alt/Win",
+                    "not reported by this console",
+                ));
+            }
+            if status == ResultStatus::Warning {
+                results.push(TestResult::info(
+                    format!("  Held more than {} keys?", self.max_keys),
+                    "the keyboard limits rollover",
+                ));
+                results.push(TestResult::info(
+                    format!("  Held only {}?", self.max_keys),
+                    format!("not a fault: hold {}+ keys", GOOD_ROLLOVER),
+                ));
+                results.push(TestResult::info(
+                    "  (Modifiers",
+                    "do not count toward the limit)",
+                ));
+            }
+            results.push(TestResult::info(
+                "Avg Rollover",
+                format!("{:.1} keys", self.avg_rollover()),
+            ));
+        }
 
-        results.push(TestResult::info(
-            "Peak Keys",
-            format!("{} simultaneous", self.max_simultaneous),
-        ));
-
-        // Average rollover
-        results.push(TestResult::info(
-            "Avg Rollover",
-            format!("{:.1} keys", self.avg_rollover()),
-        ));
-
-        // Ghost detections
+        // Ghost detections. A ghost arrives as an ordinary key press, so it
+        // cannot be told apart without knowing which keys are really held.
         if self.ghost_detections.is_empty() {
-            results.push(TestResult::ok("Ghosting", "None detected"));
+            results.push(TestResult::info(
+                "Ghosting",
+                "not auto-detected: watch Active Keys for extras",
+            ));
         } else {
             results.push(TestResult::error(
                 "Ghost Events",
@@ -241,6 +351,8 @@ impl KeyboardTest for RolloverTest {
     fn reset(&mut self) {
         self.pressed_keys.clear();
         self.max_simultaneous = 0;
+        self.max_keys = 0;
+        self.peak_modifiers = 0;
         self.rollover_history.clear();
         self.ghost_detections.clear();
         self.total_events = 0;
@@ -272,25 +384,79 @@ mod tests {
     #[test]
     fn rollover_rating_2kro() {
         let mut test = RolloverTest::new();
-        test.max_simultaneous = 2;
+        test.max_keys = 2;
         assert_eq!(test.rollover_rating(), "2KRO");
     }
 
     #[test]
     fn rollover_rating_6kro() {
         let mut test = RolloverTest::new();
-        test.max_simultaneous = 6;
+        test.max_keys = 6;
         assert_eq!(test.rollover_rating(), "6KRO");
     }
 
     #[test]
     fn rollover_rating_nkro() {
         let mut test = RolloverTest::new();
-        test.max_simultaneous = 10;
+        test.max_keys = 10;
         assert_eq!(test.rollover_rating(), "NKRO");
 
-        test.max_simultaneous = 15;
+        test.max_keys = 15;
         assert_eq!(test.rollover_rating(), "NKRO");
+    }
+
+    fn row(test: &RolloverTest, label: &str) -> TestResult {
+        test.get_results()
+            .into_iter()
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no {label} row"))
+    }
+
+    #[test]
+    fn modifiers_do_not_make_a_6kro_keyboard_nkro() {
+        // A USB boot keyboard (6 keys + 8 modifier bits), a palm over Ctrl,
+        // Win, Alt and Shift plus six letters: 10 keys down, but 6KRO
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::Evdev);
+        for key in [29u16, 125, 56, 42, 30, 31, 32, 33, 34, 35] {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(test.max_rollover(), 10);
+        assert_eq!(test.rollover_rating(), "6KRO");
+        assert_eq!(row(&test, "Max Rollover").status, ResultStatus::Ok);
+        assert_eq!(row(&test, "Peak Keys").value, "6 keys + 4 modifier(s)");
+        assert_eq!(test.peak_summary(), "6 + 4 modifier(s)");
+        // Shift with six letters is not a "7KRO"
+        let mut test = RolloverTest::new();
+        for key in [42u16, 30, 31, 32, 33, 34, 35] {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(test.rollover_rating(), "6KRO");
+    }
+
+    #[test]
+    fn console_without_modifiers_says_they_were_not_counted() {
+        // Windows console: Shift and Ctrl never arrive, so Shift+Ctrl+4
+        // letters shows 4 keys; the view must not leave that unexplained
+        let mut test = RolloverTest::new();
+        test.modifiers_reported = false;
+        for key in 30..34 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        let results = test.get_results();
+        let note = results
+            .iter()
+            .find(|r| r.label.contains("Shift/Ctrl/Alt/Win"))
+            .expect("modifiers note");
+        assert!(note.value.contains("not reported"), "{:?}", note);
+        // With modifiers reported there is no such note
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::Evdev);
+        test.process_event(&press(KeyCode(30)));
+        assert!(!test
+            .get_results()
+            .iter()
+            .any(|r| r.label.contains("Shift/Ctrl/Alt/Win")));
     }
 
     #[test]
@@ -413,6 +579,98 @@ mod tests {
         let mut test = RolloverTest::new();
         test.process_event(&press(KeyCode(30)));
         assert!(!test.is_complete()); // Continuous test
+    }
+
+    #[test]
+    fn ghosting_is_not_claimed_clean_when_it_was_not_measured() {
+        // A membrane keyboard that ghosts: holding A, S, D makes F appear.
+        // The test cannot tell F from a real press, so it must not say
+        // "None detected" in green.
+        let mut test = RolloverTest::new();
+        for key in [30, 31, 32, 33] {
+            test.process_event(&press(KeyCode(key)));
+        }
+        let results = test.get_results();
+        let ghost = results
+            .iter()
+            .find(|r| r.label == "Ghosting")
+            .expect("ghosting row");
+        assert_eq!(ghost.status, ResultStatus::Info);
+        assert!(!ghost.value.contains("None"), "{:?}", ghost);
+        // ...but the extra key is visible for the user to judge
+        let active = results.iter().find(|r| r.label == "Active Keys").unwrap();
+        assert!(active.value.contains('F'), "{:?}", active);
+    }
+
+    fn max_rollover_status(test: &RolloverTest) -> ResultStatus {
+        test.get_results()
+            .into_iter()
+            .find(|r| r.label == "Max Rollover")
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn limited_rollover_is_flagged_with_real_releases() {
+        // A 4KRO keyboard: only 4 of the keys the user holds register
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::Evdev);
+        for key in 30..34 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(max_rollover_status(&test), ResultStatus::Warning);
+        // A keyboard that registers 7 held keys is fine
+        for key in 34..37 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(max_rollover_status(&test), ResultStatus::Ok);
+        assert!(!test
+            .get_results()
+            .iter()
+            .any(|r| r.label.contains("Held only")));
+    }
+
+    #[test]
+    fn low_peak_is_worded_as_a_condition() {
+        // 4 keys at once: a 4KRO keyboard, or a user who held only 4 keys on
+        // a healthy one. The view must not call it the keyboard's limit.
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::Evdev);
+        for key in 30..34 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        let results = test.get_results();
+        let more = results
+            .iter()
+            .find(|r| r.label.contains("Held more than 4 keys?"))
+            .expect("condition for a real limit");
+        assert!(more.value.contains("limits rollover"));
+        let only = results
+            .iter()
+            .find(|r| r.label.contains("Held only 4?"))
+            .expect("condition for a user who held few keys");
+        assert!(only.value.contains("not a fault"), "{:?}", only);
+    }
+
+    #[test]
+    fn press_only_input_does_not_show_a_rollover_number() {
+        // A press-only terminal keeps a tap "down" for up to 750 ms: typing
+        // five letters quickly looks like five keys held at once, although
+        // the user never held more than one. No count, no grade.
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::TerminalPressOnly);
+        for key in 30..35 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(test.max_rollover(), 5);
+        assert!(!test.rollover_measurable());
+        let results = test.get_results();
+        let max = results.iter().find(|r| r.label == "Max Rollover").unwrap();
+        assert_eq!(max.status, ResultStatus::Info);
+        assert_eq!(max.value, "n/a (terminal input)");
+        assert!(!results
+            .iter()
+            .any(|r| r.value.contains("5KRO") || r.value.contains("5 simultaneous")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Polling rate test module
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{KeyEvent, KeyEventType};
 use crate::utils::MinMaxExt;
 use std::time::{Duration, Instant};
@@ -13,16 +13,25 @@ pub struct PollingRateTest {
     sample_window_us: u64,
     /// Start time of the test
     start_time: Option<Instant>,
-    /// Recorded intervals between events (in microseconds)
+    /// Recorded intervals between key presses (in microseconds), for the
+    /// key-rate statistics
     intervals_us: Vec<u64>,
-    /// Last event timestamp
+    /// Gaps between consecutive key events of any kind (presses and
+    /// releases), for the report-grid estimate (see
+    /// [`PollingRateTest::estimated_poll_interval_us`])
+    report_gaps_us: Vec<u64>,
+    /// Last press timestamp
     last_event: Option<Instant>,
+    /// Last key event (press or release) timestamp
+    last_any_event: Option<Instant>,
     /// Number of events recorded
     event_count: u64,
     /// Minimum interval seen
     min_interval_us: Option<u64>,
     /// Maximum interval seen
     max_interval_us: Option<u64>,
+    /// Whether event timestamps come from the device (needed for the estimate)
+    precise_timestamps: bool,
 }
 
 impl PollingRateTest {
@@ -32,11 +41,35 @@ impl PollingRateTest {
             sample_window_us: sample_window_ms * 1000,
             start_time: None,
             intervals_us: Vec::with_capacity(10000),
+            report_gaps_us: Vec::new(),
             last_event: None,
+            last_any_event: None,
             event_count: 0,
             min_interval_us: None,
             max_interval_us: None,
+            precise_timestamps: true,
         }
+    }
+
+    /// Tell the test where events come from. The poll-rate estimate needs
+    /// device (kernel) timestamps; terminal input is stamped when it is read.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.precise_timestamps = source.has_precise_timestamps();
+    }
+
+    /// Change the test duration (used for the progress display).
+    pub fn set_duration_secs(&mut self, duration_secs: u64) {
+        self.duration = Duration::from_secs(duration_secs);
+    }
+
+    /// The test duration in seconds.
+    pub fn duration_secs(&self) -> u64 {
+        self.duration.as_secs()
+    }
+
+    /// Whether the poll rate can be estimated with the current input source.
+    pub fn poll_rate_measurable(&self) -> bool {
+        self.precise_timestamps
     }
 
     /// Calculate average polling rate in Hz (over all samples)
@@ -120,16 +153,28 @@ impl PollingRateTest {
         &self.intervals_us
     }
 
-    /// Estimate the keyboard's USB/BT report interval from timestamp quantization.
+    /// Number of gaps between key events available to the report-grid
+    /// estimate (it needs [`MIN_QUANTIZATION_SAMPLES`]).
+    pub fn quantization_samples(&self) -> usize {
+        self.report_gaps_us.len()
+    }
+
+    /// Estimate the keyboard's USB report interval from timestamp quantization.
     ///
     /// A polled keyboard can only deliver reports on its poll boundary, so the
-    /// gaps between its events are (near) multiples of the poll interval. This
-    /// looks for the largest candidate interval that explains almost all of the
-    /// recorded gaps. It needs precise (kernel) timestamps and at least
-    /// [`MIN_QUANTIZATION_SAMPLES`] samples; returns `None` otherwise, or when
-    /// no quantization is visible (interrupt-driven or >= 1000 Hz keyboards).
+    /// gaps between its events, presses and releases alike, are (near)
+    /// multiples of the poll interval. This looks for the largest candidate
+    /// interval that explains almost all of the recorded gaps. Releases count
+    /// too: a key tapped with one finger is pressed only every 120-200 ms, but
+    /// stays down 50-100 ms and up a similar time. It needs precise (kernel)
+    /// timestamps and at least [`MIN_QUANTIZATION_SAMPLES`] gaps; returns
+    /// `None` otherwise (always for terminal input), or when no 125/250/500 Hz
+    /// grid is visible (interrupt-driven or >= 1000 Hz keyboards, Bluetooth).
     pub fn estimated_poll_interval_us(&self) -> Option<u64> {
-        estimate_quantization_us(&self.intervals_us)
+        if !self.precise_timestamps {
+            return None;
+        }
+        estimate_quantization_us(&self.report_gaps_us)
     }
 
     /// Estimated polling rate in Hz derived from [`Self::estimated_poll_interval_us`].
@@ -138,14 +183,23 @@ impl PollingRateTest {
             .map(|us| 1_000_000.0 / us as f64)
     }
 
-    /// Get test progress (0.0 to 1.0)
+    /// Get test progress (0.0 to 1.0): the configured duration since the
+    /// first press, and with kernel timestamps also enough gaps for the
+    /// poll-rate estimate (100% while it still needs taps would contradict it).
     pub fn progress(&self) -> f64 {
-        match self.start_time {
+        let time = match self.start_time {
             Some(start) => {
                 let elapsed = start.elapsed();
                 (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.0)
             }
             None => 0.0,
+        };
+        if self.precise_timestamps {
+            let samples =
+                (self.report_gaps_us.len() as f64 / MIN_QUANTIZATION_SAMPLES as f64).min(1.0);
+            time.min(samples)
+        } else {
+            time
         }
     }
 }
@@ -166,23 +220,41 @@ const QUANTIZATION_TOLERANCE_US: u64 = 400;
 
 /// Estimate the timestamp quantization step of a set of intervals (see
 /// [`PollingRateTest::estimated_poll_interval_us`]).
+///
+/// A candidate must explain almost every gap, and the gaps must actually
+/// fill its grid: gaps that are all multiples of a coarser period are not a
+/// report grid but the period itself. A Bluetooth LE keyboard on a 30 ms
+/// connection interval delivers presses 30, 60, 90 ms apart, all multiples
+/// of 2 ms, and would otherwise be called a 500 Hz keyboard.
 pub fn estimate_quantization_us(intervals: &[u64]) -> Option<u64> {
     if intervals.len() < MIN_QUANTIZATION_SAMPLES {
         return None;
     }
     for &step in &QUANTIZATION_CANDIDATES_US {
-        let matching = intervals
+        let multiples: Vec<u64> = intervals
             .iter()
             .filter(|&&iv| {
                 let rem = iv % step;
                 rem <= QUANTIZATION_TOLERANCE_US || step - rem <= QUANTIZATION_TOLERANCE_US
             })
-            .count();
-        if matching as f64 / intervals.len() as f64 >= QUANTIZATION_MATCH_RATIO {
-            return Some(step);
+            .map(|iv| (iv + step / 2) / step)
+            .collect();
+        if (multiples.len() as f64) < intervals.len() as f64 * QUANTIZATION_MATCH_RATIO {
+            continue;
         }
+        let period = multiples.iter().fold(0, |g, &m| gcd(g, m));
+        return (period == 1).then_some(step);
     }
     None
+}
+
+/// Greatest common divisor (`gcd(0, n) == n`).
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 impl KeyboardTest for PollingRateTest {
@@ -195,7 +267,18 @@ impl KeyboardTest for PollingRateTest {
     }
 
     fn process_event(&mut self, event: &KeyEvent) {
-        // Only count key press events for cleaner measurement
+        // Every key event sits on the report grid. Events reported together
+        // (one USB report, the same kernel timestamp) say nothing about its
+        // period, so gaps that are practically zero are left out.
+        if let Some(last) = self.last_any_event {
+            let gap_us = event.timestamp.saturating_duration_since(last).as_micros() as u64;
+            if gap_us > QUANTIZATION_TOLERANCE_US && gap_us < 100_000 {
+                self.report_gaps_us.push(gap_us);
+            }
+        }
+        self.last_any_event = Some(event.timestamp);
+
+        // The key-rate statistics count key presses only
         if event.event_type != KeyEventType::Press {
             return;
         }
@@ -244,7 +327,7 @@ impl KeyboardTest for PollingRateTest {
             "1000Hz=1ms, 125Hz=8ms delay",
         ));
         results.push(TestResult::info(
-            "Tap keys rapidly; poll rate",
+            "Tap keys quickly; poll rate",
             "is inferred from timestamps",
         ));
         results.push(TestResult::info("", ""));
@@ -255,13 +338,23 @@ impl KeyboardTest for PollingRateTest {
         ));
 
         // Poll rate inferred from timestamp quantization (needs kernel timestamps)
-        if self.intervals_us.len() >= MIN_QUANTIZATION_SAMPLES {
+        if !self.precise_timestamps {
+            results.push(TestResult::info("Est. Poll Rate", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Terminal timestamps",
+                "are read times, too coarse;",
+            ));
+            results.push(TestResult::info(
+                "poll rate needs",
+                "evdev (Linux, sudo/input group)",
+            ));
+        } else if self.report_gaps_us.len() >= MIN_QUANTIZATION_SAMPLES {
             match self.estimated_poll_rate_hz() {
                 Some(hz) => {
+                    // A lower rate is a spec, not a fault: 125 Hz is the USB
+                    // default and fine for typing.
                     let status = if hz >= 500.0 {
                         ResultStatus::Ok
-                    } else if hz >= 200.0 {
-                        ResultStatus::Warning
                     } else {
                         ResultStatus::Info
                     };
@@ -272,16 +365,21 @@ impl KeyboardTest for PollingRateTest {
                     ));
                 }
                 None => {
-                    results.push(TestResult::ok("Est. Poll Rate", ">= 1000 Hz or not polled"));
+                    // No 2/4/8 ms grid: a 1000+ Hz keyboard, but also Bluetooth
+                    // (connection intervals of their own), so no rate is claimed.
+                    results.push(TestResult::info(
+                        "Est. Poll Rate",
+                        "no 125/250/500 Hz grid (1000+ Hz or Bluetooth)",
+                    ));
                 }
             }
         } else {
             results.push(TestResult::info(
                 "Est. Poll Rate",
                 format!(
-                    "need {} rapid taps ({} so far)",
-                    MIN_QUANTIZATION_SAMPLES,
-                    self.intervals_us.len()
+                    "keep tapping: {} of {} key-event gaps",
+                    self.report_gaps_us.len(),
+                    MIN_QUANTIZATION_SAMPLES
                 ),
             ));
         }
@@ -336,7 +434,9 @@ impl KeyboardTest for PollingRateTest {
     fn reset(&mut self) {
         self.start_time = None;
         self.intervals_us.clear();
+        self.report_gaps_us.clear();
         self.last_event = None;
+        self.last_any_event = None;
         self.event_count = 0;
         self.min_interval_us = None;
         self.max_interval_us = None;
@@ -487,5 +587,168 @@ mod tests {
         let test = PollingRateTest::new(10, 100);
         assert_eq!(test.name(), "Polling Rate Test");
         assert!(!test.description().is_empty());
+    }
+
+    /// Feed presses separated by the given gaps (µs), rolling over four
+    /// keys as fast typing does (one key cannot be re-pressed that fast).
+    fn feed_gaps(test: &mut PollingRateTest, gaps_us: &[u64]) {
+        let key = |i: usize| crate::keyboard::KeyCode(30 + (i % 4) as u16);
+        let mut at = Instant::now();
+        test.process_event(&press_at(key(0), at, 0));
+        for (i, &gap) in gaps_us.iter().enumerate() {
+            at += Duration::from_micros(gap);
+            test.process_event(&press_at(key(i + 1), at, gap));
+        }
+    }
+
+    fn poll_row(test: &PollingRateTest) -> TestResult {
+        test.get_results()
+            .into_iter()
+            .find(|r| r.label == "Est. Poll Rate")
+            .expect("poll rate row")
+    }
+
+    /// Fast rolled typing on a 125 Hz keyboard: human gaps of 24-56 ms,
+    /// each one landing on the 8 ms report grid.
+    fn gaps_125hz() -> Vec<u64> {
+        (0..30u64).map(|i| 8_000 * (3 + i % 4)).collect()
+    }
+
+    /// Fast typing with gaps that are not on any report grid (1000 Hz
+    /// keyboard, or Bluetooth with jittery connection events).
+    fn gaps_unquantized() -> Vec<u64> {
+        (0..30u64).map(|i| 31_000 + (i * 7_919) % 23_000).collect()
+    }
+
+    #[test]
+    fn quantized_evdev_timestamps_give_the_poll_rate() {
+        let mut test = PollingRateTest::new(10, 100);
+        feed_gaps(&mut test, &gaps_125hz());
+        assert_eq!(test.estimated_poll_interval_us(), Some(8000));
+        let row = poll_row(&test);
+        assert!(row.value.starts_with("125 Hz"), "{:?}", row);
+        // 125 Hz is the USB default, not a fault
+        assert_eq!(row.status, ResultStatus::Info);
+    }
+
+    #[test]
+    fn no_grid_is_not_claimed_as_1000hz() {
+        let mut test = PollingRateTest::new(10, 100);
+        feed_gaps(&mut test, &gaps_unquantized());
+        assert_eq!(test.estimated_poll_interval_us(), None);
+        let row = poll_row(&test);
+        assert_eq!(row.status, ResultStatus::Info, "{:?}", row);
+        assert!(!row.value.contains(">= 1000"), "{:?}", row);
+    }
+
+    #[test]
+    fn terminal_input_reports_poll_rate_as_not_measurable() {
+        for source in [
+            InputSource::TerminalWithRelease,
+            InputSource::TerminalPressOnly,
+        ] {
+            for gaps in [gaps_125hz(), gaps_unquantized()] {
+                let mut test = PollingRateTest::new(10, 100);
+                test.set_input_source(source);
+                feed_gaps(&mut test, &gaps);
+                assert!(!test.poll_rate_measurable());
+                assert_eq!(test.estimated_poll_interval_us(), None);
+                assert_eq!(test.estimated_poll_rate_hz(), None);
+                let row = poll_row(&test);
+                assert_eq!(row.status, ResultStatus::Info);
+                assert!(row.value.contains("n/a"), "{:?}", row);
+                assert!(!test
+                    .get_results()
+                    .iter()
+                    .any(|r| r.status == ResultStatus::Ok));
+            }
+        }
+    }
+
+    #[test]
+    fn evdev_input_keeps_the_estimate() {
+        let mut test = PollingRateTest::new(10, 100);
+        test.set_input_source(InputSource::Evdev);
+        feed_gaps(&mut test, &gaps_125hz());
+        assert!(test.poll_rate_measurable());
+        assert_eq!(test.estimated_poll_interval_us(), Some(8000));
+    }
+
+    /// Taps of one key with one finger, ~6 per second: presses 150-190 ms
+    /// apart (too far apart to count on their own), each held 60-90 ms, all
+    /// on a report grid of `step_us`.
+    fn one_finger_taps(step_us: u64, taps: u64) -> Vec<KeyEvent> {
+        let on_grid = |us: u64| us / step_us * step_us;
+        let mut at = Instant::now();
+        let mut events = Vec::new();
+        for i in 0..taps {
+            let hold = on_grid(60_000 + (i * 7_919) % 30_000);
+            let up = on_grid(90_000 + (i * 4_513) % 40_000);
+            events.push(press_at(DEFAULT_KEY, at, 0));
+            events.push(release_at(DEFAULT_KEY, at + Duration::from_micros(hold)));
+            at += Duration::from_micros(hold + up);
+        }
+        events
+    }
+
+    #[test]
+    fn one_finger_rapid_taps_give_the_poll_rate() {
+        // The auto test's rapid-tap step: no two presses are under 100 ms
+        // apart, but the holds and the gaps between taps are on the grid
+        for (step, hz) in [(8_000, "125 Hz"), (4_000, "250 Hz")] {
+            let mut test = PollingRateTest::new(10, 100);
+            for event in one_finger_taps(step, 30) {
+                test.process_event(&event);
+            }
+            assert!(test.intervals_us().is_empty());
+            assert!(test.quantization_samples() >= MIN_QUANTIZATION_SAMPLES);
+            assert_eq!(test.estimated_poll_interval_us(), Some(step));
+            assert!(
+                poll_row(&test).value.starts_with(hz),
+                "{:?}",
+                poll_row(&test)
+            );
+        }
+    }
+
+    #[test]
+    fn bluetooth_connection_interval_is_not_a_poll_rate() {
+        // A BLE keyboard on a 30 ms (or 20/10/40 ms) connection interval
+        // delivers every report at a connection event: all gaps are
+        // multiples of the interval, so also of 2, 4 or 8 ms
+        for interval_ms in [10u64, 20, 30, 40] {
+            let gaps: Vec<u64> = (0..40u64)
+                .map(|i| interval_ms * 1000 * (1 + i % 3))
+                .filter(|us| *us < 100_000)
+                .collect();
+            assert!(gaps.len() >= MIN_QUANTIZATION_SAMPLES);
+            assert_eq!(estimate_quantization_us(&gaps), None, "{interval_ms} ms");
+        }
+        // A real 500 Hz grid filled by human timing is still recognised
+        let gaps: Vec<u64> = (0..40u64).map(|i| 2_000 * (11 + (i * 7) % 23)).collect();
+        assert_eq!(estimate_quantization_us(&gaps), Some(2_000));
+    }
+
+    #[test]
+    fn progress_waits_for_enough_samples() {
+        let mut test = PollingRateTest::new(10, 100);
+        test.process_event(&press_at(DEFAULT_KEY, Instant::now(), 0));
+        test.start_time = Some(Instant::now() - Duration::from_secs(30));
+        // The time is up, but the estimate still needs gaps
+        assert_eq!(test.progress(), 0.0);
+        feed_gaps(&mut test, &gaps_125hz());
+        assert_eq!(test.progress(), 1.0);
+    }
+
+    #[test]
+    fn duration_setter_changes_progress() {
+        let mut test = PollingRateTest::new(10, 100);
+        feed_gaps(&mut test, &gaps_125hz());
+        test.start_time = Some(Instant::now() - Duration::from_secs(5));
+        assert!((test.progress() - 0.5).abs() < 0.05);
+        assert!(!test.is_complete());
+        test.set_duration_secs(5);
+        assert!(test.is_complete());
+        assert!((test.progress() - 1.0).abs() < f64::EPSILON);
     }
 }

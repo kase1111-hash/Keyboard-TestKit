@@ -6,12 +6,12 @@
 //!
 //! | Test | Description |
 //! |------|-------------|
-//! | [`PollingRateTest`] | Measures keyboard polling frequency (Hz) and jitter |
+//! | [`PollingRateTest`] | Estimates the keyboard's report rate from evdev timestamp quantization |
 //! | [`StickinessTest`] | Detects stuck keys that fail to release properly |
-//! | [`RolloverTest`] | Tests N-Key Rollover (NKRO) and ghosting detection |
-//! | [`EventTimingTest`] | Measures inter-event timing intervals per-key and globally |
+//! | [`RolloverTest`] | Counts keys registered at once (NKRO); ghost keys are shown, not detected |
+//! | [`EventTimingTest`] | Gaps between key events: typing-rhythm statistics, not a keyboard rating |
 //! | [`HoldReleaseTest`] | Analyzes key hold duration and mechanical bounce |
-//! | [`ShortcutTest`] | Validates keyboard shortcut combinations |
+//! | [`ShortcutTest`] | Records modifier combos and flags known system shortcuts |
 //! | [`VirtualKeyboardTest`] | Compares physical vs virtual key events |
 //! | [`OemKeyTest`] | Captures OEM keys and provides FN key restoration |
 //! | [`AutoTest`] | Guided automatic diagnostic that turns all of the above into findings |
@@ -54,10 +54,12 @@ pub mod virtual_detect;
 pub mod test_helpers;
 
 pub use auto_test::{
-    expected_keys_for_layout, AnalysisContext, AutoTest, AutoTestState, Finding, InputSource,
-    Severity, StepKind, StepOutcome,
+    expected_keys_for_layout, issues_status, AnalysisContext, AutoTest, AutoTestState, Finding,
+    InputSource, Severity, StepKind, StepOutcome, IDLE_DURATION,
 };
 pub use bounce::HoldReleaseTest;
+// The config clamps its bounce window to the range the test accepts
+pub(crate) use bounce::{DEFAULT_BOUNCE_WINDOW_MS, MAX_BOUNCE_WINDOW_MS, MIN_BOUNCE_WINDOW_MS};
 pub use latency::EventTimingTest;
 pub use oem_keys::OemKeyTest;
 pub use polling::PollingRateTest;

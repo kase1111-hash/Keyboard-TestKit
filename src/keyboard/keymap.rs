@@ -379,6 +379,9 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
         KeyInfo::new("RightShift", "Shift", 4, 11, 2.75),
     );
 
+    // ISO key between left Shift and Z (KEY_102ND: "\\|" on UK, "<>" on DE)
+    map.insert(KeyCode(86), KeyInfo::new("IsoBackslash", "\\", 4, 1, 1.0));
+
     // Bottom row (modifiers + space)
     map.insert(KeyCode(29), KeyInfo::new("LeftCtrl", "Ctrl", 5, 0, 1.25));
     map.insert(KeyCode(125), KeyInfo::new("LeftMeta", "Win", 5, 1, 1.25));
@@ -388,6 +391,14 @@ pub static KEYMAP: LazyLock<HashMap<KeyCode, KeyInfo>> = LazyLock::new(|| {
     map.insert(KeyCode(126), KeyInfo::new("RightMeta", "Win", 5, 5, 1.25));
     map.insert(KeyCode(127), KeyInfo::new("Menu", "Menu", 5, 6, 1.25));
     map.insert(KeyCode(97), KeyInfo::new("RightCtrl", "Ctrl", 5, 7, 1.25));
+
+    // JIS bottom-row keys
+    map.insert(KeyCode(94), KeyInfo::new("Muhenkan", "無", 5, 3, 1.0));
+    map.insert(KeyCode(92), KeyInfo::new("Henkan", "変", 5, 4, 1.0));
+    map.insert(
+        KeyCode(93),
+        KeyInfo::new("KatakanaHiragana", "カナ", 5, 5, 1.0),
+    );
 
     // Arrow keys
     map.insert(KeyCode(103), KeyInfo::new("Up", "↑", 5, 9, 1.0));
@@ -596,6 +607,15 @@ mod tests {
         let space_info = KEYMAP.get(&KeyCode(57)).unwrap();
         assert_eq!(space_info.name, "Space");
         assert!((space_info.width - 6.25).abs() < 0.01); // Wide key
+    }
+
+    #[test]
+    fn keymap_names_iso_and_jis_keys() {
+        // The ISO and JIS layouts expect these keys; they must not show as "Unknown"
+        for code in [86, 92, 93, 94] {
+            assert_ne!(get_key_info(KeyCode(code)).name, "Unknown", "code {}", code);
+        }
+        assert_eq!(get_key_info(KeyCode(86)).name, "IsoBackslash");
     }
 
     #[test]

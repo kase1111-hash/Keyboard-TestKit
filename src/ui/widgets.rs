@@ -53,12 +53,8 @@ impl<'a> Widget for ResultsPanel<'a> {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut y = inner.y;
-        for result in self.results {
-            if y >= inner.y + inner.height {
-                break;
-            }
-
+        let rows = inner.y..inner.y + inner.height;
+        for (y, result) in rows.zip(self.results.iter()) {
             let is_header = result.label.starts_with("---") || result.label.starts_with("===");
 
             if is_header {
@@ -86,7 +82,6 @@ impl<'a> Widget for ResultsPanel<'a> {
                 ]);
                 buf.set_line(inner.x, y, &line, inner.width);
             }
-            y += 1;
         }
     }
 }
@@ -149,32 +144,38 @@ impl Widget for HelpPanel {
 
         let sections = [
             (
-                "NAV",
+                "ANY VIEW",
                 &[
-                    ("Tab", "Switch view"),
-                    ("1-0", "Jump to view"),
-                    ("m", "Toggle shortcuts"),
-                    ("q", "Quit"),
+                    ("Tab", "Next view (Shift+Tab: previous)"),
+                    ("Esc", "Quit (Ctrl+C too)"),
+                    ("Ctrl+P", "Pause / resume"),
+                    ("Ctrl+R", "Reset current test"),
+                    ("Ctrl+E", "Export JSON report"),
                 ][..],
             ),
             (
-                "AUTO",
+                "TEST VIEWS 2-9",
+                &[
+                    ("keys", "Every other key is test input"),
+                    ("Ctrl", "Shortcuts: Ctrl combos too"),
+                    ("v", "Virtual: send test keys"),
+                    ("a f c", "OEM: add FN key, FN mode, clear"),
+                ][..],
+            ),
+            (
+                "DASHBOARD / AUTO / HELP",
                 &[
                     ("A", "Run auto test"),
-                    ("Ctrl+N", "Skip step"),
-                    ("Ctrl+C", "Abort test"),
+                    ("1-0", "Jump to view (m: on/off)"),
+                    ("Space", "Pause"),
+                    ("r / R", "Reset current / all"),
+                    ("e  q", "Export, quit"),
+                    ("S t ?", "Settings, theme, help"),
                 ][..],
             ),
             (
-                "CTL",
-                &[
-                    ("Space", "Pause"),
-                    ("r/R", "Reset"),
-                    ("e", "Export"),
-                    ("t", "Toggle theme"),
-                    ("S", "Settings"),
-                    ("?", "Help"),
-                ][..],
+                "AUTO TEST RUNNING",
+                &[("Ctrl+N", "Skip step"), ("Ctrl+C", "Abort test")][..],
             ),
             (
                 "TESTS",
@@ -184,19 +185,11 @@ impl Widget for HelpPanel {
                     ("3", "Bounce"),
                     ("4", "Sticky"),
                     ("5", "NKRO"),
-                    ("6", "Latency"),
+                    ("6", "Timing"),
                     ("7", "Shortcuts"),
                     ("8", "Virtual"),
                     ("9", "OEM/FN"),
                     ("0", "Auto"),
-                ][..],
-            ),
-            (
-                "OEM",
-                &[
-                    ("a", "Add FN scancode"),
-                    ("f", "Cycle FN mode"),
-                    ("c", "Clear mappings"),
                 ][..],
             ),
         ];

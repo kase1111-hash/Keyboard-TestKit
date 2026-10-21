@@ -61,6 +61,8 @@ fn full_pipeline_processes_through_all_tests() {
 #[test]
 fn full_pipeline_shortcut_detection() {
     let mut app = App::default();
+    // A bare Ctrl press only arrives through evdev (or the kitty protocol)
+    app.set_input_source(InputSource::Evdev);
 
     // Press Ctrl+C (scancode 29=LCtrl, 46=C)
     app.process_event(&press(29, 1000));
@@ -93,6 +95,18 @@ fn full_pipeline_rollover_tracking() {
         app.process_event(&release(k, 1000));
     }
     assert_eq!(app.keyboard_state.current_rollover(), 0);
+
+    // The rating, the Dashboard and the report count Shift apart: a 6KRO
+    // keyboard held with modifiers is not "7KRO" or "NKRO"
+    app.set_input_source(InputSource::Evdev);
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    let max = dash.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "5 + 1 modifier(s)");
+    assert_eq!(app.rollover_test.rollover_rating(), "5KRO");
+    let report = app.generate_report();
+    assert_eq!(report.summary.max_rollover, Some(5));
+    assert!(report.to_text().contains("Max Rollover:    5KRO"));
 }
 
 // ---------------------------------------------------------------------------
@@ -340,12 +354,209 @@ fn dashboard_results_include_session_info() {
 
 #[test]
 fn no_events_produces_empty_report() {
-    let app = App::default();
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
     let report = app.generate_report();
 
     assert_eq!(report.summary.total_events, 0);
-    assert_eq!(report.summary.max_rollover, 0);
+    assert_eq!(report.summary.max_rollover, Some(0));
     assert_eq!(report.summary.issues_detected, 0);
+}
+
+#[test]
+fn press_only_rollover_is_not_presented_as_a_measurement() {
+    // A press-only terminal keeps each tap "down" for up to 750 ms, so
+    // typing "hello" quickly looks like 4 keys held at once (h, e, l, o)
+    // although the user never held more than one.
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    let t0 = Instant::now();
+    for (i, key) in [35u16, 18, 38, 38, 24].iter().enumerate() {
+        let when = t0 + Duration::from_millis(i as u64 * 110);
+        app.process_event(&timed(*key, KeyEventType::Press, when, 110_000));
+    }
+    assert_eq!(app.keyboard_state.max_rollover(), 4);
+
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    let max = dash.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "n/a (terminal input)");
+
+    let nkro = {
+        app.view = AppView::Rollover;
+        app.current_results()
+    };
+    let max = nkro.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "n/a (terminal input)");
+    assert!(!nkro.iter().any(|r| r.value.contains("4KRO")));
+
+    let report = app.generate_report();
+    assert_eq!(report.summary.max_rollover, None);
+    assert!(report.to_text().contains("Max Rollover:    n/a"));
+
+    // The auto test does not run (or judge) its rollover step either
+    app.start_auto_test();
+    assert!(!app.auto_test.steps().contains(&StepKind::Rollover));
+    app.abort_auto_test();
+    assert!(!app.findings.iter().any(|f| f.category == "Rollover"));
+
+    // With real releases the same view shows the measured peak
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalWithRelease);
+    for key in 30..36 {
+        app.process_event(&press(key, 1000));
+    }
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    assert_eq!(
+        dash.iter()
+            .find(|r| r.label == "Max Rollover")
+            .unwrap()
+            .value,
+        "6"
+    );
+    assert_eq!(app.generate_report().summary.max_rollover, Some(6));
+}
+
+#[test]
+fn keyboard_disconnect_is_a_finding_everywhere_not_only_at_exit() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    // The cable drops out mid-run: main.rs records it, then stops the run
+    app.keyboard_disconnected("USB Keyboard");
+    app.abort_auto_test();
+    app.keyboard_connected();
+
+    let connection = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Connection")
+        .expect("connection finding");
+    assert_eq!(connection.severity, Severity::Warning);
+    assert!(connection.detail.contains("USB Keyboard"));
+    assert_eq!(app.issue_count(), 1, "{:?}", app.findings);
+
+    // Dashboard: a warning-only result is yellow, not a red verdict
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    assert!(dash
+        .iter()
+        .any(|r| r.label.contains("Connection") && r.value.contains("disconnected 1 time")));
+    let issues = dash.iter().find(|r| r.label == "Issues Found").unwrap();
+    assert_eq!(
+        issues.status,
+        keyboard_testkit::tests::ResultStatus::Warning
+    );
+    // Exported report
+    let report = app.generate_report();
+    assert_eq!(report.summary.issues_detected, 1);
+    assert!(report.to_csv().contains("Diagnostics,Connection"));
+
+    // A clean slate forgets it (e.g. replugged on purpose before a new run)
+    app.start_auto_test();
+    assert!(!app.findings.iter().any(|f| f.category == "Connection"));
+    app.keyboard_disconnected("USB Keyboard");
+    app.reset_all();
+    assert_eq!(app.keyboard_disconnects(), 0);
+    assert_eq!(app.issue_count(), 0);
+}
+
+#[test]
+fn key_stuck_before_the_auto_test_starts_is_reported_as_stuck() {
+    // Backspace jammed down 5 s ago; the user then presses Shift+A to
+    // start the auto test. Starting must not forget the jammed key (the idle
+    // step is there to catch it), nor flag the Shift used to type 'A'.
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let jammed = Instant::now() - Duration::from_secs(5);
+    app.process_event(&timed(14, KeyEventType::Press, jammed, 0));
+    app.process_event(&timed(42, KeyEventType::Press, Instant::now(), 0));
+    app.start_auto_test();
+    app.process_event(&timed(42, KeyEventType::Release, Instant::now(), 0));
+    app.tick();
+    app.refresh_findings();
+
+    let stuck = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Stuck key")
+        .expect("stuck key finding");
+    assert_eq!(stuck.severity, Severity::Critical);
+    assert!(
+        stuck.detail.starts_with("Backspace (5."),
+        "{}",
+        stuck.detail
+    );
+    assert!(!stuck.detail.contains("Shift"), "{}", stuck.detail);
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Phantom input"),
+        "{:?}",
+        app.findings
+    );
+
+    // Released keys from before the run stay forgotten: a clean slate
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    tap(&mut app, 30, 1000);
+    app.start_auto_test();
+    assert_eq!(app.keyboard_state.total_events(), 0);
+    assert!(app.stickiness_test.held_keys().is_empty());
+}
+
+#[test]
+fn export_includes_findings_from_the_last_moment() {
+    // A bounce typed right before Ctrl+E (no tick in between) is in the file
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let t0 = Instant::now();
+    app.process_event(&timed(30, KeyEventType::Press, t0, 0));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Release,
+        t0 + Duration::from_millis(1),
+        1000,
+    ));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Press,
+        t0 + Duration::from_millis(2),
+        1000,
+    ));
+    let path = std::env::temp_dir().join(format!(
+        "keyboard-testkit-fresh-{}.json",
+        std::process::id()
+    ));
+    app.export_report(&path.to_string_lossy()).unwrap();
+    let json = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(json.contains("Switch bounce"), "{}", json);
+    assert!(json.contains("\"issues_detected\": 1"), "{}", json);
+}
+
+#[test]
+fn healthy_session_without_disconnects_reports_no_connection_issue() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    type_keys(&mut app, &[30, 31, 32], 1000);
+    app.keyboard_connected(); // a second keyboard plugged in is not a fault
+    app.refresh_findings();
+    assert!(!app.findings.iter().any(|f| f.category == "Connection"));
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
+}
+
+#[test]
+fn press_only_sticky_view_does_not_claim_no_stuck_keys() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    app.process_event(&press(14, 1000));
+    app.view = AppView::Stickiness;
+    let results = app.current_results();
+    let stuck = results.iter().find(|r| r.label == "Stuck Keys").unwrap();
+    assert_eq!(stuck.value, "n/a (terminal input)");
+    assert!(!results
+        .iter()
+        .any(|r| r.status != keyboard_testkit::tests::ResultStatus::Info));
 }
 
 #[test]
@@ -472,7 +683,7 @@ fn current_results_returns_correct_test_results() {
 // Automatic diagnostic (auto test)
 // ---------------------------------------------------------------------------
 
-use keyboard_testkit::tests::{AutoTestState, InputSource, Severity, StepKind};
+use keyboard_testkit::tests::{AutoTestState, InputSource, Severity, StepKind, IDLE_DURATION};
 use std::time::Duration;
 
 fn timed(key: u16, event_type: KeyEventType, at: Instant, delta_us: u64) -> KeyEvent {
@@ -510,16 +721,23 @@ fn auto_test_view_renders_instructions_and_findings() {
     assert!(running.iter().any(|r| r.value.contains("Hands off")));
 }
 
+/// Let the idle step of a running auto test run its course.
+fn finish_idle_step(app: &mut App) {
+    app.auto_test.tick_at(Instant::now() + IDLE_DURATION);
+    app.refresh_findings();
+}
+
 #[test]
 fn auto_test_phantom_input_during_idle_is_reported() {
     let mut app = App::default();
     app.set_input_source(InputSource::Evdev);
     app.start_auto_test();
-    // A key fires while the user was told to keep hands off
-    app.process_event(&press(30, 1000));
-    app.process_event(&release(30, 1000));
-    app.abort_auto_test();
-    assert_eq!(app.auto_test.state(), AutoTestState::Aborted);
+    // A key fires again and again while the user was told to keep hands off
+    for _ in 0..3 {
+        tap(&mut app, 30, 1000);
+    }
+    finish_idle_step(&mut app);
+    assert_eq!(app.auto_test.current_step(), Some(StepKind::Sweep));
     let phantom = app
         .findings
         .iter()
@@ -527,6 +745,28 @@ fn auto_test_phantom_input_during_idle_is_reported() {
         .expect("phantom finding present");
     assert_eq!(phantom.severity, Severity::Critical);
     assert!(app.issue_count() >= 1);
+
+    // One whole keystroke may just be the user: a conditional Warning
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    tap(&mut app, 30, 1000);
+    finish_idle_step(&mut app);
+    let phantom = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Phantom input")
+        .unwrap();
+    assert_eq!(phantom.severity, Severity::Warning);
+
+    // Stopping the run during the idle step does not judge it
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    app.process_event(&press(29, 1000));
+    app.abort_auto_test();
+    assert_eq!(app.auto_test.state(), AutoTestState::Aborted);
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
 }
 
 #[test]
@@ -555,7 +795,7 @@ fn auto_test_skip_all_steps_completes_run() {
 }
 
 #[test]
-fn auto_test_press_only_terminal_skips_release_steps_and_warns() {
+fn auto_test_press_only_terminal_skips_release_steps_and_informs() {
     let mut app = App::default();
     app.set_input_source(InputSource::TerminalPressOnly);
     app.start_auto_test();
@@ -564,10 +804,66 @@ fn auto_test_press_only_terminal_skips_release_steps_and_warns() {
         &[StepKind::Idle, StepKind::Sweep, StepKind::RapidTap]
     );
     app.refresh_findings();
+    // A limitation of the setup, not a keyboard issue
     assert!(app
         .findings
         .iter()
-        .any(|f| f.category == "Limited capture" && f.severity == Severity::Warning));
+        .any(|f| f.category == "Limited capture" && f.severity == Severity::Info));
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
+}
+
+#[test]
+fn auto_test_start_keystroke_read_late_from_evdev_is_not_phantom() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    // The kernel stamped the 'A' press before the terminal copy started the test
+    let pressed = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    app.start_auto_test();
+    app.process_event(&timed(30, KeyEventType::Press, pressed, 0));
+    app.process_event(&release(30, 1000));
+    finish_idle_step(&mut app);
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Phantom input"),
+        "{:?}",
+        app.findings
+    );
+}
+
+#[test]
+fn auto_test_terminal_sweep_expects_only_reportable_keys() {
+    // App sets the layout's keys before it learns the input source
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let all = app.auto_test.expected_keys().len();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    let expected = app.auto_test.expected_keys();
+    assert!(expected.len() < all);
+    for modifier in [29u16, 42, 54, 56, 58, 97, 100, 125] {
+        assert!(!expected.contains(&KeyCode(modifier)), "{}", modifier);
+    }
+    assert!(expected.contains(&KeyCode(30)));
+    app.set_input_source(InputSource::Evdev);
+    assert_eq!(app.auto_test.expected_keys().len(), all);
+}
+
+#[test]
+fn long_hold_released_normally_is_not_a_stuck_key() {
+    let mut config = Config::default();
+    config.stickiness.stuck_threshold_ms = 10;
+    let mut app = App::new(config);
+    app.set_input_source(InputSource::Evdev);
+    app.process_event(&press(17, 1000));
+    std::thread::sleep(Duration::from_millis(30));
+    app.tick();
+    app.process_event(&release(17, 1000));
+    app.refresh_findings();
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Stuck key"),
+        "{:?}",
+        app.findings
+    );
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
 }
 
 #[test]
@@ -576,19 +872,24 @@ fn live_findings_detect_switch_bounce_without_running_auto_test() {
     app.set_input_source(InputSource::Evdev);
     let t0 = Instant::now();
     // press, release 1ms later, press again 1ms later: classic contact bounce
-    app.process_event(&timed(30, KeyEventType::Press, t0, 0));
-    app.process_event(&timed(
-        30,
-        KeyEventType::Release,
-        t0 + Duration::from_millis(1),
-        1000,
-    ));
-    app.process_event(&timed(
-        30,
-        KeyEventType::Press,
-        t0 + Duration::from_millis(2),
-        1000,
-    ));
+    let bounce_at = |app: &mut App, at: Instant| {
+        let ms = Duration::from_millis;
+        app.process_event(&timed(30, KeyEventType::Press, at, 0));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(1), 1000));
+        app.process_event(&timed(30, KeyEventType::Press, at + ms(2), 1000));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(80), 1000));
+    };
+    bounce_at(&mut app, t0);
+    app.refresh_findings();
+    // Once may be a delayed wireless report: worth a look, worded as such
+    let bounce = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(bounce.severity, Severity::Warning);
+    // The same key bouncing again is a fault
+    bounce_at(&mut app, t0 + Duration::from_millis(300));
     app.refresh_findings();
     let bounce = app
         .findings

@@ -24,7 +24,6 @@
 //! // report.export_text(Path::new("report.txt"))?;
 //! ```
 
-use crate::keyboard::KeyboardState;
 use crate::tests::{ResultStatus, TestResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
@@ -61,8 +60,10 @@ pub struct ReportMetadata {
 pub struct SessionSummary {
     /// Total keyboard events processed
     pub total_events: u64,
-    /// Maximum simultaneous keys pressed
-    pub max_rollover: usize,
+    /// Maximum simultaneous keys pressed; `None` (JSON `null`) when the input
+    /// source cannot measure it (press-only terminal input guesses releases)
+    #[serde(default)]
+    pub max_rollover: Option<usize>,
     /// Estimated polling rate in Hz
     pub estimated_polling_rate_hz: Option<f64>,
     /// Number of issues detected
@@ -113,6 +114,10 @@ impl From<&TestResult> for ResultEntry {
 pub struct ReportInput {
     pub start_time: Instant,
     pub total_events: u64,
+    /// Peak keys held at once, modifiers not counted (as the rollover
+    /// rating counts them); `None` when releases are guessed (press-only
+    /// terminal input) and the peak is not a measurement
+    pub max_rollover: Option<usize>,
     /// Polling rate inferred from timestamp quantization, if available
     pub polling_rate_hz: Option<f64>,
     pub polling: Vec<TestResult>,
@@ -129,7 +134,7 @@ pub struct ReportInput {
 
 impl SessionReport {
     /// Create a new session report from all 8 test results
-    pub fn new(input: ReportInput, keyboard_state: &KeyboardState) -> Self {
+    pub fn new(input: ReportInput) -> Self {
         let duration_secs = input.start_time.elapsed().as_secs_f64();
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -171,7 +176,7 @@ impl SessionReport {
             },
             summary: SessionSummary {
                 total_events: input.total_events,
-                max_rollover: keyboard_state.max_rollover(),
+                max_rollover: input.max_rollover,
                 estimated_polling_rate_hz: input.polling_rate_hz,
                 issues_detected: issues,
             },
@@ -201,6 +206,14 @@ impl SessionReport {
     /// Export report to JSON string
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+
+    /// The summary's rollover for the human-readable formats.
+    fn max_rollover_text(&self) -> String {
+        match self.summary.max_rollover {
+            Some(n) => format!("{}KRO", n),
+            None => "n/a (terminal input)".to_string(),
+        }
     }
 
     // ========================================================================
@@ -291,7 +304,7 @@ impl SessionReport {
         writeln!(md, "| Metric | Value |").unwrap();
         writeln!(md, "|--------|-------|").unwrap();
         writeln!(md, "| Total Events | {} |", self.summary.total_events).unwrap();
-        writeln!(md, "| Max Rollover | {}KRO |", self.summary.max_rollover).unwrap();
+        writeln!(md, "| Max Rollover | {} |", self.max_rollover_text()).unwrap();
         if let Some(hz) = self.summary.estimated_polling_rate_hz {
             writeln!(md, "| Polling Rate | {:.0} Hz |", hz).unwrap();
         }
@@ -372,7 +385,7 @@ impl SessionReport {
         writeln!(text, "SUMMARY").unwrap();
         writeln!(text, "-------").unwrap();
         writeln!(text, "Total Events:    {}", self.summary.total_events).unwrap();
-        writeln!(text, "Max Rollover:    {}KRO", self.summary.max_rollover).unwrap();
+        writeln!(text, "Max Rollover:    {}", self.max_rollover_text()).unwrap();
         if let Some(hz) = self.summary.estimated_polling_rate_hz {
             writeln!(text, "Polling Rate:    {:.0} Hz", hz).unwrap();
         }
@@ -431,7 +444,7 @@ mod tests {
             },
             summary: SessionSummary {
                 total_events: 1500,
-                max_rollover: 6,
+                max_rollover: Some(6),
                 estimated_polling_rate_hz: Some(1000.0),
                 issues_detected: 2,
             },
@@ -602,6 +615,27 @@ mod tests {
         assert!(text.contains("SUMMARY"));
         assert!(text.contains("Total Events:    1500"));
         assert!(text.contains("Max Rollover:    6KRO"));
+    }
+
+    #[test]
+    fn unmeasured_rollover_is_not_reported_as_a_number() {
+        let mut report = create_test_report();
+        report.summary.max_rollover = None;
+        let json = report.to_json().unwrap();
+        assert!(json.contains("\"max_rollover\": null"), "{}", json);
+        assert!(report
+            .to_markdown()
+            .contains("| Max Rollover | n/a (terminal input) |"));
+        assert!(report
+            .to_text()
+            .contains("Max Rollover:    n/a (terminal input)"));
+        // Reports exported by earlier versions (always a number) still load
+        let old = json.replace("\"max_rollover\": null,", "\"max_rollover\": 6,");
+        let parsed: SessionReport = serde_json::from_str(&old).unwrap();
+        assert_eq!(parsed.summary.max_rollover, Some(6));
+        let missing = json.replace("\"max_rollover\": null,", "");
+        let parsed: SessionReport = serde_json::from_str(&missing).unwrap();
+        assert_eq!(parsed.summary.max_rollover, None);
     }
 
     #[test]

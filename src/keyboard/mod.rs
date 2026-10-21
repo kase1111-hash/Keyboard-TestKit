@@ -52,4 +52,4 @@ pub use layout::KeyboardLayout;
 pub use state::{KeyState, KeyboardState};
 
 #[cfg(target_os = "linux")]
-pub use evdev_listener::{evdev_status, is_evdev_available, EvdevListener};
+pub use evdev_listener::{evdev_status, is_evdev_available, EvdevDeviceChange, EvdevListener};

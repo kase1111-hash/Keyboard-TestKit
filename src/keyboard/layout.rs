@@ -224,78 +224,80 @@ fn parse_xkb_query(output: &str) -> KeyboardLayout {
             model = value.trim();
         } else if let Some(value) = line.strip_prefix("layout:") {
             layout = value.trim();
-            // Take only the first layout if comma-separated
-            if let Some(first) = layout.split(',').next() {
-                layout = first.trim();
-            }
         }
     }
+    classify_xkb(layout, model)
+}
 
-    // JIS detection
-    if layout == "jp" || model.contains("jp") || model.contains("jis") {
-        return KeyboardLayout::Jis;
-    }
-
-    // ISO detection: models with 102/105 keys, or known ISO layouts
-    if model.contains("105") || model.contains("102") || model.contains("iso") {
-        return KeyboardLayout::Iso;
-    }
-
+/// Decide the physical layout from an XKB layout and model name.
+///
+/// The layout decides: distributions set the model to `pc105` on almost
+/// every install (Debian/Ubuntu do so for US keyboards too), so the model is
+/// only a fallback for layouts that do not imply a physical layout.
+#[cfg(target_os = "linux")]
+fn classify_xkb(layout: &str, model: &str) -> KeyboardLayout {
     // Known ISO layout countries
     const ISO_LAYOUTS: &[&str] = &[
         "gb", "uk", "de", "fr", "es", "it", "pt", "nl", "be", "dk", "fi", "no", "se", "ch", "at",
         "ie", "is", "cz", "sk", "hu", "pl", "ro", "bg", "hr", "si", "rs", "tr", "br", "latam",
     ];
+    // Layouts sold on ANSI keyboards
+    const ANSI_LAYOUTS: &[&str] = &["us"];
 
+    // Take only the first layout if comma-separated
+    let layout = layout.split(',').next().unwrap_or("").trim();
+    let model = model.trim();
+
+    if layout == "jp" {
+        return KeyboardLayout::Jis;
+    }
     if ISO_LAYOUTS.contains(&layout) {
         return KeyboardLayout::Iso;
     }
+    if ANSI_LAYOUTS.contains(&layout) {
+        return KeyboardLayout::Ansi;
+    }
 
-    // Default to ANSI for "us" and anything else
+    // Unknown or missing layout: fall back to the model
+    if model.contains("jp") || model.contains("jis") {
+        return KeyboardLayout::Jis;
+    }
+    if model.contains("105") || model.contains("102") || model.contains("iso") {
+        return KeyboardLayout::Iso;
+    }
     KeyboardLayout::Ansi
 }
 
 #[cfg(target_os = "linux")]
 fn parse_keyboard_config(contents: &str) -> KeyboardLayout {
-    // Format: XKBLAYOUT="gb"
+    // Format: XKBMODEL="pc105"\nXKBLAYOUT="gb"
+    let mut model = "";
+    let mut layout = "";
     for line in contents.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("XKBLAYOUT=") {
-            let layout = value.trim_matches('"');
-            if layout == "jp" {
-                return KeyboardLayout::Jis;
-            }
-            // Use same ISO check
-            let first = layout.split(',').next().unwrap_or(layout);
-            return parse_xkb_query(&format!("layout: {}", first));
-        }
-        if let Some(value) = line.strip_prefix("XKBMODEL=") {
-            let model = value.trim_matches('"');
-            if model.contains("jp") || model.contains("jis") {
-                return KeyboardLayout::Jis;
-            }
-            if model.contains("105") || model.contains("102") {
-                return KeyboardLayout::Iso;
-            }
+            layout = value.trim_matches('"');
+        } else if let Some(value) = line.strip_prefix("XKBMODEL=") {
+            model = value.trim_matches('"');
         }
     }
-    KeyboardLayout::Ansi
+    classify_xkb(layout, model)
 }
 
 #[cfg(target_os = "linux")]
 fn parse_localectl(output: &str) -> KeyboardLayout {
-    // Format: "X11 Layout: gb"
+    // Format: "X11 Layout: gb\n X11 Model: pc105"
+    let mut model = "";
+    let mut layout = "";
     for line in output.lines() {
-        if let Some(value) = line.trim().strip_prefix("X11 Layout:") {
-            let layout = value.trim();
-            return parse_xkb_query(&format!("layout: {}", layout));
-        }
-        if let Some(value) = line.trim().strip_prefix("X11 Model:") {
-            let model = value.trim();
-            return parse_xkb_query(&format!("model: {}", model));
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("X11 Layout:") {
+            layout = value.trim();
+        } else if let Some(value) = line.strip_prefix("X11 Model:") {
+            model = value.trim();
         }
     }
-    KeyboardLayout::Ansi
+    classify_xkb(layout, model)
 }
 
 #[cfg(test)]
@@ -390,6 +392,54 @@ mod tests {
     fn parse_keyboard_config_gb() {
         let contents = "XKBMODEL=\"pc105\"\nXKBLAYOUT=\"gb\"\n";
         assert_eq!(parse_keyboard_config(contents), KeyboardLayout::Iso);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_xkb_default_pc105_us_is_ansi() {
+        // Debian/Ubuntu default: pc105 model even for US ANSI keyboards
+        let output = "rules:      evdev\nmodel:      pc105\nlayout:     us\n";
+        assert_eq!(parse_xkb_query(output), KeyboardLayout::Ansi);
+        let output = "rules:      evdev\nmodel:      pc105\nlayout:     us,de\n";
+        assert_eq!(parse_xkb_query(output), KeyboardLayout::Ansi);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_xkb_first_of_several_layouts_decides() {
+        let output = "model:      pc105\nlayout:     de,us\n";
+        assert_eq!(parse_xkb_query(output), KeyboardLayout::Iso);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_xkb_model_is_fallback_for_unknown_layouts() {
+        assert_eq!(classify_xkb("", "pc105"), KeyboardLayout::Iso);
+        assert_eq!(classify_xkb("ru", "pc105"), KeyboardLayout::Iso);
+        assert_eq!(classify_xkb("ru", "pc104"), KeyboardLayout::Ansi);
+        assert_eq!(classify_xkb("", "jp106"), KeyboardLayout::Jis);
+        assert_eq!(classify_xkb("", ""), KeyboardLayout::Ansi);
+        // A known layout beats the model
+        assert_eq!(classify_xkb("gb", "pc104"), KeyboardLayout::Iso);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_keyboard_config_default_us_is_ansi() {
+        // XKBMODEL comes first in /etc/default/keyboard; it must not decide alone
+        let contents = "XKBMODEL=\"pc105\"\nXKBLAYOUT=\"us\"\nXKBVARIANT=\"\"\n";
+        assert_eq!(parse_keyboard_config(contents), KeyboardLayout::Ansi);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_localectl_uses_layout_and_model() {
+        let out = "   System Locale: LANG=en_US.UTF-8\n       VC Keymap: us\n      X11 Layout: us\n       X11 Model: pc105\n";
+        assert_eq!(parse_localectl(out), KeyboardLayout::Ansi);
+        let out = "      X11 Layout: de\n       X11 Model: pc105\n";
+        assert_eq!(parse_localectl(out), KeyboardLayout::Iso);
+        let out = "       X11 Model: pc105\n";
+        assert_eq!(parse_localectl(out), KeyboardLayout::Iso);
     }
 
     #[cfg(target_os = "linux")]
