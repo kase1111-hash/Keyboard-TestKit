@@ -211,6 +211,13 @@ between views or Settings values may repeat).
 
 ## Configuration
 
+The config file is `~/.config/keyboard-testkit/config.toml` on Linux,
+`~/Library/Application Support/keyboard-testkit/config.toml` on macOS and
+`%APPDATA%\keyboard-testkit\config.toml` on Windows; `--config <path>` uses
+another file. Run with `sudo` on Linux, the app still uses your own file
+(not root's), and files it creates there stay yours. The mapper service
+installed with `--mapper-install` is given that file's path.
+
 Default configuration values (in `src/config.rs`):
 
 | Setting | Default | Description |

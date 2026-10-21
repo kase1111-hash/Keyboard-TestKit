@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub enum MapperError {
     Io(io::Error),
     /// Device not found
     DeviceNotFound(String),
+    /// Nothing to map: no preset and no (enabled) key mappings in the config
+    NoMappings,
 }
 
 impl std::fmt::Display for MapperError {
@@ -67,6 +70,10 @@ impl std::fmt::Display for MapperError {
             MapperError::UinputFailed(msg) => write!(f, "Failed to create uinput device: {}", msg),
             MapperError::Io(e) => write!(f, "IO error: {}", e),
             MapperError::DeviceNotFound(msg) => write!(f, "Device not found: {}", msg),
+            MapperError::NoMappings => write!(
+                f,
+                "No key mappings configured (use --preset, or key_mappings in config.toml)"
+            ),
         }
     }
 }
@@ -549,10 +556,66 @@ pub fn find_mapper_devices(
     Ok(devices)
 }
 
-/// Run the key mapper daemon with the given configuration
+/// The key capabilities of an event node, from sysfs: word 0 holds key codes
+/// 0..N (sysfs prints the most significant word first).
+fn device_key_caps(path: &Path) -> Vec<u64> {
+    let node = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    fs::read_to_string(format!("/sys/class/input/{}/device/capabilities/key", node))
+        .map(|caps| parse_key_caps(&caps))
+        .unwrap_or_default()
+}
+
+/// Parse a sysfs capability bitmap (hex `unsigned long`s, most significant
+/// first) into words, least significant first.
+fn parse_key_caps(text: &str) -> Vec<u64> {
+    let mut words: Vec<u64> = text
+        .split_whitespace()
+        .map(|hex| u64::from_str_radix(hex, 16).unwrap_or(0))
+        .collect();
+    words.reverse();
+    words
+}
+
+/// Whether a capability bitmap (see [`parse_key_caps`]) has key `code`.
+fn caps_have_key(words: &[u64], code: u16) -> bool {
+    let bits = 8 * std::mem::size_of::<libc::c_ulong>();
+    let code = code as usize;
+    words
+        .get(code / bits)
+        .is_some_and(|w| (w >> (code % bits)) & 1 == 1)
+}
+
+/// The number in an `eventN` node name (for a stable order).
+fn event_number(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("event"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+/// Pick the node to grab among `candidates` (path, key capabilities): the
+/// one that can send the most of the keys to map (a keyboard also has
+/// consumer-control and NKRO nodes, a mouse or a YubiKey can have a keyboard
+/// node), the lowest-numbered one on a tie. Returns it and how many of
+/// `sources` it has.
+fn pick_device(candidates: &[(PathBuf, Vec<u64>)], sources: &[u16]) -> Option<(PathBuf, usize)> {
+    candidates
+        .iter()
+        .map(|(path, caps)| {
+            let has = sources.iter().filter(|c| caps_have_key(caps, **c)).count();
+            (path, has)
+        })
+        .max_by_key(|(path, has)| (*has, std::cmp::Reverse(event_number(path))))
+        .map(|(path, has)| (path.clone(), has))
+}
+
+/// Run the key mapper daemon with the given configuration. `config_path`
+/// is a config file other than the default one (`--config`).
 pub fn run_mapper(
     preset_name: Option<&str>,
     device_path: Option<PathBuf>,
+    config_path: Option<&Path>,
     extra_mappings: &[(u16, u16)],
     running: Arc<AtomicBool>,
 ) -> Result<(), MapperError> {
@@ -571,14 +634,28 @@ pub fn run_mapper(
         }
     }
 
-    // Also load from the config file, saying so when it cannot be used
-    // (the mappings in it would otherwise be missing without a word)
-    let load = Config::load_reporting();
+    // Also load from the config file, saying which one and when it cannot
+    // be used (the mappings in it would otherwise be missing without a word)
+    let load = match config_path {
+        Some(path) => Config::load_reporting_from(path),
+        None => Config::load_reporting(),
+    };
+    if let Some(path) = &load.path {
+        eprintln!("Config file: {}", path.display());
+    }
     for note in load.notes() {
         eprintln!("Config: {}", note);
     }
-    for (from, to) in &load.config.oem_keys.key_mappings {
-        mappings.insert(*from, *to);
+    let oem = &load.config.oem_keys;
+    if oem.enabled {
+        for (from, to) in &oem.key_mappings {
+            mappings.insert(*from, *to);
+        }
+    } else if !oem.key_mappings.is_empty() {
+        eprintln!(
+            "[oem_keys] enabled = false: the {} key_mappings in the config are not applied",
+            oem.key_mappings.len()
+        );
     }
 
     // Apply extra mappings (override preset/config)
@@ -592,24 +669,23 @@ pub fn run_mapper(
         for (name, desc) in MapperPreset::available() {
             eprintln!("  --preset {} : {}", name, desc);
         }
-        return Ok(());
+        // An error, so a service with nothing to do shows as failed
+        return Err(MapperError::NoMappings);
     }
 
     // Find the target device
     let target_path = if let Some(path) = device_path {
         path
     } else {
-        // Auto-detect: try to find ASUS device first if using ASUS preset
+        // Auto-detect: try to find ASUS device first if using ASUS preset;
+        // if none matches the preset's name, look at every device
         let pattern =
             preset_name.and_then(|n| MapperPreset::by_name(n).and_then(|p| p.device_match));
-
-        let devices = find_mapper_devices(pattern.as_deref())?;
-
-        // If pattern didn't match, try without filter
-        let devices = if devices.is_empty() {
-            find_mapper_devices(None)?
-        } else {
-            devices
+        let devices = match pattern.as_deref() {
+            Some(pattern) => {
+                find_mapper_devices(Some(pattern)).or_else(|_| find_mapper_devices(None))?
+            }
+            None => find_mapper_devices(None)?,
         };
 
         eprintln!("Found {} input device(s):", devices.len());
@@ -617,12 +693,22 @@ pub fn run_mapper(
             eprintln!("  {} - {}", path.display(), name);
         }
 
-        // Use the first matching device
-        devices
+        let candidates: Vec<(PathBuf, Vec<u64>)> = devices
             .into_iter()
-            .next()
-            .map(|(path, _)| path)
-            .ok_or(MapperError::NoDevices)?
+            .map(|(path, _)| {
+                let caps = device_key_caps(&path);
+                (path, caps)
+            })
+            .collect();
+        let sources: Vec<u16> = mappings.keys().copied().collect();
+        let (path, has) = pick_device(&candidates, &sources).ok_or(MapperError::NoDevices)?;
+        if has == 0 {
+            eprintln!(
+                "No device reports the keys to map; pass --device to choose one \
+                 (see --list-devices)"
+            );
+        }
+        path
     };
 
     eprintln!("Using device: {}", target_path.display());
@@ -640,10 +726,14 @@ pub fn run_mapper(
     mapper.run()
 }
 
-/// Generate a systemd service unit file content
-pub fn generate_systemd_service(preset: Option<&str>) -> String {
+/// Generate a systemd service unit file content. A system service has no
+/// home directory of its own, so the config file is named explicitly.
+pub fn generate_systemd_service(preset: Option<&str>, config: Option<&Path>) -> String {
     let preset_arg = preset
         .map(|p| format!(" --preset {}", p))
+        .unwrap_or_default();
+    let config_arg = config
+        .map(|c| format!(" --config \"{}\"", c.display()))
         .unwrap_or_default();
 
     format!(
@@ -655,7 +745,7 @@ Wants=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/keyboard-testkit --mapper{preset_arg}
+ExecStart=/usr/local/bin/keyboard-testkit --mapper{preset_arg}{config_arg}
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal
@@ -685,9 +775,13 @@ KERNEL=="uinput", GROUP="input", MODE="0660"
     .to_string()
 }
 
-/// Install the mapper as a systemd service
-pub fn install_service(preset: Option<&str>) -> Result<(), MapperError> {
-    let service_content = generate_systemd_service(preset);
+/// Install the mapper as a systemd service. The service reads `config`, or
+/// the config file of the user who ran the install (through sudo).
+pub fn install_service(preset: Option<&str>, config: Option<&Path>) -> Result<(), MapperError> {
+    let config = config
+        .map(Path::to_path_buf)
+        .or_else(|| crate::config::config_path().ok());
+    let service_content = generate_systemd_service(preset, config.as_deref());
     let service_path = "/etc/systemd/system/keyboard-testkit-mapper.service";
 
     // Write service file
@@ -736,6 +830,12 @@ pub fn install_service(preset: Option<&str>) -> Result<(), MapperError> {
     }
 
     eprintln!("Service installed to {}", service_path);
+    if let Some(config) = &config {
+        eprintln!(
+            "The service reads its key mappings from {}",
+            config.display()
+        );
+    }
     eprintln!("Udev rule installed to {}", udev_path);
     eprintln!("Binary installed to {}", target_bin);
     eprintln!();
@@ -820,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_generate_systemd_service() {
-        let service = generate_systemd_service(Some("asus-g14"));
+        let service = generate_systemd_service(Some("asus-g14"), None);
         assert!(service.contains("[Unit]"));
         assert!(service.contains("[Service]"));
         assert!(service.contains("[Install]"));
@@ -830,9 +930,65 @@ mod tests {
 
     #[test]
     fn test_generate_systemd_service_no_preset() {
-        let service = generate_systemd_service(None);
+        let service = generate_systemd_service(None, None);
         assert!(service.contains("--mapper"));
         assert!(!service.contains("--preset"));
+    }
+
+    #[test]
+    fn service_names_the_users_config_file() {
+        // A system service has no HOME: without the path it would read no
+        // config, find no mappings and do nothing
+        let config = Path::new("/home/alice/.config/keyboard-testkit/config.toml");
+        let service = generate_systemd_service(None, Some(config));
+        assert!(service.contains(
+            "ExecStart=/usr/local/bin/keyboard-testkit --mapper --config \
+             \"/home/alice/.config/keyboard-testkit/config.toml\""
+        ));
+    }
+
+    #[test]
+    fn mapper_grabs_the_node_that_sends_the_mapped_keys() {
+        let caps = |codes: &[u16]| {
+            let mut words = vec![0u64; 12];
+            let bits = 8 * std::mem::size_of::<libc::c_ulong>();
+            for &c in codes {
+                words[c as usize / bits] |= 1 << (c as usize % bits);
+            }
+            words
+        };
+        let letters: Vec<u16> = (16..=50).collect();
+        // read_dir order is arbitrary: a mouse's keyboard node, the keyboard,
+        // and the keyboard's vendor-key node that sends the ROG key (148)
+        let candidates = vec![
+            (PathBuf::from("/dev/input/event12"), caps(&letters)),
+            (PathBuf::from("/dev/input/event3"), caps(&letters)),
+            (PathBuf::from("/dev/input/event5"), caps(&[148, 149, 202])),
+        ];
+        assert_eq!(
+            pick_device(&candidates, &[148, 149]),
+            Some((PathBuf::from("/dev/input/event5"), 2))
+        );
+        // A tie goes to the lowest-numbered node, whatever the listing order
+        assert_eq!(
+            pick_device(&candidates, &[30]),
+            Some((PathBuf::from("/dev/input/event3"), 1))
+        );
+        assert_eq!(pick_device(&[], &[30]), None);
+    }
+
+    #[test]
+    fn sysfs_key_capabilities_are_parsed_least_significant_word_last() {
+        // KEY_ESC (1) and KEY_A (30) in the lowest word, KEY_MICMUTE (248)
+        // in the fourth (64-bit words)
+        let words = parse_key_caps("100000000000000 0 0 40000002");
+        if std::mem::size_of::<libc::c_ulong>() == 8 {
+            assert!(caps_have_key(&words, 1));
+            assert!(caps_have_key(&words, 30));
+            assert!(caps_have_key(&words, 248));
+            assert!(!caps_have_key(&words, 31));
+            assert!(!caps_have_key(&words, 700));
+        }
     }
 
     #[test]

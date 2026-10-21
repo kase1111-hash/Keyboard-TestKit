@@ -196,6 +196,14 @@ fn parse_args() -> CliMode {
     }
 }
 
+/// The `--config <path>` option: a config file other than the default one.
+fn config_arg() -> Option<std::path::PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    args.windows(2)
+        .find(|w| w[0] == "--config")
+        .map(|w| std::path::PathBuf::from(&w[1]))
+}
+
 /// CLI operating mode
 enum CliMode {
     /// Normal TUI mode; `auto_start` launches straight into the auto test
@@ -271,7 +279,10 @@ fn main() -> Result<()> {
             let running = Arc::new(AtomicBool::new(true));
             install_signal_handler(running.clone());
 
-            if let Err(e) = mapper::run_mapper(preset.as_deref(), device, &[], running) {
+            let config = config_arg();
+            if let Err(e) =
+                mapper::run_mapper(preset.as_deref(), device, config.as_deref(), &[], running)
+            {
                 error!("Mapper error: {}", e);
                 return Err(e.into());
             }
@@ -281,7 +292,7 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         CliMode::MapperInstall { preset } => {
             info!("Installing key mapper service...");
-            if let Err(e) = mapper::install_service(preset.as_deref()) {
+            if let Err(e) = mapper::install_service(preset.as_deref(), config_arg().as_deref()) {
                 error!("Install error: {}", e);
                 return Err(e.into());
             }
@@ -389,6 +400,7 @@ fn print_help() {
     println!("  -h, --help                    Show this help message");
     println!("  -V, --version                 Show the version");
     println!("  --auto                        Start the guided auto test immediately");
+    println!("  --config <path>               Use this config file (TUI and mapper)");
     println!();
     println!("MAPPER OPTIONS (Linux only):");
     println!("  --mapper                      Run as a key mapping daemon");
@@ -409,7 +421,8 @@ fn print_help() {
     println!("  # Use a specific device");
     println!("  sudo keyboard-testkit --mapper --device /dev/input/event5");
     println!();
-    println!("  # Custom mappings via config file");
+    println!("  # Custom mappings via config file (under sudo, ~ is your own home;");
+    println!("  # the installed service is given your config file's path)");
     println!("  # Edit ~/.config/keyboard-testkit/config.toml:");
     println!("  # [oem_keys]");
     println!("  # key_mappings = [[148, 125], [149, 228]]");
@@ -438,8 +451,10 @@ fn run_app(
     running: Arc<AtomicBool>,
     auto_start: bool,
 ) -> Result<Option<SessionOutcome>> {
-    // TODO: Support --config <path> CLI argument for custom config locations.
-    let config_load = Config::load_reporting();
+    let config_load = match config_arg() {
+        Some(path) => Config::load_reporting_from(&path),
+        None => Config::load_reporting(),
+    };
     let mut app = App::new(config_load.config.clone());
 
     // Create keyboard event channel

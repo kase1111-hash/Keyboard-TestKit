@@ -127,10 +127,15 @@ trait KeyboardTest {
 
 ## Configuration
 
-Config file locations:
-- Linux: `~/.config/keyboard-testkit/config.toml`
+Config file locations (`--config <path>` overrides):
+- Linux: `~/.config/keyboard-testkit/config.toml` (under sudo, the invoking
+  user's home, not root's; the mapper service gets the path via `--config`)
 - macOS: `~/Library/Application Support/keyboard-testkit/config.toml`
 - Windows: `%APPDATA%\keyboard-testkit\config.toml`
+
+`Config::load_reporting` keeps load errors and clamped values (`ConfigLoad`)
+so the app can show them; saving over a file that did not load keeps it as
+`config.toml.bak`.
 
 ## Conventions
 

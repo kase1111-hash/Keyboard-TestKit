@@ -11,6 +11,10 @@
 //! | macOS | `~/Library/Application Support/keyboard-testkit/config.toml` |
 //! | Windows | `%APPDATA%\keyboard-testkit\config.toml` |
 //!
+//! On Linux, run with `sudo`, `~` is the home of the user who ran sudo, not
+//! root's (sudo resets `HOME`); files created there are given to that user.
+//! `--config <path>` picks another file.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -92,7 +96,12 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 
     // Create directory if it doesn't exist
     if !app_dir.exists() {
+        let config_dir_existed = config_dir.exists();
         fs::create_dir_all(&app_dir)?;
+        if !config_dir_existed {
+            give_to_invoking_user(&config_dir);
+        }
+        give_to_invoking_user(&app_dir);
     }
 
     Ok(app_dir.join("config.toml"))
@@ -102,15 +111,11 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
 fn platform_config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        // $XDG_CONFIG_HOME or ~/.config
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg));
-            }
-        }
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join(".config"))
+        linux_config_dir(
+            std::env::var("XDG_CONFIG_HOME").ok(),
+            std::env::var("HOME").ok().map(PathBuf::from),
+            sudo_user().map(|u| u.home),
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -128,6 +133,88 @@ fn platform_config_dir() -> Option<PathBuf> {
             .ok()
             .map(|h| PathBuf::from(h).join(".config"))
     }
+}
+
+/// The Linux config directory: `$XDG_CONFIG_HOME` or `~/.config`.
+///
+/// Under sudo (`sudo_home` is the invoking user's home) `HOME` is root's:
+/// the user's own file is meant, as the app tells users to run it with sudo
+/// for evdev. sudo drops `XDG_CONFIG_HOME` unless told to keep the
+/// environment, and then it is the user's.
+#[cfg(target_os = "linux")]
+fn linux_config_dir(
+    xdg_config_home: Option<String>,
+    home: Option<PathBuf>,
+    sudo_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(xdg));
+    }
+    sudo_home.or(home).map(|h| h.join(".config"))
+}
+
+/// The user who ran this process through sudo.
+#[cfg(target_os = "linux")]
+struct SudoUser {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: PathBuf,
+}
+
+/// The user who ran this process through sudo, if it runs as root via sudo
+/// on behalf of another user.
+#[cfg(target_os = "linux")]
+fn sudo_user() -> Option<SudoUser> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let name = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|n| !n.is_empty() && n != "root")?;
+    let name = CString::new(name).ok()?;
+    // SAFETY: getpwnam gets a NUL-terminated name and returns null or a
+    // pointer to a passwd record in static storage, which is copied out
+    // below before any other passwd lookup can overwrite it.
+    let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: `pw` is a valid passwd record (checked above); pw_dir is
+    // null or a NUL-terminated string.
+    let (uid, gid, dir) = unsafe { ((*pw).pw_uid, (*pw).pw_gid, (*pw).pw_dir) };
+    if dir.is_null() {
+        return None;
+    }
+    // SAFETY: `dir` is a non-null NUL-terminated string (see above).
+    let home = OsStr::from_bytes(unsafe { CStr::from_ptr(dir) }.to_bytes());
+    Some(SudoUser {
+        uid,
+        gid,
+        home: PathBuf::from(home),
+    })
+}
+
+/// Under sudo, hand a file or directory created in the invoking user's
+/// config directory to that user: owned by root, it could not be saved
+/// again by a run without sudo.
+fn give_to_invoking_user(path: &Path) {
+    #[cfg(target_os = "linux")]
+    if let Some(user) = sudo_user() {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            // SAFETY: chown gets a NUL-terminated path; a failure only
+            // leaves the file owned by root, as before.
+            unsafe {
+                libc::chown(path.as_ptr(), user.uid, user.gid);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
 }
 
 // ----------------------------------------------------------------------------
@@ -586,7 +673,11 @@ impl Config {
     /// Useful for testing or using custom config locations.
     pub fn save_to(&self, path: &PathBuf) -> Result<(), ConfigError> {
         let contents = toml::to_string_pretty(self)?;
+        let existed = path.exists();
         fs::write(path, &contents)?;
+        if !existed {
+            give_to_invoking_user(path);
+        }
         Ok(())
     }
 
@@ -598,7 +689,11 @@ impl Config {
         let mut backup = path.clone().into_os_string();
         backup.push(".bak");
         let backup = PathBuf::from(backup);
+        let existed = backup.exists();
         fs::copy(path, &backup)?;
+        if !existed {
+            give_to_invoking_user(&backup);
+        }
         self.save_to(path)?;
         Ok(backup)
     }
@@ -756,6 +851,34 @@ theme = "Light"
         let path = result.unwrap();
         assert!(path.to_string_lossy().contains("keyboard-testkit"));
         assert!(path.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sudo_reads_the_invoking_users_config() {
+        let user = PathBuf::from("/home/alice");
+        let root = PathBuf::from("/root");
+        // sudo: HOME is root's, the invoking user's home is meant
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), Some(user.clone())),
+            Some(user.join(".config"))
+        );
+        // Without sudo, and for root itself
+        assert_eq!(
+            linux_config_dir(None, Some(user.clone()), None),
+            Some(user.join(".config"))
+        );
+        assert_eq!(
+            linux_config_dir(None, Some(root.clone()), None),
+            Some(root.join(".config"))
+        );
+        // XDG_CONFIG_HOME wins (sudo only keeps it when told to keep the
+        // user's environment)
+        assert_eq!(
+            linux_config_dir(Some("/cfg".into()), Some(root), Some(user)),
+            Some(PathBuf::from("/cfg"))
+        );
+        assert_eq!(linux_config_dir(Some(String::new()), None, None), None);
     }
 
     #[test]
