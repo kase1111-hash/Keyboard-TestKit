@@ -264,7 +264,8 @@ impl StepKind {
         }
     }
 
-    /// How long the step may run before it is considered timed out.
+    /// How long the step may run before it is considered timed out. The
+    /// sweep runs longer while keys keep registering (see [`SWEEP_GRACE`]).
     pub fn timeout(&self) -> Duration {
         match self {
             Self::Idle => IDLE_DURATION,
@@ -282,6 +283,10 @@ pub const IDLE_DURATION: Duration = Duration::from_secs(3);
 pub const MIN_HOLD: Duration = Duration::from_millis(800);
 /// How long the rapid-tap step records after the first press.
 pub const RAPID_TAP_DURATION: Duration = Duration::from_secs(5);
+/// A sweep that is still verifying new keys runs past its timeout until this
+/// long after the latest one, so a slow but steady user is not cut off and
+/// told the keys they had not reached yet are dead.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(30);
 /// Two presses of the same key closer than this are chatter: 25 presses a
 /// second is well beyond the 10-15 taps/s even fast tappers reach on one key.
 pub const CHATTER_GAP_US: u64 = 40_000;
@@ -390,6 +395,8 @@ pub struct AutoTest {
     seen_keys: HashSet<KeyCode>,
     /// Keys released during the sweep
     released_keys: HashSet<KeyCode>,
+    /// When the sweep last verified an expected key it had not seen before
+    sweep_progress_at: Option<Instant>,
     /// Press timestamps for hold measurement
     press_times: HashMap<KeyCode, Instant>,
     /// Longest completed hold in the hold step
@@ -436,6 +443,7 @@ impl AutoTest {
             expected_keys: Vec::new(),
             seen_keys: HashSet::new(),
             released_keys: HashSet::new(),
+            sweep_progress_at: None,
             press_times: HashMap::new(),
             longest_hold: None,
             rollover_pressed: HashSet::new(),
@@ -668,6 +676,7 @@ impl AutoTest {
         self.idle_pressed.clear();
         self.seen_keys.clear();
         self.released_keys.clear();
+        self.sweep_progress_at = None;
         self.press_times.clear();
         self.longest_hold = None;
         self.rollover_pressed.clear();
@@ -718,12 +727,22 @@ impl AutoTest {
             // The idle step "passing" just means the time elapsed; whether it
             // found phantom input is judged in the analysis.
             self.finish_step(step, StepOutcome::Passed, now);
-        } else if elapsed >= step.timeout() {
+        } else if self.step_deadline(step).is_some_and(|d| now >= d) {
             self.finish_step(step, StepOutcome::TimedOut, now);
         } else {
             return false;
         }
         self.state == AutoTestState::Complete
+    }
+
+    /// When the current step times out. The sweep is extended while keys
+    /// keep registering (see [`SWEEP_GRACE`]).
+    fn step_deadline(&self, step: StepKind) -> Option<Instant> {
+        let deadline = self.step_started? + step.timeout();
+        Some(match self.sweep_progress_at {
+            Some(at) if step == StepKind::Sweep => deadline.max(at + SWEEP_GRACE),
+            _ => deadline,
+        })
     }
 
     fn finish_step(&mut self, step: StepKind, outcome: StepOutcome, now: Instant) {
@@ -798,7 +817,9 @@ impl AutoTest {
             }
             StepKind::Sweep => match event.event_type {
                 KeyEventType::Press => {
-                    self.seen_keys.insert(event.key);
+                    if self.seen_keys.insert(event.key) && self.expected_keys.contains(&event.key) {
+                        self.sweep_progress_at = Some(event.timestamp);
+                    }
                 }
                 KeyEventType::Release => {
                     self.released_keys.insert(event.key);
@@ -1364,7 +1385,11 @@ impl AutoTest {
                     step.instruction(),
                     ResultStatus::Warning,
                 ));
-                let remaining = step.timeout().saturating_sub(self.step_elapsed()).as_secs();
+                let remaining = self
+                    .step_deadline(step)
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default()
+                    .as_secs();
                 rows.push(TestResult::info(
                     "Progress",
                     format!(
@@ -1869,6 +1894,43 @@ mod tests {
         assert_eq!(dead.severity, Severity::Critical);
         assert!(dead.title.starts_with("2 key(s)"));
         assert!(dead.detail.contains('S') && dead.detail.contains('D'));
+    }
+
+    #[test]
+    fn slow_but_steady_sweep_is_not_cut_off() {
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(31), KeyCode(32)]);
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION); // -> Sweep
+        let ss = t0 + IDLE_DURATION;
+        let secs = Duration::from_secs;
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(60), 0));
+        t.process_event(&evt(31, KeyEventType::Press, ss + secs(110), 0));
+        // Past the 120 s timeout, but the user is still finding keys
+        assert!(!t.tick_at(ss + secs(130)));
+        assert_eq!(t.current_step(), Some(StepKind::Sweep));
+        t.process_event(&evt(32, KeyEventType::Press, ss + secs(138), 0));
+        t.tick_at(ss + secs(139));
+        assert_eq!(t.outcome_of(StepKind::Sweep), Some(StepOutcome::Passed));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Dead keys"));
+
+        // A sweep that stops making progress still times out: pressing a key
+        // that was already verified does not extend it
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(31), KeyCode(32)]);
+        t.start_at(t0);
+        t.tick_at(ss);
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(110), 0));
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(125), 0));
+        assert!(!t.tick_at(ss + secs(139)));
+        t.tick_at(ss + secs(140));
+        assert_eq!(t.outcome_of(StepKind::Sweep), Some(StepOutcome::TimedOut));
+        let findings = t.analyze(&ctx!(parts));
+        let dead = findings.iter().find(|f| f.category == "Dead keys").unwrap();
+        assert!(dead.title.starts_with("2 key(s)"), "{}", dead.title);
     }
 
     #[test]
