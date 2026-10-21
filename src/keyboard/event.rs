@@ -209,12 +209,12 @@ fn midpoint(a: Instant, b: Instant) -> Instant {
 /// is that key's autorepeat (a key that has just gone down cannot repeat
 /// before the autorepeat delay), and the key stays one keystroke until it
 /// comes up. Otherwise it is a key of its own, reported with the time it
-/// went down. The cost: a different key pressed the moment Shift is let go
-/// of a repeating symbol key, and tapped shorter than that, is taken for the
-/// symbol key's last repeat, which is better than leaving that key down for
-/// good (a stuck key on a healthy keyboard). Terminals using the kitty
-/// protocol name the key itself whatever Shift/AltGr types, so presses are
-/// never held back there.
+/// went down. The cost: a different key tapped shorter than that while such
+/// a symbol key is still down (Shift already up), repeating or down for an
+/// autorepeat delay, is taken for the symbol key's last repeat, which is
+/// better than leaving that key down for good (a stuck key on a healthy
+/// keyboard). Terminals using the kitty protocol name the key itself
+/// whatever Shift/AltGr types, so presses are never held back there.
 pub struct KeyboardListener {
     /// Timestamp of the last event that was emitted (for `delta_us`)
     last_event: Option<Instant>,
