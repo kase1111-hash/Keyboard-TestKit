@@ -145,8 +145,10 @@ Config file locations:
   the poll-rate estimate need evdev timestamps, stuck keys and rollover need
   real releases; otherwise the view says "n/a (terminal input)" (Info) and
   the analysis skips or downgrades the check. Findings that may be the user
-  rather than the keyboard (low rollover, disconnects) are worded as
-  conditions, and decision logic lives in pure, unit-tested functions
+  rather than the keyboard (low rollover, disconnects, keystrokes during the
+  idle check, a single bounce) are Warnings worded as conditions, summaries
+  are red only for a Critical finding (`issues_status`), and decision logic
+  lives in pure, unit-tested functions
 
 ### UI Controls
 

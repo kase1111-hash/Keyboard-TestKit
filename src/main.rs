@@ -1502,7 +1502,8 @@ mod tests {
     }
 
     /// Feed `keys` to a fresh app through the terminal path (no evdev), the
-    /// way the main loop does, then stop the auto test the first one started.
+    /// way the main loop does, then let the idle step of the auto test the
+    /// first one started run its course.
     fn idle_findings_after(source: InputSource, keys: &[CtKeyEvent]) -> Vec<Finding> {
         let (tx, rx) = mpsc::channel();
         let mut listener = KeyboardListener::new(tx);
@@ -1518,7 +1519,9 @@ mod tests {
             }
         }
         assert!(app.auto_test_running());
-        app.abort_auto_test();
+        app.auto_test
+            .tick_at(Instant::now() + keyboard_testkit::tests::IDLE_DURATION);
+        app.refresh_findings();
         app.findings.clone()
     }
 
@@ -1623,6 +1626,60 @@ mod tests {
         assert_eq!(app.keyboard_disconnects(), 1);
         assert!(app.findings.iter().any(|f| f.category == "Connection"));
         assert!(app.get_status().unwrap().ends_with("auto test stopped"));
+    }
+
+    #[test]
+    fn aborting_the_idle_check_with_ctrl_c_is_not_phantom_input() {
+        use keyboard_testkit::keyboard::{KeyCode, KeyEventType};
+        let issues = |app: &App| -> Vec<&'static str> {
+            app.findings
+                .iter()
+                .filter(|f| f.is_issue())
+                .map(|f| f.category)
+                .collect()
+        };
+        // Evdev: the Ctrl press is read from the device a frame or more
+        // before the terminal delivers Ctrl+C
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        app.process_event(&KeyEvent::new(
+            KeyCode(29),
+            KeyEventType::Press,
+            Instant::now(),
+            0,
+        ));
+        let (tx, _rx) = mpsc::channel();
+        let mut listener = KeyboardListener::new(tx);
+        let mut held = HeldKeyFilter::default();
+        handle_terminal_key(&mut app, &mut listener, &mut held, true, ctrl('c'));
+        assert!(!app.auto_test_running());
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
+
+        // Kitty protocol: the bare Ctrl press is reported as a key event
+        let ctrl_key = CtKeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl);
+        let keys = [
+            press(CtKeyCode::Char('a'), KeyModifiers::SHIFT),
+            press(ctrl_key, KeyModifiers::CONTROL),
+            ctrl('c'),
+        ];
+        let (tx, rx) = mpsc::channel();
+        let mut listener = KeyboardListener::new(tx);
+        listener.set_release_reporting(true);
+        let mut app = App::default();
+        app.set_input_source(InputSource::TerminalWithRelease);
+        let mut held = HeldKeyFilter::default();
+        for key in keys {
+            handle_terminal_key(&mut app, &mut listener, &mut held, false, key);
+            while let Ok(event) = rx.try_recv() {
+                app.process_event(&event);
+            }
+        }
+        assert!(!app.auto_test_running());
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
+        // Quitting with Ctrl still held is not a key without a release either
+        app.refresh_findings();
+        assert!(issues(&app).is_empty(), "{:?}", app.findings);
     }
 
     #[test]

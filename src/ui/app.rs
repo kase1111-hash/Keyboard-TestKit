@@ -10,9 +10,9 @@ use crate::keyboard::remap::FnKeyMode;
 use crate::keyboard::{KeyEvent, KeyEventType, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
-    expected_keys_for_layout, AnalysisContext, AutoTest, EventTimingTest, Finding, HoldReleaseTest,
-    InputSource, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest, ShortcutTest, StepKind,
-    StickinessTest, TestResult, VirtualKeyboardTest,
+    expected_keys_for_layout, issues_status, AnalysisContext, AutoTest, EventTimingTest, Finding,
+    HoldReleaseTest, InputSource, KeyboardTest, OemKeyTest, PollingRateTest, RolloverTest,
+    ShortcutTest, StepKind, StickinessTest, TestResult, VirtualKeyboardTest,
 };
 use crate::ui::theme::ThemeColors;
 use crate::ui::widgets::SettingsItem;
@@ -773,11 +773,9 @@ impl App {
         results.push(TestResult::info("", ""));
         results.push(TestResult::info("--- Auto Diagnostics ---", ""));
         let issues = self.issue_count();
-        let issue_status = if issues == 0 {
-            crate::tests::ResultStatus::Ok
-        } else {
-            crate::tests::ResultStatus::Error
-        };
+        // Warnings are worded as conditions (a sleeping wireless keyboard, a
+        // key the laptop does not have): only a Critical finding is red
+        let issue_status = issues_status(&self.findings);
         results.push(TestResult::new(
             "Issues Found",
             if self.auto_test.is_running() {

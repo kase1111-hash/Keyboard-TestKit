@@ -142,7 +142,7 @@ auto test runs five short steps and then writes a ranked list of findings:
 | Step | You do | It checks for |
 |------|--------|---------------|
 | Idle check | Nothing for 3 s | Phantom input, keys already stuck |
-| Key sweep | Press every key once (`Ctrl+N` if your keyboard lacks one) | Dead keys, keys that never release |
+| Key sweep | Press every key once (`Ctrl+N` if your keyboard lacks one) | Dead keys, keys that stay down |
 | Hold & release | Hold a letter key or Space ~1 s | Release reporting |
 | Rollover | Hold 6 or more letter keys at once | Limited N-key rollover |
 | Rapid tap | Tap one key quickly with one finger | Switch chatter, polling rate (both evdev only) |
@@ -251,7 +251,16 @@ With evdev input the check is unavailable, because injected keys bypass the
 keyboard device. Faults of individual keys are found by the auto test's sweep.
 
 Bounce and polling-rate results need evdev's kernel timestamps; with terminal
-input those views show "n/a (terminal input)" instead of a result. Stuck keys
+input those views show "n/a (terminal input)" instead of a result. A key
+that bounces once is a warning: one doubled keystroke can also be a wireless
+keyboard delivering a delayed report together with the next one. A key that
+bounces again is reported as a fault.
+
+Input during the idle check that looks like whole keystrokes (you pressed a
+key) is a warning worded as a condition; a key left down or firing again and
+again is critical. Stopping the run with `Ctrl+C` during the idle check is
+not counted as input. A hold step that ran out of time is only a warning
+when no key release arrived during the whole run. Stuck keys
 and rollover need real key releases, so a terminal that only reports presses
 shows "n/a (terminal input)" there too (and `max_rollover` is `null` in the
 exported report).

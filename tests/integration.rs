@@ -423,12 +423,17 @@ fn keyboard_disconnect_is_a_finding_everywhere_not_only_at_exit() {
     assert!(connection.detail.contains("USB Keyboard"));
     assert_eq!(app.issue_count(), 1, "{:?}", app.findings);
 
-    // Dashboard
+    // Dashboard: a warning-only result is yellow, not a red verdict
     app.view = AppView::Dashboard;
     let dash = app.current_results();
     assert!(dash
         .iter()
         .any(|r| r.label.contains("Connection") && r.value.contains("disconnected 1 time")));
+    let issues = dash.iter().find(|r| r.label == "Issues Found").unwrap();
+    assert_eq!(
+        issues.status,
+        keyboard_testkit::tests::ResultStatus::Warning
+    );
     // Exported report
     let report = app.generate_report();
     assert_eq!(report.summary.issues_detected, 1);
@@ -664,7 +669,7 @@ fn current_results_returns_correct_test_results() {
 // Automatic diagnostic (auto test)
 // ---------------------------------------------------------------------------
 
-use keyboard_testkit::tests::{AutoTestState, InputSource, Severity, StepKind};
+use keyboard_testkit::tests::{AutoTestState, InputSource, Severity, StepKind, IDLE_DURATION};
 use std::time::Duration;
 
 fn timed(key: u16, event_type: KeyEventType, at: Instant, delta_us: u64) -> KeyEvent {
@@ -702,16 +707,23 @@ fn auto_test_view_renders_instructions_and_findings() {
     assert!(running.iter().any(|r| r.value.contains("Hands off")));
 }
 
+/// Let the idle step of a running auto test run its course.
+fn finish_idle_step(app: &mut App) {
+    app.auto_test.tick_at(Instant::now() + IDLE_DURATION);
+    app.refresh_findings();
+}
+
 #[test]
 fn auto_test_phantom_input_during_idle_is_reported() {
     let mut app = App::default();
     app.set_input_source(InputSource::Evdev);
     app.start_auto_test();
-    // A key fires while the user was told to keep hands off
-    app.process_event(&press(30, 1000));
-    app.process_event(&release(30, 1000));
-    app.abort_auto_test();
-    assert_eq!(app.auto_test.state(), AutoTestState::Aborted);
+    // A key fires again and again while the user was told to keep hands off
+    for _ in 0..3 {
+        tap(&mut app, 30, 1000);
+    }
+    finish_idle_step(&mut app);
+    assert_eq!(app.auto_test.current_step(), Some(StepKind::Sweep));
     let phantom = app
         .findings
         .iter()
@@ -719,6 +731,28 @@ fn auto_test_phantom_input_during_idle_is_reported() {
         .expect("phantom finding present");
     assert_eq!(phantom.severity, Severity::Critical);
     assert!(app.issue_count() >= 1);
+
+    // One whole keystroke may just be the user: a conditional Warning
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    tap(&mut app, 30, 1000);
+    finish_idle_step(&mut app);
+    let phantom = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Phantom input")
+        .unwrap();
+    assert_eq!(phantom.severity, Severity::Warning);
+
+    // Stopping the run during the idle step does not judge it
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    app.process_event(&press(29, 1000));
+    app.abort_auto_test();
+    assert_eq!(app.auto_test.state(), AutoTestState::Aborted);
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
 }
 
 #[test]
@@ -774,7 +808,7 @@ fn auto_test_start_keystroke_read_late_from_evdev_is_not_phantom() {
     app.start_auto_test();
     app.process_event(&timed(30, KeyEventType::Press, pressed, 0));
     app.process_event(&release(30, 1000));
-    app.abort_auto_test();
+    finish_idle_step(&mut app);
     assert!(
         !app.findings.iter().any(|f| f.category == "Phantom input"),
         "{:?}",
@@ -824,19 +858,24 @@ fn live_findings_detect_switch_bounce_without_running_auto_test() {
     app.set_input_source(InputSource::Evdev);
     let t0 = Instant::now();
     // press, release 1ms later, press again 1ms later: classic contact bounce
-    app.process_event(&timed(30, KeyEventType::Press, t0, 0));
-    app.process_event(&timed(
-        30,
-        KeyEventType::Release,
-        t0 + Duration::from_millis(1),
-        1000,
-    ));
-    app.process_event(&timed(
-        30,
-        KeyEventType::Press,
-        t0 + Duration::from_millis(2),
-        1000,
-    ));
+    let bounce_at = |app: &mut App, at: Instant| {
+        let ms = Duration::from_millis;
+        app.process_event(&timed(30, KeyEventType::Press, at, 0));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(1), 1000));
+        app.process_event(&timed(30, KeyEventType::Press, at + ms(2), 1000));
+        app.process_event(&timed(30, KeyEventType::Release, at + ms(80), 1000));
+    };
+    bounce_at(&mut app, t0);
+    app.refresh_findings();
+    // Once may be a delayed wireless report: worth a look, worded as such
+    let bounce = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(bounce.severity, Severity::Warning);
+    // The same key bouncing again is a fault
+    bounce_at(&mut app, t0 + Duration::from_millis(300));
     app.refresh_findings();
     let bounce = app
         .findings
