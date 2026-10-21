@@ -437,6 +437,18 @@ impl Config {
             SAMPLE_WINDOW_MS_MIN,
             SAMPLE_WINDOW_MS_MAX,
         );
+        // Files saved while the default was 50 ms (the Settings view then
+        // went down to 10 ms) carry a threshold below the minimum. Raising
+        // it to the minimum would still flag a Shift held for a capital
+        // letter as stuck, so use the default instead.
+        if self.stickiness.stuck_threshold_ms < STUCK_THRESHOLD_MS_MIN {
+            let default = StickinessConfig::default().stuck_threshold_ms;
+            changes.push(format!(
+                "stickiness.stuck_threshold_ms = {} is below {}, using the default {}",
+                self.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN, default
+            ));
+            self.stickiness.stuck_threshold_ms = default;
+        }
         clamp_field(
             &mut changes,
             "stickiness.stuck_threshold_ms",
@@ -727,7 +739,10 @@ theme = "Light"
         assert!(changes[0].contains("polling.test_duration_secs"));
         assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
         assert_eq!(config.ui.warning_duration_secs, WARNING_DURATION_SECS_MAX);
-        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+        assert_eq!(
+            config.stickiness.stuck_threshold_ms,
+            StickinessConfig::default().stuck_threshold_ms
+        );
         assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
         assert_eq!(config.polling.sample_window_ms, SAMPLE_WINDOW_MS_MAX);
         assert_eq!(config.hold_release.bounce_window_ms, BOUNCE_WINDOW_MS_MIN);
@@ -787,9 +802,60 @@ theme = "Dark"
         let _ = fs::remove_file(&path);
         let config = loaded.expect("config with out-of-range values must still load");
         assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
-        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+        assert_eq!(
+            config.stickiness.stuck_threshold_ms,
+            StickinessConfig::default().stuck_threshold_ms
+        );
         assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
         assert!(config.refresh_interval() > Duration::ZERO);
+    }
+
+    #[test]
+    fn load_old_saved_config_gets_the_current_stuck_threshold() {
+        // Written by Settings -> Save before the default was raised from
+        // 50 ms. 50 ms flags ordinary keystrokes, and the 250 ms minimum
+        // would still flag a held Shift.
+        let path = temp_path("old");
+        fs::write(
+            &path,
+            r#"[polling]
+test_duration_secs = 10
+sample_window_ms = 100
+
+[stickiness]
+stuck_threshold_ms = 50
+
+[hold_release]
+bounce_window_ms = 5
+min_hold_ms = 10
+
+[ui]
+refresh_rate_hz = 60
+warning_duration_secs = 3
+theme = "Light"
+
+[oem_keys]
+enabled = true
+fn_mode = "CaptureOnly"
+fn_scancodes = []
+key_mappings = []
+fn_combos = []
+capture_unknown = true
+show_notifications = true
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("old config must load");
+        assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
+        assert_eq!(config.ui.theme, Theme::Light);
+
+        // The lowest value the Settings view offers is kept as chosen
+        let mut config = Config::default();
+        config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MIN;
+        assert!(config.sanitize().is_empty());
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
     }
 
     #[test]
