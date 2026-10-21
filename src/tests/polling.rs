@@ -1,6 +1,6 @@
 //! Polling rate test module
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{KeyEvent, KeyEventType};
 use crate::utils::MinMaxExt;
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ pub struct PollingRateTest {
     min_interval_us: Option<u64>,
     /// Maximum interval seen
     max_interval_us: Option<u64>,
+    /// Whether event timestamps come from the device (needed for the estimate)
+    precise_timestamps: bool,
 }
 
 impl PollingRateTest {
@@ -36,7 +38,29 @@ impl PollingRateTest {
             event_count: 0,
             min_interval_us: None,
             max_interval_us: None,
+            precise_timestamps: true,
         }
+    }
+
+    /// Tell the test where events come from. The poll-rate estimate needs
+    /// device (kernel) timestamps; terminal input is stamped when it is read.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.precise_timestamps = source.has_precise_timestamps();
+    }
+
+    /// Change the test duration (used for the progress display).
+    pub fn set_duration_secs(&mut self, duration_secs: u64) {
+        self.duration = Duration::from_secs(duration_secs);
+    }
+
+    /// The test duration in seconds.
+    pub fn duration_secs(&self) -> u64 {
+        self.duration.as_secs()
+    }
+
+    /// Whether the poll rate can be estimated with the current input source.
+    pub fn poll_rate_measurable(&self) -> bool {
+        self.precise_timestamps
     }
 
     /// Calculate average polling rate in Hz (over all samples)
@@ -126,9 +150,13 @@ impl PollingRateTest {
     /// gaps between its events are (near) multiples of the poll interval. This
     /// looks for the largest candidate interval that explains almost all of the
     /// recorded gaps. It needs precise (kernel) timestamps and at least
-    /// [`MIN_QUANTIZATION_SAMPLES`] samples; returns `None` otherwise, or when
-    /// no quantization is visible (interrupt-driven or >= 1000 Hz keyboards).
+    /// [`MIN_QUANTIZATION_SAMPLES`] samples; returns `None` otherwise (always
+    /// for terminal input), or when no quantization is visible (interrupt-driven
+    /// or >= 1000 Hz keyboards).
     pub fn estimated_poll_interval_us(&self) -> Option<u64> {
+        if !self.precise_timestamps {
+            return None;
+        }
         estimate_quantization_us(&self.intervals_us)
     }
 
@@ -255,13 +283,23 @@ impl KeyboardTest for PollingRateTest {
         ));
 
         // Poll rate inferred from timestamp quantization (needs kernel timestamps)
-        if self.intervals_us.len() >= MIN_QUANTIZATION_SAMPLES {
+        if !self.precise_timestamps {
+            results.push(TestResult::info("Est. Poll Rate", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Terminal timestamps",
+                "are read times, too coarse;",
+            ));
+            results.push(TestResult::info(
+                "poll rate needs",
+                "evdev (Linux, sudo/input group)",
+            ));
+        } else if self.intervals_us.len() >= MIN_QUANTIZATION_SAMPLES {
             match self.estimated_poll_rate_hz() {
                 Some(hz) => {
+                    // A lower rate is a spec, not a fault: 125 Hz is the USB
+                    // default and fine for typing.
                     let status = if hz >= 500.0 {
                         ResultStatus::Ok
-                    } else if hz >= 200.0 {
-                        ResultStatus::Warning
                     } else {
                         ResultStatus::Info
                     };
@@ -272,7 +310,12 @@ impl KeyboardTest for PollingRateTest {
                     ));
                 }
                 None => {
-                    results.push(TestResult::ok("Est. Poll Rate", ">= 1000 Hz or not polled"));
+                    // No 2/4/8 ms grid: a 1000+ Hz keyboard, but also Bluetooth
+                    // (irregular connection intervals), so no rate is claimed.
+                    results.push(TestResult::info(
+                        "Est. Poll Rate",
+                        "no 125/250/500 Hz grid (1000+ Hz or Bluetooth)",
+                    ));
                 }
             }
         } else {
@@ -487,5 +530,99 @@ mod tests {
         let test = PollingRateTest::new(10, 100);
         assert_eq!(test.name(), "Polling Rate Test");
         assert!(!test.description().is_empty());
+    }
+
+    /// Feed presses separated by the given gaps (µs).
+    fn feed_gaps(test: &mut PollingRateTest, gaps_us: &[u64]) {
+        let mut at = Instant::now();
+        test.process_event(&press_at(DEFAULT_KEY, at, 0));
+        for &gap in gaps_us {
+            at += Duration::from_micros(gap);
+            test.process_event(&press_at(DEFAULT_KEY, at, gap));
+        }
+    }
+
+    fn poll_row(test: &PollingRateTest) -> TestResult {
+        test.get_results()
+            .into_iter()
+            .find(|r| r.label == "Est. Poll Rate")
+            .expect("poll rate row")
+    }
+
+    /// Rapid tapping on a 125 Hz keyboard: human gaps of 24-56 ms, each one
+    /// landing on the 8 ms report grid.
+    fn gaps_125hz() -> Vec<u64> {
+        (0..30u64).map(|i| 8_000 * (3 + i % 4)).collect()
+    }
+
+    /// Human rapid tapping with gaps that are not on any report grid
+    /// (1000 Hz keyboard, or Bluetooth with jittery connection events).
+    fn gaps_unquantized() -> Vec<u64> {
+        (0..30u64).map(|i| 31_000 + (i * 7_919) % 23_000).collect()
+    }
+
+    #[test]
+    fn quantized_evdev_timestamps_give_the_poll_rate() {
+        let mut test = PollingRateTest::new(10, 100);
+        feed_gaps(&mut test, &gaps_125hz());
+        assert_eq!(test.estimated_poll_interval_us(), Some(8000));
+        let row = poll_row(&test);
+        assert!(row.value.starts_with("125 Hz"), "{:?}", row);
+        // 125 Hz is the USB default, not a fault
+        assert_eq!(row.status, ResultStatus::Info);
+    }
+
+    #[test]
+    fn no_grid_is_not_claimed_as_1000hz() {
+        let mut test = PollingRateTest::new(10, 100);
+        feed_gaps(&mut test, &gaps_unquantized());
+        assert_eq!(test.estimated_poll_interval_us(), None);
+        let row = poll_row(&test);
+        assert_eq!(row.status, ResultStatus::Info, "{:?}", row);
+        assert!(!row.value.contains(">= 1000"), "{:?}", row);
+    }
+
+    #[test]
+    fn terminal_input_reports_poll_rate_as_not_measurable() {
+        for source in [
+            InputSource::TerminalWithRelease,
+            InputSource::TerminalPressOnly,
+        ] {
+            for gaps in [gaps_125hz(), gaps_unquantized()] {
+                let mut test = PollingRateTest::new(10, 100);
+                test.set_input_source(source);
+                feed_gaps(&mut test, &gaps);
+                assert!(!test.poll_rate_measurable());
+                assert_eq!(test.estimated_poll_interval_us(), None);
+                assert_eq!(test.estimated_poll_rate_hz(), None);
+                let row = poll_row(&test);
+                assert_eq!(row.status, ResultStatus::Info);
+                assert!(row.value.contains("n/a"), "{:?}", row);
+                assert!(!test
+                    .get_results()
+                    .iter()
+                    .any(|r| r.status == ResultStatus::Ok));
+            }
+        }
+    }
+
+    #[test]
+    fn evdev_input_keeps_the_estimate() {
+        let mut test = PollingRateTest::new(10, 100);
+        test.set_input_source(InputSource::Evdev);
+        feed_gaps(&mut test, &gaps_125hz());
+        assert!(test.poll_rate_measurable());
+        assert_eq!(test.estimated_poll_interval_us(), Some(8000));
+    }
+
+    #[test]
+    fn duration_setter_changes_progress() {
+        let mut test = PollingRateTest::new(10, 100);
+        test.start_time = Some(Instant::now() - Duration::from_secs(5));
+        assert!((test.progress() - 0.5).abs() < 0.05);
+        assert!(!test.is_complete());
+        test.set_duration_secs(5);
+        assert!(test.is_complete());
+        assert!((test.progress() - 1.0).abs() < f64::EPSILON);
     }
 }

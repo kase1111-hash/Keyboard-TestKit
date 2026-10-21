@@ -963,6 +963,18 @@ impl AutoTest {
                 "This is a keyboard matrix limitation; avoid the affected combinations \
                  or use a keyboard with anti-ghosting.",
             ));
+        } else if self.step_was_run(StepKind::Rollover) {
+            // Nothing tells the rollover test which keys are really held, so
+            // a ghost is indistinguishable from a press: say so, not "none".
+            findings.push(Finding::new(
+                Severity::Info,
+                "Ghosting",
+                "Not measured",
+                "A ghost key arrives as an ordinary key press, so it cannot be told \
+                 apart automatically.",
+                "While holding several keys, watch the keyboard view: a key that lights \
+                 up without being pressed is a ghost.",
+            ));
         }
 
         // --- Polling / timing --------------------------------------------

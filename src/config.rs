@@ -185,7 +185,8 @@ impl Default for StickinessConfig {
 /// Hold and release test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HoldReleaseConfig {
-    /// Bounce detection window in ms
+    /// Bounce detection window in ms: a press of a key this soon after its
+    /// release is a bounce (clamped to 20-40 ms by the test)
     pub bounce_window_ms: u64,
     /// Minimum hold time to register as intentional
     pub min_hold_ms: u64,
@@ -194,7 +195,10 @@ pub struct HoldReleaseConfig {
 impl Default for HoldReleaseConfig {
     fn default() -> Self {
         Self {
-            bounce_window_ms: 5,
+            // A finger needs 30+ ms to re-press a key; chatter re-registers
+            // within one or two reports (8-16 ms at 125 Hz). The old 5 ms
+            // could never see it on a 125 Hz keyboard.
+            bounce_window_ms: 20,
             min_hold_ms: 10,
         }
     }
@@ -385,7 +389,7 @@ mod tests {
         assert_eq!(config.polling.test_duration_secs, 10);
         assert_eq!(config.polling.sample_window_ms, 100);
         assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
-        assert_eq!(config.hold_release.bounce_window_ms, 5);
+        assert_eq!(config.hold_release.bounce_window_ms, 20);
         assert_eq!(config.hold_release.min_hold_ms, 10);
         assert_eq!(config.ui.refresh_rate_hz, 60);
         assert_eq!(config.ui.theme, Theme::Dark);
