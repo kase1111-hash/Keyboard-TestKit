@@ -1723,12 +1723,21 @@ fn bounce_finding(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // How to tell the radio from the switch. The keyboard was only
+    // recognized as wireless (see `EvdevListener::take_wireless_keys`), so a
+    // user already on the cable is not sent there.
+    const RADIO_RETEST: &str = "reset (R) and retest on the cable or next to the receiver; \
+         if the key still bounces there, or the keyboard already was on its cable, it is \
+         the switch.";
     let wireless_note = if bouncy.iter().any(|(_, _, wireless)| *wireless > 0) {
-        " Over a wireless link, a radio stall that delivers a whole keystroke at once \
-         looks the same: reset (R) and retest on the cable or next to the receiver; if \
-         the key still bounces there, it is the switch."
+        format!(
+            " Keys marked wireless came from a keyboard recognized as wireless: over a \
+             wireless link a radio stall that delivers a whole keystroke at once looks \
+             the same, so {}",
+            RADIO_RETEST
+        )
     } else {
-        ""
+        String::new()
     };
     let advice = |text: &str| format!("{}{}", text, wireless_note);
     let finding = if bouncy.iter().any(|(_, n, w)| bounces_are_fault(*n, *w)) {
@@ -1746,11 +1755,13 @@ fn bounce_finding(
         // Nothing came over a cable: the radio is as likely as the switch,
         // and a second stall would be no verdict either
         let advice = if bouncy.iter().all(|(_, n, w)| w == n) {
-            "A keystroke arrived doubled over the wireless link: a radio stall that \
-             delivers a whole keystroke at once looks the same as a switch that closed \
-             for less time than a finger holds a key. Reset (R) and retest on the cable \
-             or next to the receiver; if the key still bounces there, it is the switch."
-                .to_string()
+            format!(
+                "A keystroke arrived doubled from a keyboard recognized as wireless: over a \
+                 wireless link a radio stall that delivers a whole keystroke at once looks \
+                 the same as a switch that closed for less time than a finger holds a key, \
+                 so {}",
+                RADIO_RETEST
+            )
         } else {
             advice(
                 "The switch closed for less time than a finger holds a key: usually a \
@@ -2752,6 +2763,11 @@ mod tests {
         assert_eq!(bounce.detail, "A (3 bounces, wireless)");
         assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
         assert!(bounce.advice.contains("cable"), "{}", bounce.advice);
+        assert!(
+            bounce.advice.contains("already was on its cable"),
+            "{}",
+            bounce.advice
+        );
 
         // A wired key that chatters twice next to it is still a fault, and
         // the wireless key keeps its caveat
@@ -2829,9 +2845,13 @@ mod tests {
         // A second stall is no verdict either, so the advice must not say a
         // second bounce means replacing the switch
         assert!(
-            bounce
-                .advice
-                .starts_with("A keystroke arrived doubled over the wireless link"),
+            bounce.advice.starts_with("A keystroke arrived doubled"),
+            "{}",
+            bounce.advice
+        );
+        // A keyboard taken for wireless on its cable is not sent to the cable
+        assert!(
+            bounce.advice.contains("already was on its cable"),
             "{}",
             bounce.advice
         );

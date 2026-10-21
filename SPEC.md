@@ -77,7 +77,9 @@ Keyboard TestKit is a comprehensive keyboard testing and diagnostic utility desi
   on a wireless keyboard (Bluetooth bus type from `EVIOCGID`, a receiver
   name, or a HID device paired behind a receiver), where a radio stall that
   delivers a whole keystroke at once looks the same: it stays a warning that
-  says so
+  says so. On USB "Wireless" alone in the name does not make a keyboard
+  wireless (tri-mode keyboards keep it on their cable), and the warning
+  does not send a keyboard already on its cable to the cable
 
 > **Current status:** autorepeat rate and delay are not measured (evdev and
 > the terminal listener drop autorepeat events), and there is no waveform

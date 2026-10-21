@@ -287,10 +287,13 @@ be a 2.4 GHz receiver, a dropout in the middle of a shorter keystroke cannot
 be told from a double letter the radio bunched, so it is not counted there.
 A key that bounces once is a warning; a key that bounces again is reported
 as a fault. On a wireless keyboard (Bluetooth, or a 2.4 GHz receiver
-recognized by its name or, for Logitech receivers, by the paired keyboard
-behind it) a radio stall that delivers a whole keystroke at once looks like a
-bounce, so its bounces stay a warning that says so: reset (`R`) and retest on
-the cable or next to the receiver.
+recognized by its name, such as "Receiver" or "Dongle", or, for Logitech
+receivers, by the paired keyboard behind it) a radio stall that delivers a
+whole keystroke at once looks like a bounce, so its bounces stay a warning
+that says so: reset (`R`) and retest on the cable or next to the receiver; if
+the key still bounces there, or the keyboard already was on its cable, it is
+the switch. "Wireless" alone in a USB keyboard's name does not count, since
+tri-mode keyboards keep it on their cable.
 
 Input during the idle check that looks like whole keystrokes (you pressed a
 key) is a warning worded as a condition; a key left down or firing again and
