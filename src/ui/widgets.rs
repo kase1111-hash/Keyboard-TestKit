@@ -144,32 +144,38 @@ impl Widget for HelpPanel {
 
         let sections = [
             (
-                "NAV",
+                "ANY VIEW",
                 &[
-                    ("Tab", "Switch view"),
-                    ("1-0", "Jump to view"),
-                    ("m", "Toggle shortcuts"),
-                    ("q", "Quit"),
+                    ("Tab", "Next view (Shift+Tab: previous)"),
+                    ("Esc", "Quit (Ctrl+C too)"),
+                    ("Ctrl+P", "Pause / resume"),
+                    ("Ctrl+R", "Reset current test"),
+                    ("Ctrl+E", "Export JSON report"),
                 ][..],
             ),
             (
-                "AUTO",
+                "TEST VIEWS 2-9",
+                &[
+                    ("keys", "Every other key is test input"),
+                    ("Ctrl", "Shortcuts: Ctrl combos too"),
+                    ("v", "Virtual: send test keys"),
+                    ("a f c", "OEM: add FN key, FN mode, clear"),
+                ][..],
+            ),
+            (
+                "DASHBOARD / AUTO / HELP",
                 &[
                     ("A", "Run auto test"),
-                    ("Ctrl+N", "Skip step"),
-                    ("Ctrl+C", "Abort test"),
+                    ("1-0", "Jump to view (m: on/off)"),
+                    ("Space", "Pause"),
+                    ("r / R", "Reset current / all"),
+                    ("e  q", "Export, quit"),
+                    ("S t ?", "Settings, theme, help"),
                 ][..],
             ),
             (
-                "CTL",
-                &[
-                    ("Space", "Pause"),
-                    ("r/R", "Reset"),
-                    ("e", "Export"),
-                    ("t", "Toggle theme"),
-                    ("S", "Settings"),
-                    ("?", "Help"),
-                ][..],
+                "AUTO TEST RUNNING",
+                &[("Ctrl+N", "Skip step"), ("Ctrl+C", "Abort test")][..],
             ),
             (
                 "TESTS",
@@ -184,14 +190,6 @@ impl Widget for HelpPanel {
                     ("8", "Virtual"),
                     ("9", "OEM/FN"),
                     ("0", "Auto"),
-                ][..],
-            ),
-            (
-                "OEM",
-                &[
-                    ("a", "Add FN scancode"),
-                    ("f", "Cycle FN mode"),
-                    ("c", "Clear mappings"),
                 ][..],
             ),
         ];
