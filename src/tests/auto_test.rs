@@ -1129,32 +1129,43 @@ impl AutoTest {
                     },
                 ));
             }
-        } else if !self.chatter_suspects.is_empty() {
+        } else {
+            // A key already reported as bouncing above has the same fault:
+            // report it once, not as two critical findings.
+            let bouncy: HashSet<KeyCode> = ctx
+                .hold_release
+                .bouncy_keys()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             let mut suspects: Vec<(KeyCode, u32)> = self
                 .chatter_suspects
                 .iter()
+                .filter(|(k, _)| !bouncy.contains(k))
                 .map(|(k, n)| (*k, *n))
                 .collect();
-            suspects.sort_by_key(|s| std::cmp::Reverse(s.1));
-            let detail = suspects
-                .iter()
-                .take(6)
-                .map(|(k, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
-                .collect::<Vec<_>>()
-                .join(", ");
-            findings.push(Finding::new(
-                Severity::Critical,
-                "Key chatter",
-                format!("Too-fast repeated presses on {} key(s)", suspects.len()),
-                format!(
-                    "{} (re-press under {} ms after release or {} ms after the last press)",
-                    detail,
-                    CHATTER_RELEASE_GAP_US / 1000,
-                    CHATTER_GAP_US / 1000
-                ),
-                "A finger cannot re-press that fast; the switch is registering one \
-                 press as several. Clean or replace it.",
-            ));
+            if !suspects.is_empty() {
+                suspects.sort_by_key(|s| std::cmp::Reverse(s.1));
+                let detail = suspects
+                    .iter()
+                    .take(6)
+                    .map(|(k, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding::new(
+                    Severity::Critical,
+                    "Key chatter",
+                    format!("Too-fast repeated presses on {} key(s)", suspects.len()),
+                    format!(
+                        "{} (re-press under {} ms after release or {} ms after the last press)",
+                        detail,
+                        CHATTER_RELEASE_GAP_US / 1000,
+                        CHATTER_GAP_US / 1000
+                    ),
+                    "A finger cannot re-press that fast; the switch is registering one \
+                     press as several. Clean or replace it.",
+                ));
+            }
         }
 
         // --- Hold step ----------------------------------------------------
@@ -2200,6 +2211,37 @@ mod tests {
             .expect("chatter finding");
         assert_eq!(chatter.severity, Severity::Critical);
         assert!(chatter.detail.contains("A (1x)"), "{}", chatter.detail);
+    }
+
+    #[test]
+    fn bouncing_key_is_reported_once() {
+        // A 1 ms bounce is both a bounce (bounce test) and a too-fast re-press
+        // (chatter check): one fault, so the key is listed in one finding
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        for e in [
+            evt(30, KeyEventType::Press, s, 0),
+            evt(30, KeyEventType::Release, s + ms(1), 0),
+            evt(30, KeyEventType::Press, s + ms(2), 0),
+            evt(30, KeyEventType::Release, s + ms(90), 0),
+        ] {
+            t.process_event(&e);
+            parts.1.process_event(&e);
+        }
+        // Another key that only the chatter check sees
+        t.process_event(&evt(31, KeyEventType::Press, s + ms(200), 0));
+        t.process_event(&evt(31, KeyEventType::Release, s + ms(240), 0));
+        t.process_event(&evt(31, KeyEventType::Press, s + ms(256), 0));
+        let findings = t.analyze(&ctx!(parts));
+        let lists_a = findings.iter().filter(|f| f.detail.contains("A (")).count();
+        assert_eq!(lists_a, 1, "{:?}", findings);
+        let chatter = findings
+            .iter()
+            .find(|f| f.category == "Key chatter")
+            .unwrap();
+        assert!(chatter.detail.starts_with("S (1x)"), "{}", chatter.detail);
     }
 
     #[test]
