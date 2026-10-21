@@ -137,8 +137,8 @@ auto test runs five short steps and then writes a ranked list of findings:
 |------|--------|---------------|
 | Idle check | Nothing for 3 s | Phantom input, keys already stuck |
 | Key sweep | Press every key once (`Ctrl+N` if your keyboard lacks one) | Dead keys, keys that never release |
-| Hold & release | Hold one key ~1 s | Release reporting, stuck keys |
-| Rollover | Hold 6 or more keys at once | Limited N-key rollover |
+| Hold & release | Hold a letter key or Space ~1 s | Release reporting, stuck keys |
+| Rollover | Hold 6 or more letter keys at once | Limited N-key rollover |
 | Rapid tap | Tap one key quickly with one finger | Switch chatter, polling rate (both evdev only) |
 
 Only evdev sees every key. Through a terminal the sweep leaves out keys the

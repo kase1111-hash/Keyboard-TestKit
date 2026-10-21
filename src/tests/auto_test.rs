@@ -13,7 +13,7 @@
 //!    keys the input source can report are expected, and only evdev can call
 //!    a key dead (a terminal may simply not pass it on).
 //! 3. **Hold** – hold one key for about a second; verifies release reporting.
-//! 4. **Rollover** – hold as many keys as possible; measures N-key rollover.
+//! 4. **Rollover** – hold as many letter keys as possible; measures N-key rollover.
 //!    The step waits for [`GOOD_ROLLOVER`] keys (or its timeout), so a first
 //!    half-hearted attempt is not taken as the keyboard's limit.
 //! 5. **Rapid tap** – tap one key quickly; looks for switch chatter (evdev
@@ -256,9 +256,10 @@ impl StepKind {
         match self {
             Self::Idle => "Hands off the keyboard. Do not press anything.",
             Self::Sweep => "Press every key on the main block once (any order).",
-            Self::Hold => "Hold any single key for about one second, then release it.",
+            Self::Hold => "Hold a letter key or Space for about one second, then release it.",
             Self::Rollover => {
-                "Press and hold as many keys as you can at once (aim for 6+), then release all."
+                "Press and hold as many letter keys as you can at once (aim for 6+), then \
+                 release all."
             }
             Self::RapidTap => "Tap one key with one finger as fast as you can for a few seconds.",
         }
@@ -903,6 +904,8 @@ impl AutoTest {
     pub fn analyze(&self, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         let mut findings = Vec::new();
         let releases = self.input_source.has_release_events();
+        // Whether held modifier keys show up at all (not on the Windows console)
+        let modifiers_reported = self.input_source.can_report(keymap::KEY_LSHIFT);
 
         // --- Input source limitations -------------------------------------
         if !releases {
@@ -1180,17 +1183,25 @@ impl AutoTest {
                         "Expected a single key held for at least {} ms followed by its release.",
                         MIN_HOLD.as_millis()
                     ),
-                    "If you did hold a key, releases are not reaching the app: check \
-                     for remapping software or try the evdev input path.",
+                    if modifiers_reported {
+                        "If you did hold a key, releases are not reaching the app: check \
+                         for remapping software or try the evdev input path."
+                    } else {
+                        "This console does not report Shift, Ctrl, Alt or the Windows key, \
+                         so holding one of them does not count. If you held another key, \
+                         releases are not reaching the app: check for remapping software."
+                    },
                 ));
             }
             _ => {}
         }
 
         // --- Rollover -----------------------------------------------------
-        if let Some(finding) =
-            rollover_finding(self.outcome_of(StepKind::Rollover), self.rollover_max)
-        {
+        if let Some(finding) = rollover_finding(
+            self.outcome_of(StepKind::Rollover),
+            self.rollover_max,
+            modifiers_reported,
+        ) {
             findings.push(finding);
         }
         if ctx.rollover.ghost_count() > 0 {
@@ -1651,7 +1662,12 @@ fn unreportable_advice(source: InputSource) -> &'static str {
 /// The step only passes at [`GOOD_ROLLOVER`] keys. A lower peak at the timeout
 /// may be the keyboard's limit or just fewer keys pressed, which the app
 /// cannot tell apart, so it is worded as a condition, never as a verdict.
-fn rollover_finding(outcome: Option<StepOutcome>, max: usize) -> Option<Finding> {
+/// Without `modifiers_reported` held modifier keys were not counted.
+fn rollover_finding(
+    outcome: Option<StepOutcome>,
+    max: usize,
+    modifiers_reported: bool,
+) -> Option<Finding> {
     let peak = format!(
         "Peak of {} simultaneous keys during the rollover step.",
         max
@@ -1677,7 +1693,15 @@ fn rollover_finding(outcome: Option<StepOutcome>, max: usize) -> Option<Finding>
             Severity::Warning,
             "Rollover",
             format!("No more than {} key(s) registered at once", max),
-            peak,
+            if modifiers_reported {
+                peak
+            } else {
+                format!(
+                    "{} Shift, Ctrl, Alt and the Windows key are not reported by this \
+                     console and were not counted.",
+                    peak
+                )
+            },
             format!(
                 "If you held more keys than that, the keyboard limits rollover, which \
                  blocks key combinations in games and shortcuts (some keyboards only \
@@ -2071,6 +2095,17 @@ mod tests {
         assert_eq!(r.severity, Severity::Warning);
         assert!(r.title.contains("4 key(s)"), "{}", r.title);
         assert!(r.advice.contains("If you held fewer, this is not a fault"));
+    }
+
+    #[test]
+    fn rollover_low_peak_says_when_modifiers_were_not_counted() {
+        // The Windows console never reports Shift/Ctrl/Alt/Win, so a user
+        // holding them with letters sees a lower count than they pressed
+        let r = rollover_finding(Some(StepOutcome::TimedOut), 3, false).unwrap();
+        assert_eq!(r.severity, Severity::Warning);
+        assert!(r.detail.contains("were not counted"), "{}", r.detail);
+        let r = rollover_finding(Some(StepOutcome::TimedOut), 3, true).unwrap();
+        assert!(!r.detail.contains("not counted"), "{}", r.detail);
     }
 
     #[test]
