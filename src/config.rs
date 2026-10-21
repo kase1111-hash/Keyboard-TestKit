@@ -148,6 +148,7 @@ pub const SAMPLE_WINDOW_MS_MIN: u64 = 10;
 pub const SAMPLE_WINDOW_MS_MAX: u64 = 10_000;
 /// Lowest stuck-key threshold. A keystroke lasts 50-150 ms, so anything
 /// shorter would flag ordinary typing; 250 ms is also the Settings view step.
+/// A lower value in a config file gets the default instead (see `sanitize`).
 pub const STUCK_THRESHOLD_MS_MIN: u64 = 250;
 /// Highest stuck-key threshold. Past a minute the check would practically
 /// never fire during a test session.
@@ -168,6 +169,25 @@ pub const REFRESH_RATE_HZ_MAX: u32 = 240;
 pub const WARNING_DURATION_SECS_MIN: u32 = 1;
 /// ...and a huge value would leave it covering the results.
 pub const WARNING_DURATION_SECS_MAX: u32 = 30;
+
+/// Readers for the numeric settings that accept any TOML integer. A
+/// hand-edited value the field's type cannot hold (negative, or too large)
+/// saturates to the nearest one and `Config::sanitize` then clamps it,
+/// instead of failing the whole file and silently dropping every other
+/// setting (key mappings included) back to its default.
+mod saturating {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        // TOML integers are i64, so this covers every value a file can hold
+        Ok(i64::deserialize(deserializer)?.max(0) as u64)
+    }
+
+    pub fn u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+        let value = i64::deserialize(deserializer)?;
+        Ok(value.clamp(0, i64::from(u32::MAX)) as u32)
+    }
+}
 
 /// Main application configuration
 ///
@@ -194,8 +214,10 @@ pub struct Config {
 #[serde(default)]
 pub struct PollingConfig {
     /// Test duration in seconds
+    #[serde(deserialize_with = "saturating::u64")]
     pub test_duration_secs: u64,
     /// Sample window for averaging (in milliseconds)
+    #[serde(deserialize_with = "saturating::u64")]
     pub sample_window_ms: u64,
 }
 
@@ -213,6 +235,7 @@ impl Default for PollingConfig {
 #[serde(default)]
 pub struct StickinessConfig {
     /// Threshold in ms after which a key is considered stuck
+    #[serde(deserialize_with = "saturating::u64")]
     pub stuck_threshold_ms: u64,
 }
 
@@ -232,9 +255,11 @@ impl Default for StickinessConfig {
 #[serde(default)]
 pub struct HoldReleaseConfig {
     /// Bounce detection window in ms
+    #[serde(deserialize_with = "saturating::u64")]
     pub bounce_window_ms: u64,
     /// Minimum hold time to register as intentional.
     /// Not used by any test yet; kept so existing config files still load.
+    #[serde(deserialize_with = "saturating::u64")]
     pub min_hold_ms: u64,
 }
 
@@ -252,8 +277,10 @@ impl Default for HoldReleaseConfig {
 #[serde(default)]
 pub struct UiConfig {
     /// Refresh rate for UI updates (in Hz)
+    #[serde(deserialize_with = "saturating::u32")]
     pub refresh_rate_hz: u32,
     /// Show warning overlay duration in seconds
+    #[serde(deserialize_with = "saturating::u32")]
     pub warning_duration_secs: u32,
     /// Color theme (dark/light)
     pub theme: Theme,
@@ -763,6 +790,46 @@ theme = "Dark"
         assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
         assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
         assert!(config.refresh_interval() > Duration::ZERO);
+    }
+
+    #[test]
+    fn load_clamps_negative_and_oversized_values_keeping_the_rest() {
+        // A typo such as a minus sign must not throw away the whole file
+        let path = temp_path("negative");
+        fs::write(
+            &path,
+            r#"
+[stickiness]
+stuck_threshold_ms = 100000000000
+
+[hold_release]
+bounce_window_ms = -5
+min_hold_ms = -1
+
+[ui]
+refresh_rate_hz = -60
+warning_duration_secs = 5000000000
+theme = "Light"
+
+[oem_keys]
+enabled = true
+fn_mode = "CaptureOnly"
+key_mappings = [[100, 97]]
+capture_unknown = true
+show_notifications = true
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("config with negative values must still load");
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(config.ui.warning_duration_secs, WARNING_DURATION_SECS_MAX);
+        assert_eq!(config.hold_release.bounce_window_ms, BOUNCE_WINDOW_MS_MIN);
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MAX);
+        // The rest of the file is kept
+        assert_eq!(config.ui.theme, Theme::Light);
+        assert_eq!(config.oem_keys.key_mappings, vec![(100, 97)]);
     }
 
     #[test]
