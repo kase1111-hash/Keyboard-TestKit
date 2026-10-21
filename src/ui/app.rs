@@ -1,9 +1,12 @@
 //! Main application state and logic
 
-use crate::config::{Config, Theme};
+use crate::config::{
+    Config, Theme, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN, STUCK_THRESHOLD_MS_MAX,
+    STUCK_THRESHOLD_MS_MIN, WARNING_DURATION_SECS_MAX, WARNING_DURATION_SECS_MIN,
+};
 use crate::keyboard::layout::KeyboardLayout;
 use crate::keyboard::remap::FnKeyMode;
-use crate::keyboard::{KeyEvent, KeyboardState};
+use crate::keyboard::{KeyEvent, KeyEventType, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
     expected_keys_for_layout, AnalysisContext, AutoTest, EventTimingTest, Finding, HoldReleaseTest,
@@ -18,8 +21,23 @@ use std::time::{Duration, Instant};
 /// How often the live diagnostic findings are recomputed.
 const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Stuck-key threshold applied while the auto test asks the user to hold a key.
+/// Stuck-key threshold applied while the auto test asks the user to hold keys
+/// (Hold and Rollover steps). Getting 6-10 keys down for the rollover step
+/// takes a few seconds; 15 s leaves room for a slow attempt without flagging
+/// it, while a key that really stays down is still caught once the step ends.
 const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
+
+/// Stuck-key threshold (ms) to use during `step` of the auto test, given the
+/// configured threshold. Steps that ask the user to hold keys get a relaxed
+/// threshold; every other step (and no run at all) uses the configured one.
+fn stuck_threshold_for_step(step: Option<StepKind>, configured_ms: u64) -> u64 {
+    match step {
+        Some(StepKind::Hold | StepKind::Rollover) => {
+            configured_ms.max(HOLD_STEP_STUCK_THRESHOLD_MS)
+        }
+        _ => configured_ms,
+    }
+}
 
 /// Current view/tab in the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +202,7 @@ impl App {
         // Set up OEM test with config settings
         let mut oem_test = OemKeyTest::new();
         oem_test.set_fn_mode(config.oem_keys.fn_mode);
+        oem_test.remapper_mut().set_enabled(config.oem_keys.enabled);
 
         // Load custom FN scancodes
         for scancode in &config.oem_keys.fn_scancodes {
@@ -293,8 +312,14 @@ impl App {
 
     /// Process a keyboard event through all active tests
     pub fn process_event(&mut self, event: &KeyEvent) {
-        if self.state != AppState::Running {
-            return;
+        match self.state {
+            AppState::Running => {}
+            // Paused: record nothing new, but let keys that went down before
+            // the pause come back up. Otherwise a key released while paused
+            // (often the very key that was held when Space was pressed) would
+            // look held, and later stuck, after resuming.
+            AppState::Paused if self.completes_recorded_keystroke(event) => {}
+            _ => return,
         }
 
         self.total_events += 1;
@@ -315,7 +340,15 @@ impl App {
             }
         }
 
-        self.check_stuck_keys();
+        if self.state == AppState::Running {
+            self.check_stuck_keys();
+        }
+    }
+
+    /// Whether `event` is the release of a key the tests saw go down.
+    fn completes_recorded_keystroke(&self, event: &KeyEvent) -> bool {
+        event.event_type == KeyEventType::Release
+            && self.keyboard_state.pressed_keys().contains(&event.key)
     }
 
     /// Flag keys held past the stickiness threshold in the status bar.
@@ -357,28 +390,17 @@ impl App {
         }
     }
 
-    /// Relax the stuck-key threshold while the user is asked to hold a key,
+    /// Relax the stuck-key threshold while the user is asked to hold keys,
     /// and restore it afterwards.
     fn apply_auto_step_transition(&mut self) {
         let step = self.auto_test.current_step();
         if step == self.last_auto_step {
             return;
         }
-        match (self.last_auto_step, step) {
-            (_, Some(StepKind::Hold)) => {
-                self.stickiness_test.set_threshold(
-                    self.config
-                        .stickiness
-                        .stuck_threshold_ms
-                        .max(HOLD_STEP_STUCK_THRESHOLD_MS),
-                );
-            }
-            (Some(StepKind::Hold), _) => {
-                self.stickiness_test
-                    .set_threshold(self.config.stickiness.stuck_threshold_ms);
-            }
-            _ => {}
-        }
+        self.stickiness_test.set_threshold(stuck_threshold_for_step(
+            step,
+            self.config.stickiness.stuck_threshold_ms,
+        ));
         self.last_auto_step = step;
     }
 
@@ -524,7 +546,8 @@ impl App {
     pub fn reset_current(&mut self) {
         if self.view == AppView::AutoTest {
             self.auto_test.reset();
-            self.last_auto_step = None;
+            // Restores the stuck-key threshold if a step had relaxed it
+            self.apply_auto_step_transition();
             self.refresh_findings();
             self.set_status("Auto test reset".to_string());
             return;
@@ -813,14 +836,15 @@ impl App {
                         .config
                         .stickiness
                         .stuck_threshold_ms
-                        .saturating_add(250);
+                        .saturating_add(250)
+                        .min(STUCK_THRESHOLD_MS_MAX);
                 } else {
                     self.config.stickiness.stuck_threshold_ms = self
                         .config
                         .stickiness
                         .stuck_threshold_ms
                         .saturating_sub(250)
-                        .max(250);
+                        .max(STUCK_THRESHOLD_MS_MIN);
                 }
                 self.stickiness_test
                     .set_threshold(self.config.stickiness.stuck_threshold_ms);
@@ -842,11 +866,19 @@ impl App {
             3 => {
                 // Refresh rate
                 if increase {
-                    self.config.ui.refresh_rate_hz =
-                        self.config.ui.refresh_rate_hz.saturating_add(10).min(240);
+                    self.config.ui.refresh_rate_hz = self
+                        .config
+                        .ui
+                        .refresh_rate_hz
+                        .saturating_add(10)
+                        .min(REFRESH_RATE_HZ_MAX);
                 } else {
-                    self.config.ui.refresh_rate_hz =
-                        self.config.ui.refresh_rate_hz.saturating_sub(10).max(10);
+                    self.config.ui.refresh_rate_hz = self
+                        .config
+                        .ui
+                        .refresh_rate_hz
+                        .saturating_sub(10)
+                        .max(REFRESH_RATE_HZ_MIN);
                 }
             }
             4 => {
@@ -865,14 +897,14 @@ impl App {
                         .ui
                         .warning_duration_secs
                         .saturating_add(1)
-                        .min(30);
+                        .min(WARNING_DURATION_SECS_MAX);
                 } else {
                     self.config.ui.warning_duration_secs = self
                         .config
                         .ui
                         .warning_duration_secs
                         .saturating_sub(1)
-                        .max(1);
+                        .max(WARNING_DURATION_SECS_MIN);
                 }
             }
             _ => {}
@@ -1182,5 +1214,201 @@ mod tests {
         let app = App::default();
         // No shortcut detected yet
         assert!(app.shortcut_overlay().is_none());
+    }
+
+    /// An instant `ago` in the past (falls back to now on a freshly booted clock).
+    fn ago(ago: Duration) -> Instant {
+        Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+    }
+
+    fn event_at(key: u16, kind: KeyEventType, at: Instant) -> KeyEvent {
+        KeyEvent::new(KeyCode(key), kind, at, 1000)
+    }
+
+    /// Run the auto test (with real releases) up to `step`.
+    fn app_at_auto_step(step: StepKind) -> App {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        app.tick();
+        while app.auto_test.current_step() != Some(step) {
+            app.skip_auto_step();
+            app.tick();
+        }
+        app
+    }
+
+    #[test]
+    fn stuck_threshold_relaxed_for_hold_and_rollover_steps() {
+        let configured = Duration::from_millis(Config::default().stickiness.stuck_threshold_ms);
+        let relaxed = Duration::from_millis(HOLD_STEP_STUCK_THRESHOLD_MS);
+
+        let mut app = app_at_auto_step(StepKind::Sweep);
+        assert_eq!(app.stickiness_test.threshold(), configured);
+
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::Hold));
+        assert_eq!(app.stickiness_test.threshold(), relaxed);
+
+        // Hold -> Rollover must keep the relaxed threshold: the user is asked
+        // to hold as many keys as possible, which takes a few seconds.
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::Rollover));
+        assert_eq!(app.stickiness_test.threshold(), relaxed);
+
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::RapidTap));
+        assert_eq!(app.stickiness_test.threshold(), configured);
+    }
+
+    #[test]
+    fn stuck_threshold_restored_when_aborted_during_rollover() {
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        app.abort_auto_test();
+        assert_eq!(
+            app.stickiness_test.threshold(),
+            Duration::from_millis(app.config.stickiness.stuck_threshold_ms)
+        );
+    }
+
+    #[test]
+    fn stuck_threshold_for_step_policy() {
+        assert_eq!(stuck_threshold_for_step(None, 2000), 2000);
+        assert_eq!(stuck_threshold_for_step(Some(StepKind::Sweep), 2000), 2000);
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Hold), 2000),
+            HOLD_STEP_STUCK_THRESHOLD_MS
+        );
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Rollover), 2000),
+            HOLD_STEP_STUCK_THRESHOLD_MS
+        );
+        // A user threshold above the relaxed one is never lowered
+        assert_eq!(
+            stuck_threshold_for_step(Some(StepKind::Rollover), 30_000),
+            30_000
+        );
+    }
+
+    #[test]
+    fn rollover_step_long_hold_is_not_flagged() {
+        // The user takes 3 s to get 6 keys down, then lets go.
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        let t0 = ago(Duration::from_secs(3));
+        for key in 30..36 {
+            app.process_event(&event_at(key, KeyEventType::Press, t0));
+        }
+        app.tick();
+        assert!(app.stickiness_test.flagged_keys().is_empty());
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+        for key in 30..36 {
+            app.process_event(&event_at(key, KeyEventType::Release, Instant::now()));
+        }
+        app.tick();
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+    }
+
+    #[test]
+    fn key_still_down_after_rollover_step_is_stuck() {
+        // A key that never comes back up is still caught once the step is over.
+        let mut app = app_at_auto_step(StepKind::Rollover);
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(3)),
+        ));
+        app.skip_auto_step();
+        app.tick();
+        assert_eq!(app.auto_test.current_step(), Some(StepKind::RapidTap));
+        let stuck: Vec<KeyCode> = app
+            .stickiness_test
+            .stuck_keys()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(stuck, vec![KeyCode(30)]);
+    }
+
+    #[test]
+    fn release_during_pause_is_not_lost() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        // Down for 1 s (below the 2 s threshold) when Space pauses the app
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(1)),
+        ));
+        app.toggle_pause();
+        // Key released while paused (e.g. the user lets go after pausing)
+        app.process_event(&event_at(30, KeyEventType::Release, Instant::now()));
+        app.toggle_pause();
+        // Time passing after the resume, simulated with a shorter threshold:
+        // a key the tests still thought was down would now be flagged.
+        app.stickiness_test.set_threshold(250);
+        app.tick();
+
+        assert_eq!(app.keyboard_state.current_rollover(), 0);
+        assert_eq!(app.rollover_test.current_count(), 0);
+        assert!(app.stickiness_test.held_keys().is_empty());
+        assert!(app.stickiness_test.flagged_keys().is_empty());
+        assert!(app.stickiness_test.stuck_keys().is_empty());
+    }
+
+    #[test]
+    fn pause_still_ignores_new_keystrokes() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.toggle_pause();
+        app.process_event(&press(30, 1000));
+        app.process_event(&release(30, 1000));
+        // A release for a key the tests never saw go down is not recorded
+        app.process_event(&release(31, 1000));
+        assert_eq!(app.total_events, 0);
+        assert_eq!(app.keyboard_state.total_events(), 0);
+    }
+
+    #[test]
+    fn key_held_through_pause_is_still_detected_as_stuck() {
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.process_event(&event_at(
+            30,
+            KeyEventType::Press,
+            ago(Duration::from_secs(3)),
+        ));
+        app.toggle_pause();
+        app.toggle_pause();
+        app.tick();
+        assert_eq!(app.stickiness_test.stuck_keys().len(), 1);
+    }
+
+    #[test]
+    fn stuck_threshold_setting_is_bounded() {
+        // Settings view uses the same bounds a loaded config is clamped to
+        let mut app = App {
+            settings_selected: 1,
+            ..App::default()
+        };
+        app.config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MAX;
+        app.adjust_setting(true);
+        assert_eq!(
+            app.config.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MAX
+        );
+        assert_eq!(
+            app.stickiness_test.threshold(),
+            Duration::from_millis(STUCK_THRESHOLD_MS_MAX)
+        );
+
+        app.config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MIN;
+        app.adjust_setting(false);
+        assert_eq!(
+            app.config.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MIN
+        );
     }
 }
