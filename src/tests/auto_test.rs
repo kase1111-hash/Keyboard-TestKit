@@ -1743,16 +1743,27 @@ fn bounce_finding(
             ),
         )
     } else if bouncy.iter().all(|(_, n, _)| *n == 1) {
+        // Nothing came over a cable: the radio is as likely as the switch,
+        // and a second stall would be no verdict either
+        let advice = if bouncy.iter().all(|(_, n, w)| w == n) {
+            "A keystroke arrived doubled over the wireless link: a radio stall that \
+             delivers a whole keystroke at once looks the same as a switch that closed \
+             for less time than a finger holds a key. Reset (R) and retest on the cable \
+             or next to the receiver; if the key still bounces there, it is the switch."
+                .to_string()
+        } else {
+            advice(
+                "The switch closed for less time than a finger holds a key: usually a \
+                 worn or dirty switch. Press the key several times: if it bounces again, \
+                 clean or replace the switch.",
+            )
+        };
         Finding::new(
             Severity::Warning,
             "Switch bounce",
             format!("{} key(s) registered one press twice", bouncy.len()),
             detail,
-            advice(
-                "The switch closed for less time than a finger holds a key: usually a \
-                 worn or dirty switch. Press the key several times: if it bounces again, \
-                 clean or replace the switch.",
-            ),
+            advice,
         )
     } else {
         // Repeated, but no key bounced twice in events from a cable
@@ -2756,6 +2767,76 @@ mod tests {
             .unwrap();
         assert_eq!(bounce.severity, Severity::Critical);
         assert_eq!(bounce.detail, "A (3 bounces, wireless), S (2 bounces)");
+        assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
+    }
+
+    #[test]
+    fn a_single_bounce_over_a_wireless_link_is_worded_for_the_radio_first() {
+        // A healthy Bluetooth keyboard: one stall during the rapid-tap step
+        // delivers a whole tap of A at once
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        parts.1.note_wireless_keys(&[KeyCode(30)]);
+        let s = t0 + Duration::from_secs(1);
+        let burst = s + Duration::from_millis(150);
+        let us = Duration::from_micros;
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &[
+                evt(30, KeyEventType::Press, s, 0),
+                evt(30, KeyEventType::Release, burst, 0),
+                evt(30, KeyEventType::Press, burst + us(80), 0),
+                evt(30, KeyEventType::Release, burst + us(160), 0),
+            ],
+        );
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .expect("bounce finding");
+        assert_eq!(bounce.severity, Severity::Warning);
+        assert_eq!(bounce.detail, "A (1 bounce, wireless)");
+        // A second stall is no verdict either, so the advice must not say a
+        // second bounce means replacing the switch
+        assert!(
+            bounce
+                .advice
+                .starts_with("A keystroke arrived doubled over the wireless link"),
+            "{}",
+            bounce.advice
+        );
+        assert!(
+            !bounce.advice.contains("worn or dirty"),
+            "{}",
+            bounce.advice
+        );
+        assert!(
+            !bounce.advice.contains("if it bounces again"),
+            "{}",
+            bounce.advice
+        );
+        assert!(bounce.advice.contains("cable"), "{}", bounce.advice);
+
+        // Next to a wired key that bounced once, the switch advice is back
+        // for that key, and the wireless caveat stays
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &taps(31, s + Duration::from_secs(2), 5, &[1]),
+        );
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .unwrap();
+        assert_eq!(bounce.severity, Severity::Warning);
+        assert_eq!(bounce.detail, "A (1 bounce, wireless), S (1 bounce)");
+        assert!(
+            bounce.advice.contains("if it bounces again"),
+            "{}",
+            bounce.advice
+        );
         assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
     }
 
