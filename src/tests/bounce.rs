@@ -132,6 +132,23 @@ impl KeyHoldStats {
     fn bounced_only_over_wireless(&self) -> bool {
         self.bounce_count > 0 && self.wireless_bounces == self.bounce_count
     }
+
+    /// Whether the key's bounces are a switch fault (see [`bounces_are_fault`]).
+    fn bounce_is_fault(&self) -> bool {
+        bounces_are_fault(self.bounce_count, self.wireless_bounces)
+    }
+
+    /// The key's bounces as the view lists them, with the share that came
+    /// over a wireless link, as the bounce finding words it.
+    fn bounce_summary(&self) -> String {
+        let (n, w) = (self.bounce_count, self.wireless_bounces);
+        let plural = if n == 1 { "" } else { "s" };
+        match w {
+            0 => format!("{} bounce{}", n, plural),
+            w if w == n => format!("{} bounce{} (wireless)", n, plural),
+            w => format!("{} bounces ({} wireless)", n, w),
+        }
+    }
 }
 
 /// Test for hold down, release, and bounce detection
@@ -438,6 +455,11 @@ impl KeyboardTest for HoldReleaseTest {
                 results.push(TestResult::info("Bounces Detected", "not tested yet"));
             } else if self.total_bounces == 0 {
                 results.push(TestResult::ok("Bounces Detected", "None"));
+            } else if self.key_stats.values().any(KeyHoldStats::bounce_is_fault) {
+                results.push(TestResult::error(
+                    "Bounces Detected",
+                    format!("{}", self.total_bounces),
+                ));
             } else if self
                 .key_stats
                 .values()
@@ -449,7 +471,8 @@ impl KeyboardTest for HoldReleaseTest {
                     format!("{} (wireless link)", self.total_bounces),
                 ));
             } else {
-                results.push(TestResult::error(
+                // Once on a key is worth a look, not yet a pattern
+                results.push(TestResult::warning(
                     "Bounces Detected",
                     format!("{}", self.total_bounces),
                 ));
@@ -491,21 +514,28 @@ impl KeyboardTest for HoldReleaseTest {
             ));
         }
 
-        // Bouncy keys
-        let bouncy = self.bouncy_keys();
+        // Bouncy keys, judged like the bounce finding: faults first
+        let mut bouncy: Vec<(&KeyCode, &KeyHoldStats)> = self
+            .key_stats
+            .iter()
+            .filter(|(_, stats)| stats.bounce_count > 0)
+            .collect();
+        bouncy.sort_by_key(|(key, stats)| {
+            (
+                !stats.bounce_is_fault(),
+                std::cmp::Reverse(stats.bounce_count),
+                key.0,
+            )
+        });
         if !bouncy.is_empty() {
             results.push(TestResult::warning("--- Bouncy Keys ---", ""));
-            for (key, count) in bouncy.iter().take(5) {
-                let key_info = keymap::get_key_info(*key);
+            for (key, stats) in bouncy.iter().take(5) {
+                let key_info = keymap::get_key_info(**key);
                 let label = format!("  {}", key_info.name);
-                let over_wireless = self
-                    .key_stats
-                    .get(key)
-                    .is_some_and(KeyHoldStats::bounced_only_over_wireless);
-                results.push(if over_wireless {
-                    TestResult::warning(label, format!("{} bounces (wireless)", count))
+                results.push(if stats.bounce_is_fault() {
+                    TestResult::error(label, stats.bounce_summary())
                 } else {
-                    TestResult::error(label, format!("{} bounces", count))
+                    TestResult::warning(label, stats.bounce_summary())
                 });
             }
         }
@@ -583,10 +613,32 @@ mod tests {
         );
         assert_eq!(test.total_bounces(), 1);
         assert_eq!(test.bouncy_keys(), vec![(KEY, 1)]);
+        // Once is worth a look, as the finding says, not yet a fault
+        let results = test.get_results();
         assert_eq!(
-            row(&test.get_results(), "Bounces Detected").status,
+            row(&results, "Bounces Detected").status,
+            ResultStatus::Warning
+        );
+        let key_row = row(&results, &format!("  {}", keymap::get_key_info(KEY).name));
+        assert_eq!(key_row.status, ResultStatus::Warning);
+        assert_eq!(key_row.value, "1 bounce");
+        assert!(!results.iter().any(|r| r.status == ResultStatus::Error));
+
+        // The key bounces again: a fault
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(500),
+            &[(0, true), (72, false), (88, true), (96, false)],
+        );
+        let results = test.get_results();
+        assert_eq!(
+            row(&results, "Bounces Detected").status,
             ResultStatus::Error
         );
+        let key_row = row(&results, &format!("  {}", keymap::get_key_info(KEY).name));
+        assert_eq!(key_row.status, ResultStatus::Error);
+        assert_eq!(key_row.value, "2 bounces");
     }
 
     #[test]
@@ -847,6 +899,16 @@ mod tests {
             &[(0, true), (80, false), (82, true), (84, false)],
         );
         assert_eq!(test.wireless_bounces(KEY), 0);
+        let bounces = row(&test.get_results(), "Bounces Detected").clone();
+        assert_eq!(bounces.status, ResultStatus::Warning);
+        assert!(!bounces.value.contains("wireless"), "{:?}", bounces);
+        // and judges the cable's bounces alone
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(6300),
+            &[(0, true), (80, false), (82, true), (84, false)],
+        );
         assert_eq!(
             row(&test.get_results(), "Bounces Detected").status,
             ResultStatus::Error
@@ -876,8 +938,18 @@ mod tests {
         // Later polls bring events of the laptop keyboard only
         test.note_wireless_keys(&[]);
         let chatter = [(0, true), (80, false), (82, true), (85, false)];
+        let key_label = format!("  {}", keymap::get_key_info(KEY).name);
         feed(&mut test, KEY, t0 + ms(1000), &chatter);
         assert!(!bounces_are_fault(2, test.wireless_bounces(KEY)));
+        // One on each link: the view says what the finding says
+        let results = test.get_results();
+        let bounces = row(&results, "Bounces Detected");
+        assert_eq!(bounces.status, ResultStatus::Warning);
+        assert!(!bounces.value.contains("wireless"), "{:?}", bounces);
+        let key_row = row(&results, &key_label);
+        assert_eq!(key_row.status, ResultStatus::Warning);
+        assert_eq!(key_row.value, "2 bounces (1 wireless)");
+
         feed(&mut test, KEY, t0 + ms(2000), &chatter);
         assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
         assert_eq!(test.wireless_bounces(KEY), 1);
@@ -887,9 +959,45 @@ mod tests {
             row(&results, "Bounces Detected").status,
             ResultStatus::Error
         );
-        let key_row = row(&results, &format!("  {}", keymap::get_key_info(KEY).name));
+        let key_row = row(&results, &key_label);
         assert_eq!(key_row.status, ResultStatus::Error);
-        assert!(!key_row.value.contains("wireless"), "{:?}", key_row);
+        assert_eq!(key_row.value, "3 bounces (1 wireless)");
+    }
+
+    #[test]
+    fn the_faulty_keys_are_listed_first() {
+        // Six keys bounced once and one twice: the view lists five, and the
+        // one that is a fault is among them whatever the map order
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        let chatter = [(0, true), (80, false), (82, true), (85, false)];
+        for (i, key) in [16u16, 17, 18, 19, 20, 21, 22].iter().enumerate() {
+            let at = t0 + ms(i as u64 * 1000);
+            feed(&mut test, KeyCode(*key), at, &chatter);
+            if *key == 22 {
+                feed(&mut test, KeyCode(*key), at + ms(500), &chatter);
+            }
+        }
+        let results = test.get_results();
+        assert_eq!(
+            row(&results, "Bounces Detected").status,
+            ResultStatus::Error
+        );
+        let listed: Vec<&TestResult> = results
+            .iter()
+            .skip_while(|r| r.label != "--- Bouncy Keys ---")
+            .skip(1)
+            .take_while(|r| r.label.starts_with("  "))
+            .collect();
+        assert_eq!(listed.len(), 5, "{:?}", listed);
+        assert_eq!(
+            listed[0].label,
+            format!("  {}", keymap::get_key_info(KeyCode(22)).name)
+        );
+        assert_eq!(listed[0].status, ResultStatus::Error);
+        assert!(listed[1..]
+            .iter()
+            .all(|r| r.status == ResultStatus::Warning));
     }
 
     #[test]
