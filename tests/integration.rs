@@ -555,7 +555,7 @@ fn auto_test_skip_all_steps_completes_run() {
 }
 
 #[test]
-fn auto_test_press_only_terminal_skips_release_steps_and_warns() {
+fn auto_test_press_only_terminal_skips_release_steps_and_informs() {
     let mut app = App::default();
     app.set_input_source(InputSource::TerminalPressOnly);
     app.start_auto_test();
@@ -564,10 +564,66 @@ fn auto_test_press_only_terminal_skips_release_steps_and_warns() {
         &[StepKind::Idle, StepKind::Sweep, StepKind::RapidTap]
     );
     app.refresh_findings();
+    // A limitation of the setup, not a keyboard issue
     assert!(app
         .findings
         .iter()
-        .any(|f| f.category == "Limited capture" && f.severity == Severity::Warning));
+        .any(|f| f.category == "Limited capture" && f.severity == Severity::Info));
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
+}
+
+#[test]
+fn auto_test_start_keystroke_read_late_from_evdev_is_not_phantom() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    // The kernel stamped the 'A' press before the terminal copy started the test
+    let pressed = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    app.start_auto_test();
+    app.process_event(&timed(30, KeyEventType::Press, pressed, 0));
+    app.process_event(&release(30, 1000));
+    app.abort_auto_test();
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Phantom input"),
+        "{:?}",
+        app.findings
+    );
+}
+
+#[test]
+fn auto_test_terminal_sweep_expects_only_reportable_keys() {
+    // App sets the layout's keys before it learns the input source
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let all = app.auto_test.expected_keys().len();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    let expected = app.auto_test.expected_keys();
+    assert!(expected.len() < all);
+    for modifier in [29u16, 42, 54, 56, 58, 97, 100, 125] {
+        assert!(!expected.contains(&KeyCode(modifier)), "{}", modifier);
+    }
+    assert!(expected.contains(&KeyCode(30)));
+    app.set_input_source(InputSource::Evdev);
+    assert_eq!(app.auto_test.expected_keys().len(), all);
+}
+
+#[test]
+fn long_hold_released_normally_is_not_a_stuck_key() {
+    let mut config = Config::default();
+    config.stickiness.stuck_threshold_ms = 10;
+    let mut app = App::new(config);
+    app.set_input_source(InputSource::Evdev);
+    app.process_event(&press(17, 1000));
+    std::thread::sleep(Duration::from_millis(30));
+    app.tick();
+    app.process_event(&release(17, 1000));
+    app.refresh_findings();
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Stuck key"),
+        "{:?}",
+        app.findings
+    );
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
 }
 
 #[test]
