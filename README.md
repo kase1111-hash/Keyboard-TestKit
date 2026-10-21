@@ -136,10 +136,15 @@ auto test runs five short steps and then writes a ranked list of findings:
 | Step | You do | It checks for |
 |------|--------|---------------|
 | Idle check | Nothing for 3 s | Phantom input, keys already stuck |
-| Key sweep | Press every key once | Dead keys, keys that never release |
-| Hold & release | Hold one key ~1 s | Release reporting, stuck keys |
-| Rollover | Hold as many keys as you can | Limited N-key rollover |
-| Rapid tap | Tap one key quickly | Switch chatter/bounce, polling rate |
+| Key sweep | Press every key once (`Ctrl+N` if your keyboard lacks one) | Dead keys, keys that never release |
+| Hold & release | Hold a letter key or Space ~1 s | Release reporting, stuck keys |
+| Rollover | Hold 6 or more letter keys at once | Limited N-key rollover |
+| Rapid tap | Tap one key quickly with one finger | Switch chatter, polling rate (both evdev only) |
+
+Only evdev sees every key. Through a terminal the sweep leaves out keys the
+terminal cannot report (modifiers and CapsLock without the kitty protocol, the
+ISO/JIS extra keys) and lists them as not checked, and a key that never
+registers is reported as "not registered" rather than dead.
 
 While the auto test runs every key is treated as test input, so `q`, `r`,
 `Esc` and the other shortcuts can be verified like any other key. `Ctrl+N`

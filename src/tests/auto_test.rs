@@ -9,11 +9,15 @@
 //! 1. **Idle** – hands off the keyboard; any event is a phantom key press or a
 //!    key that is already stuck.
 //! 2. **Sweep** – press every key of the main block once; keys that never
-//!    register are reported as dead, keys that never release as stuck.
+//!    register are reported as dead, keys that never release as stuck. Only
+//!    keys the input source can report are expected, and only evdev can call
+//!    a key dead (a terminal may simply not pass it on).
 //! 3. **Hold** – hold one key for about a second; verifies release reporting.
-//! 4. **Rollover** – hold as many keys as possible; measures N-key rollover.
-//! 5. **Rapid tap** – tap one key quickly; looks for switch chatter and
-//!    infers the polling interval from timestamp quantization.
+//! 4. **Rollover** – hold as many letter keys as possible; measures N-key rollover.
+//!    The step waits for [`GOOD_ROLLOVER`] keys (or its timeout), so a first
+//!    half-hearted attempt is not taken as the keyboard's limit.
+//! 5. **Rapid tap** – tap one key quickly; looks for switch chatter (evdev
+//!    only) and infers the polling interval from timestamp quantization.
 //!
 //! Steps 3 and 4 need real key-release events and are skipped automatically
 //! when the input source cannot provide them (see [`InputSource`]).
@@ -26,7 +30,9 @@ use super::{
     ShortcutTest, StickinessTest, TestResult, VirtualKeyboardTest,
 };
 use crate::keyboard::layout::{layout_rows, KeyboardLayout};
-use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType, KeyboardState};
+use crate::keyboard::{
+    crossterm_to_keycode, keymap, KeyCode, KeyEvent, KeyEventType, KeyboardState,
+};
 use crate::tests::virtual_detect::DiagnosticResult;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -65,6 +71,72 @@ impl InputSource {
             Self::TerminalPressOnly => "terminal (press only)",
         }
     }
+
+    /// Whether this source can identify `key` at all.
+    ///
+    /// Evdev sees every scancode. Terminals identify a key by what it types
+    /// (see [`crossterm_to_keycode`]), so keys that type nothing (modifiers,
+    /// CapsLock) are only reported with the kitty keyboard protocol, and keys
+    /// that only exist on ISO/JIS keyboards are never identified. On Windows,
+    /// `TerminalWithRelease` is the console API, which drops Shift/Ctrl/Alt and
+    /// gives CapsLock and the Windows key no character.
+    pub fn can_report(&self, key: KeyCode) -> bool {
+        match self {
+            Self::Evdev => true,
+            Self::TerminalWithRelease => terminal_can_report(key, !cfg!(windows)),
+            Self::TerminalPressOnly => terminal_can_report(key, false),
+        }
+    }
+}
+
+/// Whether a terminal can identify `key`; `kitty` is whether it speaks the
+/// kitty keyboard protocol (which reports keys that type no character).
+fn terminal_can_report(key: KeyCode, kitty: bool) -> bool {
+    use crossterm::event::{KeyCode as Ct, ModifierKeyCode as Mk};
+    // Everything a legacy terminal can deliver: printable ASCII and the keys
+    // with their own escape sequences.
+    let mut codes: Vec<Ct> = (' '..='~').map(Ct::Char).collect();
+    codes.extend([
+        Ct::Esc,
+        Ct::Backspace,
+        Ct::Tab,
+        Ct::Enter,
+        Ct::Up,
+        Ct::Down,
+        Ct::Left,
+        Ct::Right,
+        Ct::Home,
+        Ct::End,
+        Ct::PageUp,
+        Ct::PageDown,
+        Ct::Insert,
+        Ct::Delete,
+    ]);
+    codes.extend((1..=12).map(Ct::F));
+    if kitty {
+        codes.extend([
+            Ct::CapsLock,
+            Ct::NumLock,
+            Ct::ScrollLock,
+            Ct::PrintScreen,
+            Ct::Pause,
+            Ct::Menu,
+        ]);
+        codes.extend(
+            [
+                Mk::LeftShift,
+                Mk::RightShift,
+                Mk::LeftControl,
+                Mk::RightControl,
+                Mk::LeftAlt,
+                Mk::RightAlt,
+                Mk::LeftSuper,
+                Mk::RightSuper,
+            ]
+            .map(Ct::Modifier),
+        );
+    }
+    codes.into_iter().any(|c| crossterm_to_keycode(c) == key)
 }
 
 // ============================================================================
@@ -184,13 +256,17 @@ impl StepKind {
         match self {
             Self::Idle => "Hands off the keyboard. Do not press anything.",
             Self::Sweep => "Press every key on the main block once (any order).",
-            Self::Hold => "Hold any single key for about one second, then release it.",
-            Self::Rollover => "Press and hold as many keys as you can at once, then release all.",
-            Self::RapidTap => "Tap one key as fast as you can for a few seconds.",
+            Self::Hold => "Hold a letter key or Space for about one second, then release it.",
+            Self::Rollover => {
+                "Press and hold as many letter keys as you can at once (aim for 6+), then \
+                 release all."
+            }
+            Self::RapidTap => "Tap one key with one finger as fast as you can for a few seconds.",
         }
     }
 
-    /// How long the step may run before it is considered timed out.
+    /// How long the step may run before it is considered timed out. The
+    /// sweep runs longer while keys keep registering (see [`SWEEP_GRACE`]).
     pub fn timeout(&self) -> Duration {
         match self {
             Self::Idle => IDLE_DURATION,
@@ -208,10 +284,54 @@ pub const IDLE_DURATION: Duration = Duration::from_secs(3);
 pub const MIN_HOLD: Duration = Duration::from_millis(800);
 /// How long the rapid-tap step records after the first press.
 pub const RAPID_TAP_DURATION: Duration = Duration::from_secs(5);
-/// Same-key press gaps below this cannot be produced by a finger: chatter.
-pub const CHATTER_GAP_US: u64 = 15_000;
-/// Rollover considered good (typical gaming/mechanical keyboards).
+/// A sweep that is still verifying new keys runs past its timeout until this
+/// long after the latest one, so a slow but steady user is not cut off and
+/// told the keys they had not reached yet are dead.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(30);
+/// Two presses of the same key closer than this are chatter: 25 presses a
+/// second is well beyond the 10-15 taps/s even fast tappers reach on one key.
+pub const CHATTER_GAP_US: u64 = 40_000;
+/// A same-key re-press sooner than this after the key's release is chatter.
+/// Even fast human taps keep a key up for well over 30 ms, while a chattering
+/// switch re-closes within a few ms; a 125 Hz keyboard reports that one or two
+/// 8 ms report intervals later, so the window must span at least two reports.
+pub const CHATTER_RELEASE_GAP_US: u64 = 20_000;
+/// Rollover considered good (typical gaming/mechanical keyboards). It is also
+/// the USB boot-protocol limit, so every keyboard should reach it.
 pub const GOOD_ROLLOVER: usize = 6;
+
+/// Keys a healthy keyboard may simply not have or not send: the ISO and JIS
+/// extra keys (expected from the configured layout, not the hardware), Right
+/// Ctrl (missing on MacBooks and on laptops where the Copilot key replaced it)
+/// and the Windows key (missing on some keyboards, and switched off by the
+/// game-mode lock of many gaming keyboards).
+const KEYS_NOT_ON_EVERY_KEYBOARD: &[KeyCode] = &[
+    KeyCode(86), // ISO key left of Z
+    KeyCode(92), // Henkan
+    KeyCode(93), // Katakana/Hiragana
+    KeyCode(94), // Muhenkan
+    keymap::KEY_RCTRL,
+    keymap::KEY_LSUPER,
+];
+
+/// Whether a press is switch chatter rather than a human re-press, given when
+/// the same key was last pressed and released (kernel timestamps only).
+pub fn is_chatter(
+    last_press: Option<Instant>,
+    last_release: Option<Instant>,
+    press: Instant,
+) -> bool {
+    let gap_us = |since: Option<Instant>| {
+        since.map(|t| press.saturating_duration_since(t).as_micros() as u64)
+    };
+    gap_us(last_release).is_some_and(|us| us < CHATTER_RELEASE_GAP_US)
+        || gap_us(last_press).is_some_and(|us| us < CHATTER_GAP_US)
+}
+
+/// Taps per second between the first and last of `presses` taps spanning `span`.
+pub fn tap_rate(presses: u32, span: Duration) -> Option<f64> {
+    (presses >= 2 && !span.is_zero()).then(|| (presses - 1) as f64 / span.as_secs_f64())
+}
 
 /// Lifecycle state of the auto test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,12 +391,16 @@ pub struct AutoTest {
     /// Keys pressed during the idle step (releases of other keys are the tail
     /// of the gesture that started the test, not phantom input)
     idle_pressed: HashSet<KeyCode>,
-    /// Keys the sweep expects to see
+    /// Keys the caller asked the sweep to check
+    requested_keys: Vec<KeyCode>,
+    /// The requested keys the input source can report: what the sweep waits for
     expected_keys: Vec<KeyCode>,
     /// Keys pressed during the sweep
     seen_keys: HashSet<KeyCode>,
     /// Keys released during the sweep
     released_keys: HashSet<KeyCode>,
+    /// When the sweep last verified an expected key it had not seen before
+    sweep_progress_at: Option<Instant>,
     /// Press timestamps for hold measurement
     press_times: HashMap<KeyCode, Instant>,
     /// Longest completed hold in the hold step
@@ -289,12 +413,16 @@ pub struct AutoTest {
     rollover_peak_at: Option<Instant>,
     /// First press in the rapid-tap step
     rapid_started: Option<Instant>,
+    /// Latest press in the rapid-tap step
+    rapid_last: Option<Instant>,
     /// Presses recorded in the rapid-tap step
     rapid_presses: u32,
     /// Inter-press gaps (µs) recorded in the rapid-tap step
     rapid_intervals: Vec<u64>,
     /// Last press time per key (for same-key gap / chatter detection)
     last_press_by_key: HashMap<KeyCode, Instant>,
+    /// Last release time per key (for release-to-press chatter detection)
+    last_release_by_key: HashMap<KeyCode, Instant>,
     /// Suspiciously short same-key press gaps, per key
     chatter_suspects: HashMap<KeyCode, u32>,
     /// Presses that occurred in any step
@@ -304,7 +432,7 @@ pub struct AutoTest {
 impl AutoTest {
     /// Create an auto test for the given input source.
     pub fn new(input_source: InputSource) -> Self {
-        Self {
+        let mut test = Self {
             input_source,
             state: AutoTestState::Idle,
             steps: Vec::new(),
@@ -315,26 +443,33 @@ impl AutoTest {
             outcomes: Vec::new(),
             phantom_events: Vec::new(),
             idle_pressed: HashSet::new(),
-            expected_keys: expected_keys_for_layout(KeyboardLayout::Ansi),
+            requested_keys: expected_keys_for_layout(KeyboardLayout::Ansi),
+            expected_keys: Vec::new(),
             seen_keys: HashSet::new(),
             released_keys: HashSet::new(),
+            sweep_progress_at: None,
             press_times: HashMap::new(),
             longest_hold: None,
             rollover_pressed: HashSet::new(),
             rollover_max: 0,
             rollover_peak_at: None,
             rapid_started: None,
+            rapid_last: None,
             rapid_presses: 0,
             rapid_intervals: Vec::new(),
             last_press_by_key: HashMap::new(),
+            last_release_by_key: HashMap::new(),
             chatter_suspects: HashMap::new(),
             presses_during_run: 0,
-        }
+        };
+        test.filter_expected_keys();
+        test
     }
 
     /// Change the input source (e.g. once the main loop knows what it got).
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+        self.filter_expected_keys();
     }
 
     /// The input source this test assumes.
@@ -342,14 +477,36 @@ impl AutoTest {
         self.input_source
     }
 
-    /// Set the keys the sweep step expects to see.
+    /// Set the keys the sweep step should check. Keys the input source cannot
+    /// report are left out of the sweep (see [`AutoTest::unreportable_keys`]).
     pub fn set_expected_keys(&mut self, keys: Vec<KeyCode>) {
-        self.expected_keys = keys;
+        self.requested_keys = keys;
+        self.filter_expected_keys();
     }
 
-    /// Keys the sweep step expects.
+    fn filter_expected_keys(&mut self) {
+        let source = self.input_source;
+        self.expected_keys = self
+            .requested_keys
+            .iter()
+            .copied()
+            .filter(|k| source.can_report(*k))
+            .collect();
+    }
+
+    /// Keys the sweep step expects: the requested keys the input source can report.
     pub fn expected_keys(&self) -> &[KeyCode] {
         &self.expected_keys
+    }
+
+    /// Requested keys the sweep cannot check because the input source never
+    /// reports them (e.g. modifiers through a plain terminal).
+    pub fn unreportable_keys(&self) -> Vec<KeyCode> {
+        self.requested_keys
+            .iter()
+            .filter(|k| !self.expected_keys.contains(k))
+            .copied()
+            .collect()
     }
 
     /// Keys verified so far in the sweep step.
@@ -523,15 +680,18 @@ impl AutoTest {
         self.idle_pressed.clear();
         self.seen_keys.clear();
         self.released_keys.clear();
+        self.sweep_progress_at = None;
         self.press_times.clear();
         self.longest_hold = None;
         self.rollover_pressed.clear();
         self.rollover_max = 0;
         self.rollover_peak_at = None;
         self.rapid_started = None;
+        self.rapid_last = None;
         self.rapid_presses = 0;
         self.rapid_intervals.clear();
         self.last_press_by_key.clear();
+        self.last_release_by_key.clear();
         self.chatter_suspects.clear();
         self.presses_during_run = 0;
     }
@@ -553,8 +713,10 @@ impl AutoTest {
             StepKind::Sweep => self.sweep_missing().is_empty(),
             StepKind::Hold => self.longest_hold.is_some(),
             StepKind::Rollover => {
-                // Done once the user has let go after a real attempt.
-                self.rollover_max >= 2
+                // Done once the user has let go after reaching a good peak.
+                // A lower peak keeps the step open (until it times out or is
+                // skipped): the first attempt is often just a few keys.
+                self.rollover_max >= GOOD_ROLLOVER
                     && self.rollover_pressed.is_empty()
                     && self
                         .rollover_peak_at
@@ -569,12 +731,22 @@ impl AutoTest {
             // The idle step "passing" just means the time elapsed; whether it
             // found phantom input is judged in the analysis.
             self.finish_step(step, StepOutcome::Passed, now);
-        } else if elapsed >= step.timeout() {
+        } else if self.step_deadline(step).is_some_and(|d| now >= d) {
             self.finish_step(step, StepOutcome::TimedOut, now);
         } else {
             return false;
         }
         self.state == AutoTestState::Complete
+    }
+
+    /// When the current step times out. The sweep is extended while keys
+    /// keep registering (see [`SWEEP_GRACE`]).
+    fn step_deadline(&self, step: StepKind) -> Option<Instant> {
+        let deadline = self.step_started? + step.timeout();
+        Some(match self.sweep_progress_at {
+            Some(at) if step == StepKind::Sweep => deadline.max(at + SWEEP_GRACE),
+            _ => deadline,
+        })
     }
 
     fn finish_step(&mut self, step: StepKind, outcome: StepOutcome, now: Instant) {
@@ -592,17 +764,44 @@ impl AutoTest {
         let Some(step) = self.current_step() else {
             return;
         };
+        // Evdev events carry kernel timestamps (CLOCK_MONOTONIC, the clock
+        // behind `Instant`). The evdev copy of the keystroke that started the
+        // test is read only after the terminal delivered it, so it predates
+        // the start and is not part of the run.
+        if self.started_at.is_some_and(|start| event.timestamp < start) {
+            return;
+        }
 
-        if event.event_type == KeyEventType::Press {
-            self.presses_during_run += 1;
-            // Same-key gap: a finger cannot re-press a key within a few ms.
-            if let Some(last) = self.last_press_by_key.get(&event.key) {
-                let gap_us = event.timestamp.saturating_duration_since(*last).as_micros() as u64;
-                if gap_us < CHATTER_GAP_US {
+        match event.event_type {
+            KeyEventType::Press => {
+                self.presses_during_run += 1;
+                // Terminal timestamps are taken when the app reads the event
+                // (a burst read together looks simultaneous), so only kernel
+                // timestamps can tell chatter from a fast human re-press.
+                if self.input_source.has_precise_timestamps()
+                    && is_chatter(
+                        self.last_press_by_key.get(&event.key).copied(),
+                        self.last_release_by_key.get(&event.key).copied(),
+                        event.timestamp,
+                    )
+                {
                     *self.chatter_suspects.entry(event.key).or_insert(0) += 1;
                 }
+                self.last_press_by_key.insert(event.key, event.timestamp);
             }
-            self.last_press_by_key.insert(event.key, event.timestamp);
+            KeyEventType::Release => {
+                self.last_release_by_key.insert(event.key, event.timestamp);
+            }
+        }
+
+        // Likewise the evdev copy of the Ctrl+N that skipped the previous
+        // step is read after the skip: it belongs to that step, not this one
+        // (it would start the rapid-tap timer before the user taps).
+        if self
+            .step_started
+            .is_some_and(|start| event.timestamp < start)
+        {
+            return;
         }
 
         match step {
@@ -622,7 +821,9 @@ impl AutoTest {
             }
             StepKind::Sweep => match event.event_type {
                 KeyEventType::Press => {
-                    self.seen_keys.insert(event.key);
+                    if self.seen_keys.insert(event.key) && self.expected_keys.contains(&event.key) {
+                        self.sweep_progress_at = Some(event.timestamp);
+                    }
                 }
                 KeyEventType::Release => {
                     self.released_keys.insert(event.key);
@@ -670,6 +871,7 @@ impl AutoTest {
                         self.rapid_intervals.push(event.delta_us);
                     }
                     self.rapid_presses += 1;
+                    self.rapid_last = Some(event.timestamp);
                 }
             }
         }
@@ -702,15 +904,18 @@ impl AutoTest {
     pub fn analyze(&self, ctx: &AnalysisContext<'_>) -> Vec<Finding> {
         let mut findings = Vec::new();
         let releases = self.input_source.has_release_events();
+        // Whether held modifier keys show up at all (not on the Windows console)
+        let modifiers_reported = self.input_source.can_report(keymap::KEY_LSHIFT);
 
         // --- Input source limitations -------------------------------------
         if !releases {
+            // A limitation of the setup, not of the keyboard.
             findings.push(Finding::new(
-                Severity::Warning,
+                Severity::Info,
                 "Limited capture",
                 "Terminal reports key presses only",
-                "Releases are synthesized, so hold, rollover, stuck-key and bounce \
-                 checks are skipped.",
+                "Releases are synthesized, so hold, rollover, stuck-key, bounce and \
+                 chatter checks are skipped.",
                 if cfg!(target_os = "linux") {
                     "Run with sudo (or add your user to the 'input' group) for raw evdev \
                      access, or use a terminal with the kitty keyboard protocol."
@@ -744,17 +949,10 @@ impl AutoTest {
         // --- Sweep step: dead / unreleased keys ---------------------------
         match self.outcome_of(StepKind::Sweep) {
             Some(StepOutcome::TimedOut) => {
-                let missing = self.sweep_missing();
-                if !missing.is_empty() {
-                    findings.push(Finding::new(
-                        Severity::Critical,
-                        "Dead keys",
-                        format!("{} key(s) never registered", missing.len()),
-                        format!("Keys: {}", key_list(missing.iter().copied(), 12)),
-                        "If you did press them, the switch or its matrix trace is faulty. \
-                         Clean or replace the switch; on laptops check the ribbon cable.",
-                    ));
-                }
+                findings.extend(missing_key_findings(
+                    self.input_source,
+                    &self.sweep_missing(),
+                ));
             }
             Some(StepOutcome::Skipped | StepOutcome::Aborted) => {
                 let missing = self.sweep_missing();
@@ -769,6 +967,22 @@ impl AutoTest {
                 }
             }
             _ => {}
+        }
+        if self.outcome_of(StepKind::Sweep).is_some() {
+            let unreportable = self.unreportable_keys();
+            if !unreportable.is_empty() {
+                findings.push(Finding::new(
+                    Severity::Info,
+                    "Not checked",
+                    format!(
+                        "{} key(s) cannot be checked via {}",
+                        unreportable.len(),
+                        self.input_source.name()
+                    ),
+                    format!("Keys: {}", key_list(unreportable.iter().copied(), 12)),
+                    unreportable_advice(self.input_source),
+                ));
+            }
         }
         if releases && self.step_was_run(StepKind::Sweep) {
             let unreleased: Vec<KeyCode> = self
@@ -801,18 +1015,32 @@ impl AutoTest {
         }
 
         // --- Stuck keys (continuous) --------------------------------------
+        // Only a key that is *still* down past the threshold is stuck; one
+        // that was held long and then released is a normal long hold. The
+        // hold and rollover steps ask the user to hold keys, so keys held
+        // during them are not judged until the step is over.
         if releases {
-            let flagged = ctx.stickiness.flagged_keys();
-            if !flagged.is_empty() {
-                let detail = flagged
+            let threshold = ctx.stickiness.threshold();
+            let mut still_held: Vec<(KeyCode, Duration)> = ctx
+                .stickiness
+                .held_keys()
+                .into_iter()
+                .filter(|(_, held)| *held > threshold)
+                .collect();
+            let holding_on_purpose = matches!(
+                self.current_step(),
+                Some(StepKind::Hold | StepKind::Rollover)
+            );
+            if !still_held.is_empty() && !holding_on_purpose {
+                still_held.sort_by_key(|(_, held)| std::cmp::Reverse(*held));
+                let detail = still_held
                     .iter()
                     .take(6)
-                    .map(|(k, d, n)| {
+                    .map(|(k, held)| {
                         format!(
-                            "{} ({:.1}s, {}x)",
+                            "{} ({:.1}s)",
                             keymap::get_key_info(*k).name,
-                            d.as_secs_f64(),
-                            n
+                            held.as_secs_f64()
                         )
                     })
                     .collect::<Vec<_>>()
@@ -821,19 +1049,48 @@ impl AutoTest {
                     Severity::Critical,
                     "Stuck key",
                     format!(
-                        "{} key(s) stayed pressed past the {} ms threshold",
-                        flagged.len(),
-                        ctx.stickiness.threshold().as_millis()
+                        "{} key(s) held down for more than {} ms",
+                        still_held.len(),
+                        threshold.as_millis()
                     ),
                     detail,
-                    "Remove the keycap and clean the switch. If it persists, the switch \
-                     or controller is faulty.",
+                    "If you are not holding it, the key is stuck: remove the keycap and \
+                     clean the switch. If it persists, the switch or controller is faulty.",
+                ));
+            }
+            let released: Vec<(KeyCode, Duration, u32)> = ctx
+                .stickiness
+                .flagged_keys()
+                .into_iter()
+                .filter(|(k, _, _)| !still_held.iter().any(|(h, _)| h == k))
+                .collect();
+            if !released.is_empty() {
+                let detail = released
+                    .iter()
+                    .take(6)
+                    .map(|(k, _, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding::new(
+                    Severity::Info,
+                    "Long hold",
+                    format!(
+                        "{} key(s) were held past the {} ms threshold, then released",
+                        released.len(),
+                        threshold.as_millis()
+                    ),
+                    detail,
+                    "Normal if you were holding them. If a key stayed down after you let \
+                     go, it is sticking: watch it in the Sticky view.",
                 ));
             }
         }
 
         // --- Bounce / chatter (continuous) --------------------------------
-        if releases {
+        // Both need kernel timestamps: a terminal stamps events when the app
+        // reads them, so a press and release read in one burst look like a
+        // bounce (e.g. over SSH or while the app is busy drawing).
+        if self.input_source.has_precise_timestamps() {
             let bouncy = ctx.hold_release.bouncy_keys();
             if !bouncy.is_empty() {
                 let detail = bouncy
@@ -856,31 +1113,59 @@ impl AutoTest {
                 ));
             }
         }
-        if !self.chatter_suspects.is_empty() {
+        if !self.input_source.has_precise_timestamps() {
+            if self.step_was_run(StepKind::RapidTap) && self.rapid_presses > 0 {
+                findings.push(Finding::new(
+                    Severity::Info,
+                    "Key chatter",
+                    "Chatter and bounce cannot be measured with terminal input",
+                    "Terminal timestamps are taken when the app reads the event, so a \
+                     switch firing twice cannot be told from a fast tap.",
+                    if cfg!(target_os = "linux") {
+                        "Use the evdev input path (sudo or the 'input' group) to check for \
+                         chatter and bounce."
+                    } else {
+                        ""
+                    },
+                ));
+            }
+        } else {
+            // A key already reported as bouncing above has the same fault:
+            // report it once, not as two critical findings.
+            let bouncy: HashSet<KeyCode> = ctx
+                .hold_release
+                .bouncy_keys()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
             let mut suspects: Vec<(KeyCode, u32)> = self
                 .chatter_suspects
                 .iter()
+                .filter(|(k, _)| !bouncy.contains(k))
                 .map(|(k, n)| (*k, *n))
                 .collect();
-            suspects.sort_by_key(|s| std::cmp::Reverse(s.1));
-            let detail = suspects
-                .iter()
-                .take(6)
-                .map(|(k, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
-                .collect::<Vec<_>>()
-                .join(", ");
-            findings.push(Finding::new(
-                Severity::Critical,
-                "Key chatter",
-                format!(
-                    "Repeated presses under {} ms apart on {} key(s)",
-                    CHATTER_GAP_US / 1000,
-                    suspects.len()
-                ),
-                detail,
-                "A finger cannot re-press that fast; the switch is registering one \
-                 press as several. Clean or replace it.",
-            ));
+            if !suspects.is_empty() {
+                suspects.sort_by_key(|s| std::cmp::Reverse(s.1));
+                let detail = suspects
+                    .iter()
+                    .take(6)
+                    .map(|(k, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                findings.push(Finding::new(
+                    Severity::Critical,
+                    "Key chatter",
+                    format!("Too-fast repeated presses on {} key(s)", suspects.len()),
+                    format!(
+                        "{} (re-press under {} ms after release or {} ms after the last press)",
+                        detail,
+                        CHATTER_RELEASE_GAP_US / 1000,
+                        CHATTER_GAP_US / 1000
+                    ),
+                    "A finger cannot re-press that fast; the switch is registering one \
+                     press as several. Clean or replace it.",
+                ));
+            }
         }
 
         // --- Hold step ----------------------------------------------------
@@ -909,50 +1194,26 @@ impl AutoTest {
                         "Expected a single key held for at least {} ms followed by its release.",
                         MIN_HOLD.as_millis()
                     ),
-                    "If you did hold a key, releases are not reaching the app: check \
-                     for remapping software or try the evdev input path.",
+                    if modifiers_reported {
+                        "If you did hold a key, releases are not reaching the app: check \
+                         for remapping software or try the evdev input path."
+                    } else {
+                        "This console does not report Shift, Ctrl, Alt or the Windows key, \
+                         so holding one of them does not count. If you held another key, \
+                         releases are not reaching the app: check for remapping software."
+                    },
                 ));
             }
             _ => {}
         }
 
         // --- Rollover -----------------------------------------------------
-        if self.step_was_run(StepKind::Rollover) {
-            let max = self.rollover_max;
-            let (severity, title) = match max {
-                0 => (
-                    Severity::Info,
-                    "Rollover step produced no key presses".to_string(),
-                ),
-                1..=2 => (
-                    Severity::Critical,
-                    format!("Only {} key(s) could be held at once", max),
-                ),
-                3..=5 => (
-                    Severity::Warning,
-                    format!("Limited rollover: {} keys at once", max),
-                ),
-                n => (Severity::Info, format!("Rollover OK: {} keys at once", n)),
-            };
-            findings.push(Finding::new(
-                severity,
-                "Rollover",
-                title,
-                if max > 0 {
-                    format!(
-                        "Peak of {} simultaneous keys during the rollover step.",
-                        max
-                    )
-                } else {
-                    String::new()
-                },
-                if max < GOOD_ROLLOVER && max > 0 {
-                    "Low rollover blocks key combinations in games and shortcuts. Some \
-                     keyboards only reach full rollover over USB, not Bluetooth."
-                } else {
-                    ""
-                },
-            ));
+        if let Some(finding) = rollover_finding(
+            self.outcome_of(StepKind::Rollover),
+            self.rollover_max,
+            modifiers_reported,
+        ) {
+            findings.push(finding);
         }
         if ctx.rollover.ghost_count() > 0 {
             findings.push(Finding::new(
@@ -1011,17 +1272,32 @@ impl AutoTest {
             ));
         }
         if self.step_was_run(StepKind::RapidTap) && self.rapid_presses > 0 {
-            let secs = RAPID_TAP_DURATION.as_secs_f64();
+            let span = match (self.rapid_started, self.rapid_last) {
+                (Some(first), Some(last)) => last.saturating_duration_since(first),
+                _ => Duration::ZERO,
+            };
+            let title = match tap_rate(self.rapid_presses, span) {
+                Some(rate) => format!(
+                    "{} presses in {:.1}s ({:.1} per second)",
+                    self.rapid_presses,
+                    span.as_secs_f64(),
+                    rate
+                ),
+                None => format!(
+                    "{} press(es), too few to measure a rate",
+                    self.rapid_presses
+                ),
+            };
             findings.push(Finding::new(
                 Severity::Info,
                 "Rapid tap",
-                format!(
-                    "{} presses in {:.0}s ({:.1} per second)",
-                    self.rapid_presses,
-                    secs,
-                    self.rapid_presses as f64 / secs
-                ),
-                "",
+                title,
+                if releases {
+                    ""
+                } else {
+                    "Press-only terminals merge quick same-key taps, so fast tapping is \
+                     undercounted."
+                },
                 "",
             ));
         }
@@ -1138,7 +1414,11 @@ impl AutoTest {
                     step.instruction(),
                     ResultStatus::Warning,
                 ));
-                let remaining = step.timeout().saturating_sub(self.step_elapsed()).as_secs();
+                let remaining = self
+                    .step_deadline(step)
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default()
+                    .as_secs();
                 rows.push(TestResult::info(
                     "Progress",
                     format!(
@@ -1164,6 +1444,20 @@ impl AutoTest {
                                 "Still missing",
                                 key_list(missing.iter().copied(), 14),
                             ));
+                            rows.push(TestResult::info(
+                                "No such key?",
+                                "Press Ctrl+N if your keyboard lacks a listed key",
+                            ));
+                        }
+                        let unreportable = self.unreportable_keys();
+                        if !unreportable.is_empty() {
+                            rows.push(TestResult::info(
+                                "Not checkable",
+                                format!(
+                                    "{} (this input source cannot report them)",
+                                    key_list(unreportable.iter().copied(), 8)
+                                ),
+                            ));
                         }
                     }
                     StepKind::Hold => rows.push(TestResult::info(
@@ -1178,9 +1472,10 @@ impl AutoTest {
                     StepKind::Rollover => rows.push(TestResult::info(
                         "Keys held",
                         format!(
-                            "{} now, peak {}",
+                            "{} now, peak {} (step ends at {}+ once all are released)",
                             self.rollover_pressed.len(),
-                            self.rollover_max
+                            self.rollover_max,
+                            GOOD_ROLLOVER
                         ),
                     )),
                     StepKind::RapidTap => rows.push(TestResult::info(
@@ -1265,6 +1560,176 @@ pub fn expected_keys_for_layout(layout: KeyboardLayout) -> Vec<KeyCode> {
     let mut seen = HashSet::new();
     keys.retain(|k| seen.insert(*k));
     keys
+}
+
+/// Findings for keys that never registered in a sweep that timed out.
+///
+/// Only evdev sees every key the keyboard sends, so only there is a missing
+/// key evidence of a dead switch. Even then some keys are not on every
+/// keyboard. Through a terminal a key may also just not be passed on.
+fn missing_key_findings(source: InputSource, missing: &[KeyCode]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let keys = |list: &[KeyCode]| format!("Keys: {}", key_list(list.iter().copied(), 12));
+    if source == InputSource::Evdev {
+        let (optional, required): (Vec<KeyCode>, Vec<KeyCode>) = missing
+            .iter()
+            .partition(|k| KEYS_NOT_ON_EVERY_KEYBOARD.contains(k));
+        if !required.is_empty() {
+            findings.push(Finding::new(
+                Severity::Critical,
+                "Dead keys",
+                format!("{} key(s) never registered", required.len()),
+                keys(&required),
+                "If you did press them, the switch or its matrix trace is faulty. \
+                 Clean or replace the switch; on laptops check the ribbon cable.",
+            ));
+        }
+        if !optional.is_empty() {
+            findings.push(Finding::new(
+                Severity::Warning,
+                "Not registered",
+                format!(
+                    "{} key(s) that not every keyboard has never registered",
+                    optional.len()
+                ),
+                keys(&optional),
+                "Many laptops have no Right Ctrl, gaming keyboards switch the Windows key \
+                 off in game mode, and ISO/JIS-only keys depend on the physical layout. \
+                 If your keyboard has them and you pressed them, the switch is faulty.",
+            ));
+        }
+        return findings;
+    }
+
+    // Letters and the named keys reach the terminal on any Latin layout;
+    // digits and punctuation type other characters on non-US layouts, and
+    // the desktop may keep modifier keys to itself.
+    let (definite, uncertain): (Vec<KeyCode>, Vec<KeyCode>) =
+        missing.iter().partition(|k| reported_on_any_layout(**k));
+    let better = if cfg!(target_os = "linux") {
+        " Run with sudo (or join the 'input' group) so evdev can tell for certain."
+    } else {
+        ""
+    };
+    if !definite.is_empty() {
+        findings.push(Finding::new(
+            Severity::Warning,
+            "Not registered",
+            format!(
+                "{} key(s) never registered through the terminal",
+                definite.len()
+            ),
+            keys(&definite),
+            format!(
+                "If you pressed them, the keys may be dead (unless a non-Latin layout such \
+                 as Cyrillic was active); check them in a text editor.{}",
+                better
+            ),
+        ));
+    }
+    if !uncertain.is_empty() {
+        findings.push(Finding::new(
+            Severity::Info,
+            "Not registered",
+            format!(
+                "{} key(s) never registered through the terminal",
+                uncertain.len()
+            ),
+            keys(&uncertain),
+            format!(
+                "Not evidence of a fault: on non-US layouts these keys type characters \
+                 the terminal cannot map back, the desktop may keep modifier keys to \
+                 itself, or they were not pressed.{}",
+                better
+            ),
+        ));
+    }
+    findings
+}
+
+/// Keys a terminal reports the same way on any Latin layout: the letters
+/// (permuted on QWERTZ/AZERTY, but all present) and the named keys.
+fn reported_on_any_layout(key: KeyCode) -> bool {
+    matches!(
+        key.0,
+        1 | 14 | 15 | 28 | 57 | 16..=25 | 30..=38 | 44..=50 | 103 | 105 | 106 | 108
+    )
+}
+
+/// What to do about keys the input source cannot report.
+fn unreportable_advice(source: InputSource) -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Run with sudo (or add your user to the 'input' group) so evdev can check them."
+    } else if source == InputSource::TerminalPressOnly {
+        "A terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, \
+         Alacritty 0.13+) reports modifier keys."
+    } else {
+        "This console does not report them; check them in another application."
+    }
+}
+
+/// Judge the rollover step from how it ended and its peak.
+///
+/// The step only passes at [`GOOD_ROLLOVER`] keys. A lower peak at the timeout
+/// may be the keyboard's limit or just fewer keys pressed, which the app
+/// cannot tell apart, so it is worded as a condition, never as a verdict.
+/// Without `modifiers_reported` held modifier keys were not counted.
+fn rollover_finding(
+    outcome: Option<StepOutcome>,
+    max: usize,
+    modifiers_reported: bool,
+) -> Option<Finding> {
+    let peak = format!(
+        "Peak of {} simultaneous keys during the rollover step.",
+        max
+    );
+    match outcome {
+        Some(StepOutcome::Passed) | Some(StepOutcome::TimedOut) if max >= GOOD_ROLLOVER => {
+            Some(Finding::new(
+                Severity::Info,
+                "Rollover",
+                format!("Rollover OK: {} keys at once", max),
+                peak,
+                "",
+            ))
+        }
+        Some(StepOutcome::TimedOut) if max == 0 => Some(Finding::new(
+            Severity::Info,
+            "Rollover",
+            "Rollover step produced no key presses",
+            "",
+            "Run the auto test again to measure rollover.",
+        )),
+        Some(StepOutcome::TimedOut) => Some(Finding::new(
+            Severity::Warning,
+            "Rollover",
+            format!("No more than {} key(s) registered at once", max),
+            if modifiers_reported {
+                peak
+            } else {
+                format!(
+                    "{} Shift, Ctrl, Alt and the Windows key are not reported by this \
+                     console and were not counted.",
+                    peak
+                )
+            },
+            format!(
+                "If you held more keys than that, the keyboard limits rollover, which \
+                 blocks key combinations in games and shortcuts (some keyboards only \
+                 reach full rollover over USB). If you held fewer, this is not a fault: \
+                 run again and hold {} or more keys.",
+                GOOD_ROLLOVER
+            ),
+        )),
+        Some(StepOutcome::Skipped | StepOutcome::Aborted) if max > 0 => Some(Finding::new(
+            Severity::Info,
+            "Rollover",
+            format!("Peak of {} key(s) at once (step not finished)", max),
+            "Rollover is only judged when the step runs to the end.",
+            "",
+        )),
+        _ => None,
+    }
 }
 
 /// Comma-separated key names, truncated with a count of the remainder.
@@ -1436,13 +1901,15 @@ mod tests {
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION); // -> Sweep
         assert_eq!(t.current_step(), Some(StepKind::Sweep));
-        t.process_event(&press(KeyCode(30)));
-        t.process_event(&release(KeyCode(30)));
+        let s = t0 + IDLE_DURATION + Duration::from_millis(200);
+        t.process_event(&evt(30, KeyEventType::Press, s, 0));
+        t.process_event(&evt(30, KeyEventType::Release, s, 0));
         assert!(!t.tick_at(t0 + Duration::from_secs(4)));
         assert_eq!(t.sweep_seen_count(), 1);
         assert_eq!(t.sweep_missing(), vec![KeyCode(31)]);
-        t.process_event(&press(KeyCode(31)));
-        t.process_event(&release(KeyCode(31)));
+        let s = t0 + Duration::from_secs(4);
+        t.process_event(&evt(31, KeyEventType::Press, s, 0));
+        t.process_event(&evt(31, KeyEventType::Release, s, 0));
         assert!(!t.tick_at(t0 + Duration::from_secs(5)));
         assert_eq!(t.current_step(), Some(StepKind::Hold));
     }
@@ -1454,8 +1921,9 @@ mod tests {
         let t0 = Instant::now();
         t.start_at(t0);
         t.tick_at(t0 + IDLE_DURATION);
-        t.process_event(&press(KeyCode(30)));
-        t.process_event(&release(KeyCode(30)));
+        let s = t0 + Duration::from_secs(4);
+        t.process_event(&evt(30, KeyEventType::Press, s, 0));
+        t.process_event(&evt(30, KeyEventType::Release, s, 0));
         // Time out the sweep
         t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
         assert_eq!(t.current_step(), Some(StepKind::Hold));
@@ -1469,6 +1937,43 @@ mod tests {
         assert_eq!(dead.severity, Severity::Critical);
         assert!(dead.title.starts_with("2 key(s)"));
         assert!(dead.detail.contains('S') && dead.detail.contains('D'));
+    }
+
+    #[test]
+    fn slow_but_steady_sweep_is_not_cut_off() {
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(31), KeyCode(32)]);
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION); // -> Sweep
+        let ss = t0 + IDLE_DURATION;
+        let secs = Duration::from_secs;
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(60), 0));
+        t.process_event(&evt(31, KeyEventType::Press, ss + secs(110), 0));
+        // Past the 120 s timeout, but the user is still finding keys
+        assert!(!t.tick_at(ss + secs(130)));
+        assert_eq!(t.current_step(), Some(StepKind::Sweep));
+        t.process_event(&evt(32, KeyEventType::Press, ss + secs(138), 0));
+        t.tick_at(ss + secs(139));
+        assert_eq!(t.outcome_of(StepKind::Sweep), Some(StepOutcome::Passed));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Dead keys"));
+
+        // A sweep that stops making progress still times out: pressing a key
+        // that was already verified does not extend it
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(31), KeyCode(32)]);
+        t.start_at(t0);
+        t.tick_at(ss);
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(110), 0));
+        t.process_event(&evt(30, KeyEventType::Press, ss + secs(125), 0));
+        assert!(!t.tick_at(ss + secs(139)));
+        t.tick_at(ss + secs(140));
+        assert_eq!(t.outcome_of(StepKind::Sweep), Some(StepOutcome::TimedOut));
+        let findings = t.analyze(&ctx!(parts));
+        let dead = findings.iter().find(|f| f.category == "Dead keys").unwrap();
+        assert!(dead.title.starts_with("2 key(s)"), "{}", dead.title);
     }
 
     #[test]
@@ -1521,34 +2026,35 @@ mod tests {
         assert_eq!(t.current_step(), Some(StepKind::Rollover));
     }
 
-    #[test]
-    fn rollover_step_records_peak_and_completes_after_release() {
-        let mut t = AutoTest::new(InputSource::Evdev);
+    /// Start a run and skip ahead to `step`, with no keys expected in the sweep.
+    fn run_at_step(source: InputSource, step: StepKind) -> (AutoTest, Instant) {
+        let mut t = AutoTest::new(source);
         t.set_expected_keys(vec![]);
         let t0 = Instant::now();
         t.start_at(t0);
-        t.tick_at(t0 + IDLE_DURATION);
-        t.tick_at(t0 + IDLE_DURATION);
-        t.skip_step_at(t0 + IDLE_DURATION); // skip hold
-        assert_eq!(t.current_step(), Some(StepKind::Rollover));
+        while t.current_step() != Some(step) {
+            t.skip_step_at(t0);
+        }
+        (t, t0)
+    }
 
+    /// Press `keys` together at `at`, then release them all 500 ms later.
+    fn chord(t: &mut AutoTest, keys: &[u16], at: Instant) {
+        for (i, k) in keys.iter().enumerate() {
+            let when = at + Duration::from_millis(i as u64 * 10);
+            t.process_event(&evt(*k, KeyEventType::Press, when, 0));
+        }
+        for (i, k) in keys.iter().enumerate() {
+            let when = at + Duration::from_millis(500 + i as u64 * 10);
+            t.process_event(&evt(*k, KeyEventType::Release, when, 0));
+        }
+    }
+
+    #[test]
+    fn rollover_step_records_peak_and_completes_after_release() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
         let s = t0 + Duration::from_secs(4);
-        for (i, k) in [30u16, 31, 32, 33].iter().enumerate() {
-            t.process_event(&evt(
-                *k,
-                KeyEventType::Press,
-                s + Duration::from_millis(i as u64 * 10),
-                0,
-            ));
-        }
-        for (i, k) in [30u16, 31, 32, 33].iter().enumerate() {
-            t.process_event(&evt(
-                *k,
-                KeyEventType::Release,
-                s + Duration::from_millis(500 + i as u64 * 10),
-                0,
-            ));
-        }
+        chord(&mut t, &[30, 31, 32, 33, 34, 35, 36], s);
         // Not yet: needs 1s after the peak
         assert!(!t.tick_at(s + Duration::from_millis(600)));
         assert_eq!(t.current_step(), Some(StepKind::Rollover));
@@ -1561,12 +2067,72 @@ mod tests {
             .iter()
             .find(|f| f.category == "Rollover")
             .expect("rollover finding");
-        assert_eq!(r.severity, Severity::Warning);
-        assert!(r.title.contains("4 keys"));
+        assert_eq!(r.severity, Severity::Info);
+        assert!(r.title.contains("7 keys"), "{}", r.title);
     }
 
     #[test]
-    fn rapid_tap_detects_chatter_and_completes_sequence() {
+    fn rollover_low_first_attempt_keeps_the_step_open() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
+        let s = t0 + Duration::from_secs(4);
+        // A tentative first try with two keys, then a pause
+        chord(&mut t, &[30, 31], s);
+        assert!(!t.tick_at(s + Duration::from_secs(3)));
+        assert_eq!(t.current_step(), Some(StepKind::Rollover));
+        // The real attempt
+        let s = s + Duration::from_secs(4);
+        chord(&mut t, &[30, 31, 32, 33, 34, 35], s);
+        assert!(!t.tick_at(s + Duration::from_secs(2)));
+        assert_eq!(t.current_step(), Some(StepKind::RapidTap));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+    }
+
+    #[test]
+    fn rollover_timeout_with_low_peak_is_a_conditional_warning() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
+        chord(&mut t, &[30, 31, 32, 33], t0 + Duration::from_secs(1));
+        t.tick_at(t0 + StepKind::Rollover.timeout());
+        assert_eq!(
+            t.outcomes().last(),
+            Some(&(StepKind::Rollover, StepOutcome::TimedOut))
+        );
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let r = findings.iter().find(|f| f.category == "Rollover").unwrap();
+        // Could be the keyboard or the user: worth a look, never "Critical",
+        // and worded so pressing few keys is not called a keyboard limit.
+        assert_eq!(r.severity, Severity::Warning);
+        assert!(r.title.contains("4 key(s)"), "{}", r.title);
+        assert!(r.advice.contains("If you held fewer, this is not a fault"));
+    }
+
+    #[test]
+    fn rollover_low_peak_says_when_modifiers_were_not_counted() {
+        // The Windows console never reports Shift/Ctrl/Alt/Win, so a user
+        // holding them with letters sees a lower count than they pressed
+        let r = rollover_finding(Some(StepOutcome::TimedOut), 3, false).unwrap();
+        assert_eq!(r.severity, Severity::Warning);
+        assert!(r.detail.contains("were not counted"), "{}", r.detail);
+        let r = rollover_finding(Some(StepOutcome::TimedOut), 3, true).unwrap();
+        assert!(!r.detail.contains("not counted"), "{}", r.detail);
+    }
+
+    #[test]
+    fn rollover_skipped_step_is_not_judged() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
+        chord(&mut t, &[30, 31], t0 + Duration::from_secs(1));
+        t.skip_step_at(t0 + Duration::from_secs(3));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let r = findings.iter().find(|f| f.category == "Rollover").unwrap();
+        assert_eq!(r.severity, Severity::Info);
+        assert!(r.title.contains("not finished"));
+    }
+
+    #[test]
+    fn rapid_tap_in_press_only_terminal_completes_without_judging_chatter() {
         let mut t = AutoTest::new(InputSource::TerminalPressOnly);
         t.set_expected_keys(vec![]);
         let t0 = Instant::now();
@@ -1593,16 +2159,232 @@ mod tests {
 
         let parts = ctx_parts();
         let findings = t.analyze(&ctx!(parts));
+        // Read-time timestamps cannot show chatter: say so, do not guess
+        let chatter = findings
+            .iter()
+            .find(|f| f.category == "Key chatter")
+            .expect("chatter finding");
+        assert_eq!(chatter.severity, Severity::Info);
+        assert!(chatter.title.contains("cannot be measured"));
+        // Press-only terminals get the capture limitation, as information
+        let limited = findings
+            .iter()
+            .find(|f| f.category == "Limited capture")
+            .expect("limited capture finding");
+        assert_eq!(limited.severity, Severity::Info);
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+        // Sorted most severe first
+        assert!(findings.windows(2).all(|w| w[0].severity >= w[1].severity));
+    }
+
+    #[test]
+    fn rapid_tap_chatter_detected_with_evdev() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let s = t0 + Duration::from_secs(1);
+        // Taps every 100 ms; on the fifth, the switch re-closes 6 ms after
+        // opening (one press registered twice)
+        for i in 0..10u64 {
+            let at = s + Duration::from_millis(i * 100);
+            t.process_event(&evt(30, KeyEventType::Press, at, 0));
+            t.process_event(&evt(
+                30,
+                KeyEventType::Release,
+                at + Duration::from_millis(40),
+                0,
+            ));
+            if i == 4 {
+                let again = at + Duration::from_millis(46);
+                t.process_event(&evt(30, KeyEventType::Press, again, 0));
+                t.process_event(&evt(
+                    30,
+                    KeyEventType::Release,
+                    again + Duration::from_millis(8),
+                    0,
+                ));
+            }
+        }
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
         let chatter = findings
             .iter()
             .find(|f| f.category == "Key chatter")
             .expect("chatter finding");
         assert_eq!(chatter.severity, Severity::Critical);
-        assert!(chatter.detail.contains("A (1x)"));
-        // Press-only terminals get the capture limitation warning
-        assert!(findings.iter().any(|f| f.category == "Limited capture"));
-        // Sorted most severe first
-        assert!(findings.windows(2).all(|w| w[0].severity >= w[1].severity));
+        assert!(chatter.detail.contains("A (1x)"), "{}", chatter.detail);
+    }
+
+    #[test]
+    fn bouncing_key_is_reported_once() {
+        // A 1 ms bounce is both a bounce (bounce test) and a too-fast re-press
+        // (chatter check): one fault, so the key is listed in one finding
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        let ms = Duration::from_millis;
+        for e in [
+            evt(30, KeyEventType::Press, s, 0),
+            evt(30, KeyEventType::Release, s + ms(1), 0),
+            evt(30, KeyEventType::Press, s + ms(2), 0),
+            evt(30, KeyEventType::Release, s + ms(90), 0),
+        ] {
+            t.process_event(&e);
+            parts.1.process_event(&e);
+        }
+        // Another key that only the chatter check sees
+        t.process_event(&evt(31, KeyEventType::Press, s + ms(200), 0));
+        t.process_event(&evt(31, KeyEventType::Release, s + ms(240), 0));
+        t.process_event(&evt(31, KeyEventType::Press, s + ms(256), 0));
+        let findings = t.analyze(&ctx!(parts));
+        let lists_a = findings.iter().filter(|f| f.detail.contains("A (")).count();
+        assert_eq!(lists_a, 1, "{:?}", findings);
+        let chatter = findings
+            .iter()
+            .find(|f| f.category == "Key chatter")
+            .unwrap();
+        assert!(chatter.detail.starts_with("S (1x)"), "{}", chatter.detail);
+    }
+
+    #[test]
+    fn chatter_on_125hz_keyboard_is_detected() {
+        // A 125 Hz keyboard reports every 8 ms: a release and the bounce that
+        // re-closes the switch land two reports (16 ms) apart. The press-to-
+        // press gap (56 ms) alone would not show it.
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let s = t0 + Duration::from_secs(1);
+        t.process_event(&evt(30, KeyEventType::Press, s, 0));
+        t.process_event(&evt(
+            30,
+            KeyEventType::Release,
+            s + Duration::from_millis(40),
+            0,
+        ));
+        t.process_event(&evt(
+            30,
+            KeyEventType::Press,
+            s + Duration::from_millis(56),
+            0,
+        ));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.category == "Key chatter" && f.severity == Severity::Critical),
+            "{:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn fast_human_tapping_is_not_chatter() {
+        // 12 taps/s, about as fast as one finger goes, quantized to a 125 Hz
+        // grid (88 ms period, 40 ms down, 48 ms up), plus a quick double-tap
+        // on another key (key up 32 ms, presses 72 ms apart)
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let s = t0 + Duration::from_secs(1);
+        for i in 0..40u64 {
+            let at = s + Duration::from_millis(i * 88);
+            t.process_event(&evt(30, KeyEventType::Press, at, 0));
+            t.process_event(&evt(
+                30,
+                KeyEventType::Release,
+                at + Duration::from_millis(40),
+                0,
+            ));
+        }
+        let d = s + Duration::from_secs(5);
+        t.process_event(&evt(31, KeyEventType::Press, d, 0));
+        t.process_event(&evt(
+            31,
+            KeyEventType::Release,
+            d + Duration::from_millis(40),
+            0,
+        ));
+        t.process_event(&evt(
+            31,
+            KeyEventType::Press,
+            d + Duration::from_millis(72),
+            0,
+        ));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            !findings.iter().any(|f| f.category == "Key chatter"),
+            "{:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn chatter_not_judged_from_terminal_timestamps() {
+        // A burst read in one go gets near-identical read-time timestamps
+        let (mut t, t0) = run_at_step(InputSource::TerminalWithRelease, StepKind::RapidTap);
+        let s = t0 + Duration::from_secs(1);
+        for i in 0..4u64 {
+            let at = s + Duration::from_micros(i * 300);
+            t.process_event(&evt(30, KeyEventType::Press, at, 0));
+            t.process_event(&evt(
+                30,
+                KeyEventType::Release,
+                at + Duration::from_micros(100),
+                0,
+            ));
+        }
+        t.abort();
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let chatter = findings
+            .iter()
+            .find(|f| f.category == "Key chatter")
+            .unwrap();
+        assert_eq!(chatter.severity, Severity::Info);
+    }
+
+    #[test]
+    fn is_chatter_windows() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Re-press 19 ms after release: chatter; 20 ms: not by that rule
+        assert!(is_chatter(Some(t0), Some(ms(41)), ms(60)));
+        assert!(!is_chatter(Some(t0), Some(ms(40)), ms(60)));
+        // Press-to-press under 40 ms: chatter even with a slow release gap
+        assert!(is_chatter(Some(t0), Some(ms(5)), ms(39)));
+        assert!(!is_chatter(Some(t0), Some(ms(10)), ms(40)));
+        // First press of a key is never chatter
+        assert!(!is_chatter(None, None, t0));
+    }
+
+    #[test]
+    fn tap_rate_uses_the_measured_span() {
+        assert_eq!(tap_rate(11, Duration::from_secs(1)), Some(10.0));
+        assert_eq!(tap_rate(1, Duration::from_secs(1)), None);
+        assert_eq!(tap_rate(5, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn rapid_tap_rate_reflects_an_aborted_step() {
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let s = t0 + Duration::from_secs(1);
+        // 11 presses 100 ms apart (10/s for one second), then abort
+        for i in 0..11u64 {
+            let at = s + Duration::from_millis(i * 100);
+            t.process_event(&evt(30, KeyEventType::Press, at, 0));
+            t.process_event(&evt(
+                30,
+                KeyEventType::Release,
+                at + Duration::from_millis(40),
+                0,
+            ));
+        }
+        t.abort();
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let f = findings.iter().find(|f| f.category == "Rapid tap").unwrap();
+        assert!(
+            f.title.contains("11 presses in 1.0s (10.0 per second)"),
+            "{}",
+            f.title
+        );
     }
 
     #[test]
@@ -1674,6 +2456,10 @@ mod tests {
         assert!(findings
             .iter()
             .any(|f| f.category == "Rollover" && f.title.contains("7 keys")));
+        // 20 presses 70 ms apart: 19 intervals over 1.33 s
+        assert!(findings
+            .iter()
+            .any(|f| f.category == "Rapid tap" && f.title.contains("14.3 per second")));
     }
 
     #[test]
@@ -1697,6 +2483,12 @@ mod tests {
         let t = AutoTest::new(InputSource::Evdev);
         let findings = t.analyze(&ctx!(parts));
         assert!(findings.iter().any(|f| f.category == "Switch bounce"));
+
+        // The same burst from a terminal is read-time stamps, not a bounce
+        let t = AutoTest::new(InputSource::TerminalWithRelease);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Switch bounce"));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
     }
 
     #[test]
@@ -1785,6 +2577,307 @@ mod tests {
         assert!(rows[2].value.contains("advice"));
         assert!(f.is_issue());
         assert!(!Finding::new(Severity::Info, "x", "", "", "").is_issue());
+    }
+
+    #[test]
+    fn start_keystroke_read_after_start_is_not_phantom() {
+        // With evdev the 'A' that started the test is read on the next loop
+        // iteration, but its kernel timestamp predates the start.
+        let mut t = AutoTest::new(InputSource::Evdev);
+        let pressed = Instant::now();
+        let t0 = pressed + Duration::from_millis(5);
+        t.start_at(t0);
+        t.process_event(&evt(42, KeyEventType::Press, pressed, 0));
+        t.process_event(&evt(30, KeyEventType::Press, pressed, 0));
+        t.process_event(&evt(
+            30,
+            KeyEventType::Release,
+            t0 + Duration::from_millis(80),
+            0,
+        ));
+        t.process_event(&evt(
+            42,
+            KeyEventType::Release,
+            t0 + Duration::from_millis(90),
+            0,
+        ));
+        t.tick_at(t0 + IDLE_DURATION);
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            !findings.iter().any(|f| f.category == "Phantom input"),
+            "{:?}",
+            findings
+        );
+
+        // A press that really happens during the idle step is still caught
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.start_at(t0);
+        t.process_event(&evt(
+            31,
+            KeyEventType::Press,
+            t0 + Duration::from_secs(1),
+            0,
+        ));
+        t.tick_at(t0 + IDLE_DURATION);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(findings.iter().any(|f| f.category == "Phantom input"));
+    }
+
+    #[test]
+    fn skip_keystroke_read_after_the_skip_stays_out_of_the_next_step() {
+        // With evdev the Ctrl+N that skipped the rollover step is read on the
+        // next loop iteration. Its presses predate the rapid-tap step: they
+        // must not start its timer or count as taps.
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::Rollover);
+        let skip = t0 + Duration::from_secs(10);
+        t.skip_step_at(skip);
+        assert_eq!(t.current_step(), Some(StepKind::RapidTap));
+        let ms = Duration::from_millis;
+        t.process_event(&evt(29, KeyEventType::Press, skip - ms(60), 0));
+        t.process_event(&evt(49, KeyEventType::Press, skip - ms(20), 0));
+        t.process_event(&evt(49, KeyEventType::Release, skip + ms(50), 0));
+        t.process_event(&evt(29, KeyEventType::Release, skip + ms(80), 0));
+        // The user reads the instruction, then taps 11 times in one second
+        let s = skip + Duration::from_secs(3);
+        assert!(!t.tick_at(s));
+        for i in 0..11u64 {
+            t.process_event(&evt(30, KeyEventType::Press, s + ms(i * 100), 0));
+            t.process_event(&evt(30, KeyEventType::Release, s + ms(i * 100 + 40), 0));
+        }
+        // The 5 s window runs from the first tap
+        assert!(!t.tick_at(s + Duration::from_secs(2)));
+        assert!(t.tick_at(s + RAPID_TAP_DURATION));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let f = findings.iter().find(|f| f.category == "Rapid tap").unwrap();
+        assert!(
+            f.title.contains("11 presses in 1.0s (10.0 per second)"),
+            "{}",
+            f.title
+        );
+    }
+
+    #[test]
+    fn expected_keys_follow_what_the_input_source_reports() {
+        let ansi = expected_keys_for_layout(KeyboardLayout::Ansi);
+        let modifiers_and_caps: Vec<KeyCode> = ansi
+            .iter()
+            .copied()
+            .filter(|k| keymap::is_modifier(*k) || *k == KeyCode(58))
+            .collect();
+        assert_eq!(modifiers_and_caps.len(), 8);
+
+        // Evdev sees everything
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(ansi.clone());
+        assert_eq!(t.expected_keys(), ansi.as_slice());
+        assert!(t.unreportable_keys().is_empty());
+
+        // A legacy terminal (and the Windows console) never reports keys
+        // that type nothing; App sets the keys before the source
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(ansi.clone());
+        t.set_input_source(InputSource::TerminalPressOnly);
+        for k in &modifiers_and_caps {
+            assert!(!t.expected_keys().contains(k), "{:?}", k);
+        }
+        assert_eq!(t.unreportable_keys(), modifiers_and_caps);
+        assert_eq!(t.expected_keys().len(), ansi.len() - 8);
+        for k in [30u16, 57, 28, 14, 15, 41, 43, 103, 105, 106, 108] {
+            assert!(t.expected_keys().contains(&KeyCode(k)), "{}", k);
+        }
+
+        // The kitty protocol reports modifiers and CapsLock too
+        for k in &modifiers_and_caps {
+            assert!(terminal_can_report(*k, true), "{:?}", k);
+            assert!(!terminal_can_report(*k, false), "{:?}", k);
+        }
+
+        // No terminal can identify the ISO and JIS extra keys
+        for k in [86u16, 92, 93, 94] {
+            assert!(!terminal_can_report(KeyCode(k), true), "{}", k);
+            assert!(InputSource::Evdev.can_report(KeyCode(k)));
+        }
+        let mut t = AutoTest::new(InputSource::TerminalWithRelease);
+        t.set_expected_keys(expected_keys_for_layout(KeyboardLayout::Iso));
+        assert!(!t.expected_keys().contains(&KeyCode(86)));
+        assert!(t.unreportable_keys().contains(&KeyCode(86)));
+    }
+
+    #[test]
+    fn terminal_sweep_completes_without_unreportable_keys() {
+        let mut t = AutoTest::new(InputSource::TerminalPressOnly);
+        t.set_expected_keys(expected_keys_for_layout(KeyboardLayout::Ansi));
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION);
+        for k in t.expected_keys().to_vec() {
+            t.process_event(&evt(
+                k.0,
+                KeyEventType::Press,
+                t0 + Duration::from_secs(4),
+                0,
+            ));
+        }
+        t.tick_at(t0 + Duration::from_secs(5));
+        assert_eq!(t.current_step(), Some(StepKind::RapidTap));
+        t.skip_step_at(t0 + Duration::from_secs(6));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+        // The keys that could not be checked are listed, not passed silently
+        let f = findings
+            .iter()
+            .find(|f| f.category == "Not checked")
+            .unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.detail.contains("LeftShift") && f.detail.contains("CapsLock"));
+    }
+
+    #[test]
+    fn terminal_sweep_timeout_is_never_called_dead() {
+        let mut t = AutoTest::new(InputSource::TerminalPressOnly);
+        // A letter, a punctuation key (another character on non-US layouts)
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(39), KeyCode(31)]);
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION);
+        t.process_event(&evt(
+            31,
+            KeyEventType::Press,
+            t0 + Duration::from_secs(4),
+            0,
+        ));
+        t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
+        assert_eq!(t.outcome_of(StepKind::Sweep), Some(StepOutcome::TimedOut));
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            !findings.iter().any(|f| f.severity == Severity::Critical),
+            "{:?}",
+            findings
+        );
+        let letters = findings
+            .iter()
+            .find(|f| f.category == "Not registered" && f.severity == Severity::Warning)
+            .expect("letter warning");
+        assert_eq!(letters.detail, "Keys: A");
+        let punct = findings
+            .iter()
+            .find(|f| f.category == "Not registered" && f.severity == Severity::Info)
+            .expect("punctuation info");
+        assert_eq!(punct.detail, "Keys: Semicolon");
+    }
+
+    #[test]
+    fn evdev_sweep_timeout_separates_keys_not_every_keyboard_has() {
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(97), KeyCode(86), KeyCode(125)]);
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION);
+        t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
+        let parts = ctx_parts();
+        let findings = t.analyze(&ctx!(parts));
+        let dead = findings.iter().find(|f| f.category == "Dead keys").unwrap();
+        assert_eq!(dead.severity, Severity::Critical);
+        assert_eq!(dead.detail, "Keys: A");
+        let optional = findings
+            .iter()
+            .find(|f| f.category == "Not registered")
+            .unwrap();
+        assert_eq!(optional.severity, Severity::Warning);
+        assert_eq!(optional.detail, "Keys: IsoBackslash, LeftMeta, RightCtrl");
+
+        // A healthy laptop without Right Ctrl, or a gaming keyboard with its
+        // Windows key locked: no critical finding
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(30), KeyCode(97), KeyCode(125)]);
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION);
+        t.process_event(&evt(
+            30,
+            KeyEventType::Press,
+            t0 + Duration::from_secs(4),
+            0,
+        ));
+        t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            !findings.iter().any(|f| f.severity == Severity::Critical),
+            "{:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn released_long_hold_is_info_not_stuck() {
+        // Holding W for 3 s (e.g. in a game), then letting go, is normal
+        let mut parts = ctx_parts();
+        let past = Instant::now() - Duration::from_secs(3);
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Press, past, 0));
+        assert_eq!(parts.2.check_stuck_keys(), vec![KeyCode(17)]);
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Release, Instant::now(), 0));
+        let t = AutoTest::new(InputSource::Evdev);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+        let f = findings.iter().find(|f| f.category == "Long hold").unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert!(f.detail.contains('W'));
+    }
+
+    #[test]
+    fn key_still_held_past_threshold_is_stuck() {
+        let mut parts = ctx_parts();
+        let past = Instant::now() - Duration::from_secs(5);
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Press, past, 0));
+        parts.2.check_stuck_keys();
+        let t = AutoTest::new(InputSource::Evdev);
+        let findings = t.analyze(&ctx!(parts));
+        let f = findings.iter().find(|f| f.category == "Stuck key").unwrap();
+        assert_eq!(f.severity, Severity::Critical);
+        assert!(f.detail.starts_with("W (5."), "{}", f.detail);
+        // Not reported twice as a long hold
+        assert!(!findings.iter().any(|f| f.category == "Long hold"));
+
+        // A key held briefly is fine
+        let mut parts = ctx_parts();
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Press, Instant::now(), 0));
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Stuck key"));
+    }
+
+    #[test]
+    fn keys_held_on_purpose_are_not_stuck() {
+        for step in [StepKind::Hold, StepKind::Rollover] {
+            let mut parts = ctx_parts();
+            let past = Instant::now() - Duration::from_secs(3);
+            for k in [30u16, 31, 32] {
+                parts.2.process_event(&evt(k, KeyEventType::Press, past, 0));
+            }
+            let (mut t, t0) = run_at_step(InputSource::Evdev, step);
+            let findings = t.analyze(&ctx!(parts));
+            assert!(
+                !findings.iter().any(|f| f.category == "Stuck key"),
+                "{:?}",
+                findings
+            );
+            // Once those steps are over, keys that are still down are stuck
+            while matches!(t.current_step(), Some(StepKind::Hold | StepKind::Rollover)) {
+                t.skip_step_at(t0);
+            }
+            let findings = t.analyze(&ctx!(parts));
+            assert!(findings.iter().any(|f| f.category == "Stuck key"));
+        }
     }
 
     #[test]
