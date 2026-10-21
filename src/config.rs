@@ -153,12 +153,14 @@ pub const STUCK_THRESHOLD_MS_MIN: u64 = 250;
 /// Highest stuck-key threshold. Past a minute the check would practically
 /// never fire during a test session.
 pub const STUCK_THRESHOLD_MS_MAX: u64 = 60_000;
-/// Bounce window: 0 would disable bounce detection entirely...
-pub const BOUNCE_WINDOW_MS_MIN: u64 = 1;
-/// ...and 100 ms is already about twice the release-to-press gap of a
-/// deliberate fast double tap (~50 ms); a wider window would count ordinary
-/// typing as bounce.
-pub const BOUNCE_WINDOW_MS_MAX: u64 = 100;
+/// Bounce (release -> re-press) window: the bounce test's own limits, so the
+/// saved value, the Settings view and the running test always agree. Below
+/// 20 ms a 125 Hz keyboard's chatter (one or two 8 ms reports after the
+/// release) is missed; older files saved 5 ms, which now loads as 20...
+pub const BOUNCE_WINDOW_MS_MIN: u64 = crate::tests::MIN_BOUNCE_WINDOW_MS;
+/// ...and above 40 ms fast same-key drumming (key up ~30-40 ms) would count
+/// as bounce.
+pub const BOUNCE_WINDOW_MS_MAX: u64 = crate::tests::MAX_BOUNCE_WINDOW_MS;
 /// UI refresh rate. Below 10 Hz the screen and the stuck-key check visibly
 /// lag (0 would divide by zero)...
 pub const REFRESH_RATE_HZ_MIN: u32 = 10;
@@ -255,7 +257,7 @@ impl Default for StickinessConfig {
 #[serde(default)]
 pub struct HoldReleaseConfig {
     /// Bounce detection window in ms: a press of a key this soon after its
-    /// release is a bounce (clamped to 20-40 ms by the test)
+    /// release is a bounce (clamped to `BOUNCE_WINDOW_MS_MIN`..=`_MAX`, 20-40)
     #[serde(deserialize_with = "saturating::u64")]
     pub bounce_window_ms: u64,
     /// Minimum hold time to register as intentional.
@@ -270,7 +272,7 @@ impl Default for HoldReleaseConfig {
             // A finger needs 30+ ms to re-press a key; chatter re-registers
             // within one or two reports (8-16 ms at 125 Hz). The old 5 ms
             // could never see it on a 125 Hz keyboard.
-            bounce_window_ms: 20,
+            bounce_window_ms: crate::tests::DEFAULT_BOUNCE_WINDOW_MS,
             min_hold_ms: 10,
         }
     }
@@ -541,10 +543,6 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn temp_config_path() -> PathBuf {
-        env::temp_dir().join(format!("keyboard-testkit-test-{}.toml", std::process::id()))
-    }
-
     #[test]
     fn config_default_values() {
         let config = Config::default();
@@ -575,7 +573,7 @@ mod tests {
 
     #[test]
     fn config_save_and_load_roundtrip() {
-        let path = temp_config_path();
+        let path = temp_path("roundtrip");
 
         // Create non-default config
         let mut config = Config::default();
@@ -693,7 +691,7 @@ theme = "Light"
 
     #[test]
     fn config_load_malformed_toml_returns_parse_error() {
-        let path = temp_config_path();
+        let path = temp_path("malformed");
         fs::write(&path, "this is not [valid toml").unwrap();
         let result = Config::load_from(&path);
         assert!(matches!(result, Err(ConfigError::Parse(_))));
@@ -854,12 +852,41 @@ show_notifications = true
         let config = loaded.expect("old config must load");
         assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
         assert_eq!(config.ui.theme, Theme::Light);
+        // The old 5 ms bounce window could never see chatter on a 125 Hz
+        // keyboard; it loads as the window the test actually uses
+        assert_eq!(config.hold_release.bounce_window_ms, 20);
 
         // The lowest value the Settings view offers is kept as chosen
         let mut config = Config::default();
         config.stickiness.stuck_threshold_ms = STUCK_THRESHOLD_MS_MIN;
         assert!(config.sanitize().is_empty());
         assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+    }
+
+    #[test]
+    fn bounce_window_range_is_the_one_the_test_uses() {
+        use crate::tests::HoldReleaseTest;
+        // What the file is clamped to is exactly what the test runs with, so
+        // the Settings view, the saved value and the test never disagree
+        assert_eq!(
+            HoldReleaseTest::new(0).bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            HoldReleaseTest::new(u64::MAX).bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MAX
+        );
+        for ms in [0, 5, 20, 33, 40, 100, 5000] {
+            let mut config = Config::default();
+            config.hold_release.bounce_window_ms = ms;
+            config.sanitize();
+            assert_eq!(
+                config.hold_release.bounce_window_ms,
+                HoldReleaseTest::new(ms).bounce_window_ms(),
+                "{} ms",
+                ms
+            );
+        }
     }
 
     #[test]

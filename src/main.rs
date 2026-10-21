@@ -48,7 +48,7 @@ use std::time::Duration;
 use keyboard_testkit::{
     config::Config,
     keyboard::{KeyEvent, KeyboardListener},
-    tests::{Finding, InputSource, Severity},
+    tests::{Finding, InputSource},
     ui::{
         App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, SettingsPanel,
         ShortcutOverlay, StatusBar, TabBar,
@@ -336,11 +336,9 @@ fn main() -> Result<()> {
         println!("\nKeyboard TestKit session complete.");
         println!("Total events processed: {}", summary.total_events);
         println!("Session duration: {}", summary.elapsed);
-        let mut findings = summary.findings.clone();
-        if let Some(finding) = disconnect_finding(summary.keyboard_disconnects) {
-            findings.insert(0, finding);
-        }
-        let issues: Vec<&Finding> = findings.iter().filter(|f| f.is_issue()).collect();
+        // Same findings as the Dashboard and the exported report (keyboard
+        // disconnects included)
+        let issues: Vec<&Finding> = summary.findings.iter().filter(|f| f.is_issue()).collect();
         println!("Issues found: {}", issues.len());
         for f in issues {
             println!("  [{}] {}: {}", f.severity.label(), f.category, f.title);
@@ -358,28 +356,6 @@ struct SessionOutcome {
     total_events: u64,
     elapsed: String,
     findings: Vec<Finding>,
-    /// Times an evdev keyboard disappeared during the session
-    keyboard_disconnects: u32,
-}
-
-/// A keyboard that drops off the bus mid-session (flaky cable or port,
-/// weak wireless link) is a fault in its own right, and it explains keys
-/// that "never registered" in the meantime.
-fn disconnect_finding(disconnects: u32) -> Option<Finding> {
-    (disconnects > 0).then(|| Finding {
-        severity: Severity::Warning,
-        category: "Connection",
-        title: format!(
-            "Keyboard disconnected {} time(s) during the session",
-            disconnects
-        ),
-        detail: "Keys pressed while it was gone were not seen by any test. A wireless \
-                 keyboard that went to sleep while idle shows up here too."
-            .to_string(),
-        advice: "Check the cable and USB port (try another port), or the wireless \
-                 link and batteries."
-            .to_string(),
-    })
 }
 
 fn print_help() {
@@ -504,10 +480,6 @@ fn run_app(
         app.start_auto_test();
     }
 
-    // Times an evdev keyboard disappeared (shown in the exit summary)
-    #[cfg(target_os = "linux")]
-    let mut disconnects = DisconnectLog::default();
-
     // Main loop
     loop {
         // Check if Ctrl+C / SIGTERM was received
@@ -521,7 +493,7 @@ fn run_app(
         {
             if let Some(ref mut evdev) = evdev_listener {
                 evdev.poll();
-                report_device_changes(&mut app, evdev, &mut disconnects);
+                report_device_changes(&mut app, evdev);
             } else {
                 listener.poll();
             }
@@ -659,15 +631,10 @@ fn run_app(
         app.total_events,
         app.elapsed_formatted()
     );
-    #[cfg(target_os = "linux")]
-    let keyboard_disconnects = disconnects.count;
-    #[cfg(not(target_os = "linux"))]
-    let keyboard_disconnects = 0;
     Ok(Some(SessionOutcome {
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),
         findings: app.findings.clone(),
-        keyboard_disconnects,
     }))
 }
 
@@ -676,57 +643,18 @@ fn run_app(
 const NO_KEYBOARD_STATUS: &str =
     "No keyboard connected - plug it in or reconnect it, it is picked up automatically";
 
-/// Keyboard disconnects seen during the session.
-///
-/// One keyboard usually has several event nodes (keys, media keys, an NKRO
-/// interface) that all vanish when it is unplugged, so node disconnects
-/// close together are one disconnect.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Default)]
-struct DisconnectLog {
-    /// Separate disconnects so far
-    count: u32,
-    /// When the last node disappeared (cleared when a keyboard comes back)
-    last: Option<std::time::Instant>,
-}
-
-#[cfg(target_os = "linux")]
-impl DisconnectLog {
-    /// Node disconnects this close together belong to the same unplug.
-    const MERGE_WINDOW: Duration = Duration::from_secs(2);
-
-    /// Record that a node disappeared at `now`.
-    fn node_lost(&mut self, now: std::time::Instant) {
-        if self
-            .last
-            .is_none_or(|last| now.saturating_duration_since(last) >= Self::MERGE_WINDOW)
-        {
-            self.count += 1;
-        }
-        self.last = Some(now);
-    }
-
-    /// A keyboard came back: the next node lost is a new disconnect.
-    fn node_found(&mut self) {
-        self.last = None;
-    }
-}
-
-/// Make keyboards that disappear or come back visible in the status line.
+/// Make keyboards that disappear or come back visible in the status line,
+/// and record disconnects as a finding (Dashboard, report, exit summary).
 ///
 /// A disconnect also stops a running auto test: its steps would otherwise
 /// time out and blame the missing input on dead keys.
 #[cfg(target_os = "linux")]
-fn report_device_changes(
-    app: &mut App,
-    evdev: &mut EvdevListener,
-    disconnects: &mut DisconnectLog,
-) {
+fn report_device_changes(app: &mut App, evdev: &mut EvdevListener) {
     let mut stopped = "";
     for change in evdev.take_device_changes() {
         match change {
             EvdevDeviceChange::Disconnected { name, .. } => {
-                disconnects.node_lost(std::time::Instant::now());
+                app.keyboard_disconnected(&name);
                 if app.auto_test_running() {
                     app.abort_auto_test();
                     stopped = " - auto test stopped";
@@ -741,7 +669,7 @@ fn report_device_changes(
                 ));
             }
             EvdevDeviceChange::Connected { name, .. } => {
-                disconnects.node_found();
+                app.keyboard_connected();
                 app.set_status(format!("Keyboard connected: {}", name));
             }
         }
@@ -967,9 +895,14 @@ fn handle_terminal_key(
     // When evdev is not in use, the terminal is the test input. Presses,
     // repeats and releases each mean something different to the tests.
     // The keystroke that starts the auto test must not be counted by the
-    // test it starts (it would show up as phantom input in the idle step).
-    if !use_evdev && command != Command::StartAutoTest {
+    // test it starts (it would show up as phantom input in the idle step),
+    // and neither may its autorepeat and release when the key is held a
+    // little long. (With evdev its kernel copy predates the run.)
+    if !use_evdev {
         match key.kind {
+            KeyEventKind::Press if command == Command::StartAutoTest => {
+                listener.swallow_press(key.code);
+            }
             KeyEventKind::Press => {
                 listener.send_press(key.code);
             }
@@ -1312,6 +1245,64 @@ mod tests {
         assert_eq!(app.total_events, 1);
     }
 
+    /// Feed `keys` to a fresh app through the terminal path (no evdev), the
+    /// way the main loop does, then stop the auto test the first one started.
+    fn idle_findings_after(source: InputSource, keys: &[CtKeyEvent]) -> Vec<Finding> {
+        let (tx, rx) = mpsc::channel();
+        let mut listener = KeyboardListener::new(tx);
+        listener.set_release_reporting(source.has_release_events());
+        let mut app = App::default();
+        app.set_input_source(source);
+        for key in keys {
+            handle_terminal_key(&mut app, &mut listener, false, *key);
+            listener.poll();
+            while let Ok(event) = rx.try_recv() {
+                app.process_event(&event);
+            }
+        }
+        assert!(app.auto_test_running());
+        app.abort_auto_test();
+        app.findings.clone()
+    }
+
+    #[test]
+    fn holding_the_start_key_is_not_phantom_input() {
+        let shift_a =
+            |kind| CtKeyEvent::new_with_kind(CtKeyCode::Char('A'), KeyModifiers::SHIFT, kind);
+        let kitty_a =
+            |kind| CtKeyEvent::new_with_kind(CtKeyCode::Char('a'), KeyModifiers::SHIFT, kind);
+        // Press-only terminal: the held 'A' arrives again as autorepeat
+        let press_only = vec![shift_a(KeyEventKind::Press); 12];
+        // Kitty protocol: repeat events, then the release
+        let mut kitty = vec![kitty_a(KeyEventKind::Press)];
+        kitty.extend([kitty_a(KeyEventKind::Repeat); 10]);
+        kitty.push(kitty_a(KeyEventKind::Release));
+        // Windows console: repeats are presses, then the release
+        let mut console = vec![shift_a(KeyEventKind::Press); 10];
+        console.push(shift_a(KeyEventKind::Release));
+        for (source, keys) in [
+            (InputSource::TerminalPressOnly, press_only),
+            (InputSource::TerminalWithRelease, kitty),
+            (InputSource::TerminalWithRelease, console),
+        ] {
+            let findings = idle_findings_after(source, &keys);
+            assert!(
+                !findings.iter().any(|f| f.category == "Phantom input"),
+                "{:?}: {:?}",
+                source,
+                findings
+            );
+        }
+
+        // A different key pressed during the idle step is still caught
+        let keys = [
+            shift_a(KeyEventKind::Press),
+            press(CtKeyCode::Char('j'), KeyModifiers::NONE),
+        ];
+        let findings = idle_findings_after(InputSource::TerminalPressOnly, &keys);
+        assert!(findings.iter().any(|f| f.category == "Phantom input"));
+    }
+
     #[test]
     fn frame_interval_follows_refresh_rate_and_survives_bad_values() {
         assert_eq!(frame_interval(60), Duration::from_micros(16_666));
@@ -1319,33 +1310,5 @@ mod tests {
         // refresh_rate_hz = 0 in a hand-edited config used to divide by zero
         assert_eq!(frame_interval(0), Duration::from_secs(1));
         assert_eq!(frame_interval(u32::MAX), Duration::from_millis(1));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn one_unplug_of_a_multi_node_keyboard_is_one_disconnect() {
-        let t0 = std::time::Instant::now();
-        let ms = |n: u64| t0 + Duration::from_millis(n);
-        let mut log = DisconnectLog::default();
-        // Keyboard, consumer-control and NKRO nodes vanish together
-        log.node_lost(ms(0));
-        log.node_lost(ms(3));
-        log.node_lost(ms(20));
-        assert_eq!(log.count, 1);
-        // It comes back and drops out again: a second disconnect
-        log.node_found();
-        log.node_lost(ms(900));
-        assert_eq!(log.count, 2);
-        // A later, separate drop without a reconnect seen in between
-        log.node_lost(ms(10_000));
-        assert_eq!(log.count, 3);
-    }
-
-    #[test]
-    fn disconnects_are_reported_as_an_issue() {
-        assert!(disconnect_finding(0).is_none());
-        let finding = disconnect_finding(2).unwrap();
-        assert!(finding.is_issue());
-        assert!(finding.title.contains("2 time(s)"));
     }
 }

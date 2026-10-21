@@ -1,7 +1,8 @@
 //! Main application state and logic
 
 use crate::config::{
-    Config, Theme, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN, STUCK_THRESHOLD_MS_MAX,
+    Config, Theme, BOUNCE_WINDOW_MS_MAX, BOUNCE_WINDOW_MS_MIN, POLLING_DURATION_SECS_MAX,
+    POLLING_DURATION_SECS_MIN, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN, STUCK_THRESHOLD_MS_MAX,
     STUCK_THRESHOLD_MS_MIN, WARNING_DURATION_SECS_MAX, WARNING_DURATION_SECS_MIN,
 };
 use crate::keyboard::layout::KeyboardLayout;
@@ -26,6 +27,43 @@ const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// takes a few seconds; 15 s leaves room for a slow attempt without flagging
 /// it, while a key that really stays down is still caught once the step ends.
 const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
+
+/// Keyboard device nodes lost this close together are one unplug: one
+/// keyboard usually has several event nodes (keys, media keys, an NKRO
+/// interface) that all vanish when it is unplugged.
+const DISCONNECT_MERGE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Keyboard disconnects seen since the tests were last reset.
+#[derive(Debug, Default)]
+struct DisconnectLog {
+    /// Separate disconnects so far
+    count: u32,
+    /// When the last node disappeared (cleared when a keyboard comes back)
+    last: Option<Instant>,
+    /// Names of the devices that went away, without repeats
+    devices: Vec<String>,
+}
+
+impl DisconnectLog {
+    /// Record that the node of `device` disappeared at `now`.
+    fn node_lost(&mut self, device: &str, now: Instant) {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= DISCONNECT_MERGE_WINDOW)
+        {
+            self.count += 1;
+        }
+        self.last = Some(now);
+        if !self.devices.iter().any(|d| d == device) {
+            self.devices.push(device.to_string());
+        }
+    }
+
+    /// A keyboard came back: the next node lost is a new disconnect.
+    fn node_found(&mut self) {
+        self.last = None;
+    }
+}
 
 /// Stuck-key threshold (ms) to use during `step` of the auto test, given the
 /// configured threshold. Steps that ask the user to hold keys get a relaxed
@@ -195,6 +233,8 @@ pub struct App {
     findings_updated: Option<Instant>,
     /// Auto-test step observed on the previous tick (for step transitions)
     last_auto_step: Option<StepKind>,
+    /// Keyboard disconnects since the tests were last reset
+    disconnects: DisconnectLog,
 }
 
 impl App {
@@ -222,11 +262,13 @@ impl App {
         let theme_colors = ThemeColors::from_theme(config.ui.theme);
         let keyboard_layout = KeyboardLayout::detect();
 
+        // Assume the least capable source until `set_input_source` says
+        // otherwise; every test is told the same thing (below)
         let input_source = InputSource::TerminalPressOnly;
         let mut auto_test = AutoTest::new(input_source);
         auto_test.set_expected_keys(expected_keys_for_layout(keyboard_layout));
 
-        Self {
+        let mut app = Self {
             view: AppView::Dashboard,
             state: AppState::Running,
             config: config.clone(),
@@ -258,7 +300,32 @@ impl App {
             findings: Vec::new(),
             findings_updated: None,
             last_auto_step: None,
-        }
+            disconnects: DisconnectLog::default(),
+        };
+        app.set_input_source(input_source);
+        app
+    }
+
+    /// Record that an input device of the keyboard went away (unplugged,
+    /// wireless link lost). It is reported as a finding until the tests are
+    /// reset or the auto test is started.
+    pub fn keyboard_disconnected(&mut self, device: &str) {
+        self.keyboard_disconnected_at(device, Instant::now());
+    }
+
+    fn keyboard_disconnected_at(&mut self, device: &str, now: Instant) {
+        self.disconnects.node_lost(device, now);
+        self.refresh_findings();
+    }
+
+    /// Record that a keyboard (re)appeared.
+    pub fn keyboard_connected(&mut self) {
+        self.disconnects.node_found();
+    }
+
+    /// Separate keyboard disconnects since the tests were last reset.
+    pub fn keyboard_disconnects(&self) -> u32 {
+        self.disconnects.count
     }
 
     /// Tell the app where key events come from. Call once at startup.
@@ -268,6 +335,7 @@ impl App {
         // The manual views must not show results the source cannot measure
         self.polling_test.set_input_source(source);
         self.hold_release_test.set_input_source(source);
+        self.stickiness_test.set_input_source(source);
         self.rollover_test.set_input_source(source);
         self.virtual_test.set_input_source(source);
     }
@@ -387,14 +455,19 @@ impl App {
             self.refresh_findings();
         }
         if finished {
-            let issues = self.findings.iter().filter(|f| f.is_issue()).count();
             self.view = AppView::AutoTest;
-            self.set_status(if issues == 0 {
-                "Auto test complete: no issues detected".to_string()
-            } else {
-                format!("Auto test complete: {} issue(s) found", issues)
-            });
+            self.set_completion_status();
         }
+    }
+
+    /// Say in the status line how the finished auto test went.
+    fn set_completion_status(&mut self) {
+        let issues = self.issue_count();
+        self.set_status(if issues == 0 {
+            "Auto test complete: no issues detected".to_string()
+        } else {
+            format!("Auto test complete: {} issue(s) found", issues)
+        });
     }
 
     /// Relax the stuck-key threshold while the user is asked to hold keys,
@@ -428,6 +501,8 @@ impl App {
             virtual_detect: &self.virtual_test,
             oem_keys: &self.oem_test,
             keyboard_state: &self.keyboard_state,
+            keyboard_disconnects: self.disconnects.count,
+            disconnected_devices: &self.disconnects.devices,
         }
     }
 
@@ -439,10 +514,12 @@ impl App {
     /// Start the automatic diagnostic and switch to its view.
     pub fn start_auto_test(&mut self) {
         // Give the run a clean slate so old data does not pollute the findings
+        // (a keyboard replugged before the run is not a fault of the run)
         self.keyboard_state.reset();
         for test in self.all_tests_mut() {
             test.reset();
         }
+        self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
@@ -473,8 +550,7 @@ impl App {
             if self.auto_test.is_complete() {
                 self.apply_auto_step_transition();
                 self.refresh_findings();
-                let issues = self.issue_count();
-                self.set_status(format!("Auto test complete: {} issue(s) found", issues));
+                self.set_completion_status();
             }
         }
     }
@@ -544,6 +620,7 @@ impl App {
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
         self.last_auto_step = None;
+        self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.refresh_findings();
         self.set_status("All tests reset".to_string());
@@ -615,9 +692,15 @@ impl App {
             format!("{}", self.keyboard_state.current_rollover()),
         ));
 
+        // Press-only terminal input guesses releases, so how many keys were
+        // down at once is not known (see RolloverTest)
         results.push(TestResult::info(
             "Max Rollover",
-            format!("{}", self.keyboard_state.max_rollover()),
+            if self.rollover_test.rollover_measurable() {
+                format!("{}", self.keyboard_state.max_rollover())
+            } else {
+                "n/a (terminal input)".to_string()
+            },
         ));
 
         if let Some(rate) = self.keyboard_state.global_polling_rate_hz() {
@@ -682,6 +765,7 @@ impl App {
             ReportInput {
                 start_time: self.start_time,
                 total_events: self.total_events,
+                rollover_measured: self.rollover_test.rollover_measurable(),
                 polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
                 polling: self.polling_test.get_results(),
                 hold_release: self.hold_release_test.get_results(),
@@ -699,6 +783,9 @@ impl App {
 
     /// Export session report to JSON file
     pub fn export_report(&mut self, filename: &str) -> Result<String, std::io::Error> {
+        // The live findings are only refreshed every 500 ms; the file must
+        // match what was typed up to the moment of the export
+        self.refresh_findings();
         let report = self.generate_report();
         let path = Path::new(filename);
         report.export_json(path)?;
@@ -826,15 +913,19 @@ impl App {
             0 => {
                 // Polling duration
                 if increase {
-                    self.config.polling.test_duration_secs =
-                        self.config.polling.test_duration_secs.saturating_add(5);
+                    self.config.polling.test_duration_secs = self
+                        .config
+                        .polling
+                        .test_duration_secs
+                        .saturating_add(5)
+                        .min(POLLING_DURATION_SECS_MAX);
                 } else {
                     self.config.polling.test_duration_secs = self
                         .config
                         .polling
                         .test_duration_secs
                         .saturating_sub(5)
-                        .max(5);
+                        .max(POLLING_DURATION_SECS_MIN);
                 }
                 self.polling_test
                     .set_duration_secs(self.config.polling.test_duration_secs);
@@ -860,25 +951,18 @@ impl App {
                     .set_threshold(self.config.stickiness.stuck_threshold_ms);
             }
             2 => {
-                // Bounce window (step from the value in effect)
-                self.config.hold_release.bounce_window_ms =
-                    self.hold_release_test.bounce_window_ms();
-                if increase {
-                    self.config.hold_release.bounce_window_ms =
-                        self.config.hold_release.bounce_window_ms.saturating_add(1);
+                // Bounce window, stepped from the value in effect (an old
+                // config's 5 ms runs, and is shown, as 20)
+                let current = self.hold_release_test.bounce_window_ms();
+                let next = if increase {
+                    current.saturating_add(1)
                 } else {
-                    self.config.hold_release.bounce_window_ms = self
-                        .config
-                        .hold_release
-                        .bounce_window_ms
-                        .saturating_sub(1)
-                        .max(1);
-                }
-                // The test clamps to a useful range; keep the config in step
+                    current.saturating_sub(1)
+                };
+                self.config.hold_release.bounce_window_ms =
+                    next.clamp(BOUNCE_WINDOW_MS_MIN, BOUNCE_WINDOW_MS_MAX);
                 self.hold_release_test
                     .set_bounce_window_ms(self.config.hold_release.bounce_window_ms);
-                self.config.hold_release.bounce_window_ms =
-                    self.hold_release_test.bounce_window_ms();
             }
             3 => {
                 // Refresh rate
@@ -1426,6 +1510,86 @@ mod tests {
         assert_eq!(
             app.config.stickiness.stuck_threshold_ms,
             STUCK_THRESHOLD_MS_MIN
+        );
+    }
+
+    #[test]
+    fn one_unplug_of_a_multi_node_keyboard_is_one_disconnect() {
+        let mut app = App::default();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        // Keyboard, consumer-control and NKRO nodes vanish together
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(0));
+        app.keyboard_disconnected_at("Gaming Keyboard Consumer Control", ms(3));
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(20));
+        assert_eq!(app.keyboard_disconnects(), 1);
+        // It comes back and drops out again: a second disconnect
+        app.keyboard_connected();
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(900));
+        assert_eq!(app.keyboard_disconnects(), 2);
+        // A later, separate drop without a reconnect seen in between
+        app.keyboard_disconnected_at("Gaming Keyboard", ms(10_000));
+        assert_eq!(app.keyboard_disconnects(), 3);
+        // Each device is named once
+        let connection = app
+            .findings
+            .iter()
+            .find(|f| f.category == "Connection")
+            .unwrap();
+        assert!(connection.title.contains("3 time(s)"));
+        assert!(connection
+            .detail
+            .starts_with("Gaming Keyboard, Gaming Keyboard Consumer Control. "));
+    }
+
+    #[test]
+    fn polling_duration_and_bounce_window_settings_are_bounded() {
+        // Holding an arrow key in the Settings view must not walk a value
+        // out of the range a loaded config is clamped to
+        let mut app = App {
+            settings_selected: 0,
+            ..App::default()
+        };
+        app.config.polling.test_duration_secs = POLLING_DURATION_SECS_MAX;
+        app.adjust_setting(true);
+        assert_eq!(
+            app.config.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MAX
+        );
+        assert_eq!(app.polling_test.duration_secs(), POLLING_DURATION_SECS_MAX);
+        app.config.polling.test_duration_secs = POLLING_DURATION_SECS_MIN;
+        app.adjust_setting(false);
+        assert_eq!(
+            app.config.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MIN
+        );
+
+        app.settings_selected = 2;
+        for _ in 0..100 {
+            app.adjust_setting(true);
+        }
+        assert_eq!(
+            app.config.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MAX
+        );
+        assert_eq!(
+            app.hold_release_test.bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MAX
+        );
+        for _ in 0..100 {
+            app.adjust_setting(false);
+        }
+        assert_eq!(
+            app.config.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            app.hold_release_test.bounce_window_ms(),
+            BOUNCE_WINDOW_MS_MIN
+        );
+        assert_eq!(
+            app.settings_items()[2].value,
+            BOUNCE_WINDOW_MS_MIN.to_string()
         );
     }
 }

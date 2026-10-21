@@ -1,6 +1,6 @@
 //! Stickiness detection test module
 
-use super::{KeyboardTest, TestResult};
+use super::{InputSource, KeyboardTest, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -36,9 +36,15 @@ pub struct StickinessTest {
     keys_tested: u32,
     /// Test start time
     start_time: Option<Instant>,
+    /// Whether key releases are real. With press-only terminal input they
+    /// are guessed from autorepeat timing, so how long a key stayed down
+    /// (and so whether it is stuck) is not known.
+    real_releases: bool,
 }
 
 impl StickinessTest {
+    /// Create the test. Releases are assumed to be real until
+    /// [`StickinessTest::set_input_source`] says otherwise.
     pub fn new(threshold_ms: u64) -> Self {
         Self {
             threshold: Duration::from_millis(threshold_ms),
@@ -47,7 +53,14 @@ impl StickinessTest {
             currently_flagged: HashMap::new(),
             keys_tested: 0,
             start_time: None,
+            real_releases: true,
         }
+    }
+
+    /// Tell the test where events come from. Stuck keys can only be judged
+    /// when releases are real.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.real_releases = source.has_release_events();
     }
 
     /// Check all held keys for stickiness. Returns the keys that crossed the
@@ -141,6 +154,26 @@ impl StickinessTest {
     pub fn set_threshold(&mut self, threshold_ms: u64) {
         self.threshold = Duration::from_millis(threshold_ms);
     }
+
+    /// List the keys that have been down for at most `up_to`.
+    fn push_held_keys(&self, results: &mut Vec<TestResult>, up_to: Duration) {
+        let mut held: Vec<(KeyCode, Duration)> = self
+            .held_keys()
+            .into_iter()
+            .filter(|(_, d)| *d <= up_to)
+            .collect();
+        held.sort_by_key(|(key, _)| key.0);
+        if !held.is_empty() {
+            results.push(TestResult::info("--- Held Keys ---", ""));
+            for (key, duration) in held {
+                let key_info = keymap::get_key_info(key);
+                results.push(TestResult::info(
+                    format!("  {}", key_info.name),
+                    format!("{:.1}s", duration.as_secs_f64()),
+                ));
+            }
+        }
+    }
 }
 
 impl KeyboardTest for StickinessTest {
@@ -219,6 +252,22 @@ impl KeyboardTest for StickinessTest {
             format!("{} ms", self.threshold.as_millis()),
         ));
 
+        if !self.real_releases {
+            // A terminal that reports presses only never says when a key
+            // went up, so a clean result here would be a guess.
+            results.push(TestResult::info("Stuck Keys", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Terminal reports",
+                "presses only; releases guessed",
+            ));
+            results.push(TestResult::info(
+                "stuck keys need",
+                "releases: evdev or kitty protocol",
+            ));
+            self.push_held_keys(&mut results, Duration::MAX);
+            return results;
+        }
+
         // Keys stuck right now: the actual fault.
         let stuck = self.stuck_keys();
         if stuck.is_empty() {
@@ -261,22 +310,7 @@ impl KeyboardTest for StickinessTest {
         }
 
         // Keys that are down but have not reached the threshold yet
-        let mut held: Vec<(KeyCode, Duration)> = self
-            .held_keys()
-            .into_iter()
-            .filter(|(_, d)| *d <= self.threshold)
-            .collect();
-        held.sort_by_key(|(key, _)| key.0);
-        if !held.is_empty() {
-            results.push(TestResult::info("--- Held Keys ---", ""));
-            for (key, duration) in held {
-                let key_info = keymap::get_key_info(key);
-                results.push(TestResult::info(
-                    format!("  {}", key_info.name),
-                    format!("{:.1}s", duration.as_secs_f64()),
-                ));
-            }
-        }
+        self.push_held_keys(&mut results, self.threshold);
 
         results
     }
@@ -449,6 +483,37 @@ mod tests {
         test.set_threshold(15_000);
         assert!(test.stuck_keys_at(now).is_empty());
         assert!(test.check_stuck_keys_at(now).is_empty());
+    }
+
+    #[test]
+    fn press_only_input_does_not_claim_no_stuck_keys() {
+        // Without real releases a green "None detected" would be a guess,
+        // and a held key (kept down by its autorepeat) is not a stuck one
+        let mut test = StickinessTest::new(2000);
+        test.set_input_source(InputSource::TerminalPressOnly);
+        let results = test.get_results();
+        let row = results.iter().find(|r| r.label == "Stuck Keys").unwrap();
+        assert_eq!(row.status, ResultStatus::Info);
+        assert_eq!(row.value, "n/a (terminal input)");
+
+        test.process_event(&evt(
+            BACKSPACE,
+            KeyEventType::Press,
+            ago(Duration::from_secs(3)),
+        ));
+        assert!(faults(&test).is_empty(), "{:?}", faults(&test));
+        assert!(!test
+            .get_results()
+            .iter()
+            .any(|r| r.status == ResultStatus::Ok));
+
+        // Real releases (evdev, kitty protocol, Windows console) are judged
+        for source in [InputSource::Evdev, InputSource::TerminalWithRelease] {
+            test.set_input_source(source);
+            assert!(faults(&test)
+                .iter()
+                .any(|r| r.label == "Stuck Keys" && r.status == ResultStatus::Error));
+        }
     }
 
     #[test]

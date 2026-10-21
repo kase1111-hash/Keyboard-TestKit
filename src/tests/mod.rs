@@ -58,6 +58,8 @@ pub use auto_test::{
     Severity, StepKind, StepOutcome,
 };
 pub use bounce::HoldReleaseTest;
+// The config clamps its bounce window to the range the test accepts
+pub(crate) use bounce::{DEFAULT_BOUNCE_WINDOW_MS, MAX_BOUNCE_WINDOW_MS, MIN_BOUNCE_WINDOW_MS};
 pub use latency::EventTimingTest;
 pub use oem_keys::OemKeyTest;
 pub use polling::PollingRateTest;

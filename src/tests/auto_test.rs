@@ -372,6 +372,10 @@ pub struct AnalysisContext<'a> {
     pub virtual_detect: &'a VirtualKeyboardTest,
     pub oem_keys: &'a OemKeyTest,
     pub keyboard_state: &'a KeyboardState,
+    /// Times the keyboard dropped off (evdev saw its device go away)
+    pub keyboard_disconnects: u32,
+    /// Names of the devices that went away
+    pub disconnected_devices: &'a [String],
 }
 
 /// The automatic diagnostic test.
@@ -907,6 +911,12 @@ impl AutoTest {
         // Whether held modifier keys show up at all (not on the Windows console)
         let modifiers_reported = self.input_source.can_report(keymap::KEY_LSHIFT);
 
+        // --- Connection ---------------------------------------------------
+        findings.extend(disconnect_finding(
+            ctx.keyboard_disconnects,
+            ctx.disconnected_devices,
+        ));
+
         // --- Input source limitations -------------------------------------
         if !releases {
             // A limitation of the setup, not of the keyboard.
@@ -1021,19 +1031,14 @@ impl AutoTest {
         // during them are not judged until the step is over.
         if releases {
             let threshold = ctx.stickiness.threshold();
-            let mut still_held: Vec<(KeyCode, Duration)> = ctx
-                .stickiness
-                .held_keys()
-                .into_iter()
-                .filter(|(_, held)| *held > threshold)
-                .collect();
+            // Longest first
+            let stuck = ctx.stickiness.stuck_keys();
             let holding_on_purpose = matches!(
                 self.current_step(),
                 Some(StepKind::Hold | StepKind::Rollover)
             );
-            if !still_held.is_empty() && !holding_on_purpose {
-                still_held.sort_by_key(|(_, held)| std::cmp::Reverse(*held));
-                let detail = still_held
+            if !stuck.is_empty() && !holding_on_purpose {
+                let detail = stuck
                     .iter()
                     .take(6)
                     .map(|(k, held)| {
@@ -1050,7 +1055,7 @@ impl AutoTest {
                     "Stuck key",
                     format!(
                         "{} key(s) held down for more than {} ms",
-                        still_held.len(),
+                        stuck.len(),
                         threshold.as_millis()
                     ),
                     detail,
@@ -1058,26 +1063,35 @@ impl AutoTest {
                      clean the switch. If it persists, the switch or controller is faulty.",
                 ));
             }
-            let released: Vec<(KeyCode, Duration, u32)> = ctx
+            // Holds that ended in a release (a key that is down again now is
+            // judged above, not listed twice)
+            let mut long_holds: Vec<(KeyCode, Duration, u32)> = ctx
                 .stickiness
-                .flagged_keys()
+                .long_holds()
                 .into_iter()
-                .filter(|(k, _, _)| !still_held.iter().any(|(h, _)| h == k))
+                .filter(|(k, _, _)| !stuck.iter().any(|(s, _)| s == k))
                 .collect();
-            if !released.is_empty() {
-                let detail = released
+            if !long_holds.is_empty() {
+                long_holds.sort_by_key(|(k, longest, _)| (std::cmp::Reverse(*longest), k.0));
+                let detail = long_holds
                     .iter()
                     .take(6)
-                    .map(|(k, _, n)| format!("{} ({}x)", keymap::get_key_info(*k).name, n))
+                    .map(|(k, longest, n)| {
+                        format!(
+                            "{} ({}x, longest {:.1}s)",
+                            keymap::get_key_info(*k).name,
+                            n,
+                            longest.as_secs_f64()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 findings.push(Finding::new(
                     Severity::Info,
                     "Long hold",
                     format!(
-                        "{} key(s) were held past the {} ms threshold, then released",
-                        released.len(),
-                        threshold.as_millis()
+                        "{} key(s) were held past the stuck-key threshold, then released",
+                        long_holds.len()
                     ),
                     detail,
                     "Normal if you were holding them. If a key stayed down after you let \
@@ -1265,10 +1279,12 @@ impl AutoTest {
                             },
                         ));
                     }
+                    // Same wording as the Polling view: Bluetooth keyboards
+                    // show no grid either, so no rate is claimed
                     None => findings.push(Finding::new(
                         Severity::Info,
                         "Polling rate",
-                        "No report-interval quantization visible (>= 1000 Hz or interrupt-driven)",
+                        "No 125/250/500 Hz report grid visible (1000+ Hz, or Bluetooth)",
                         format!("{} rapid-press samples analysed.", samples),
                         "",
                     )),
@@ -1304,11 +1320,13 @@ impl AutoTest {
                 Severity::Info,
                 "Rapid tap",
                 title,
-                if releases {
+                if self.input_source.has_precise_timestamps() {
                     ""
                 } else {
-                    "Press-only terminals merge quick same-key taps, so fast tapping is \
-                     undercounted."
+                    // Every tap is counted (the terminal listener tells taps
+                    // from autorepeat), but each is stamped when it was read.
+                    "Timed from when the terminal delivered the taps, so the rate is \
+                     approximate."
                 },
                 "",
             ));
@@ -1680,6 +1698,35 @@ fn unreportable_advice(source: InputSource) -> &'static str {
     }
 }
 
+/// The finding for a keyboard that dropped off `disconnects` times.
+///
+/// A keyboard that disappears mid-session (flaky cable or port, weak
+/// wireless link) is a fault in its own right, and it explains keys that
+/// "never registered" meanwhile. An unplug made on purpose, or a wireless
+/// keyboard going to sleep, looks exactly the same, so it is a conditionally
+/// worded Warning rather than a verdict.
+fn disconnect_finding(disconnects: u32, devices: &[String]) -> Option<Finding> {
+    (disconnects > 0).then(|| {
+        let names = if devices.is_empty() {
+            String::new()
+        } else {
+            format!("{}. ", devices.join(", "))
+        };
+        Finding::new(
+            Severity::Warning,
+            "Connection",
+            format!("Keyboard disconnected {} time(s)", disconnects),
+            format!(
+                "{}Keys pressed while it was gone were not seen by any test. A wireless \
+                 keyboard that went to sleep while idle shows up here too.",
+                names
+            ),
+            "If you did not unplug it or switch it off, check the cable and USB port \
+             (try another port), or the wireless link and batteries.",
+        )
+    })
+}
+
 /// Judge the rollover step from how it ended and its peak.
 ///
 /// The step only passes at [`GOOD_ROLLOVER`] keys. A lower peak at the timeout
@@ -1796,6 +1843,9 @@ mod tests {
 
     macro_rules! ctx {
         ($p:expr) => {
+            ctx!($p, 0, &[])
+        };
+        ($p:expr, $disconnects:expr, $devices:expr) => {
             AnalysisContext {
                 polling: &$p.0,
                 hold_release: &$p.1,
@@ -1806,6 +1856,8 @@ mod tests {
                 virtual_detect: &$p.6,
                 oem_keys: &$p.7,
                 keyboard_state: &$p.8,
+                keyboard_disconnects: $disconnects,
+                disconnected_devices: $devices,
             }
         };
     }
@@ -2185,6 +2237,11 @@ mod tests {
             .expect("limited capture finding");
         assert_eq!(limited.severity, Severity::Info);
         assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+        // The listener counts every tap; only the timing is approximate
+        let rapid = findings.iter().find(|f| f.category == "Rapid tap").unwrap();
+        assert!(rapid.title.starts_with("11 presses"), "{}", rapid.title);
+        assert!(rapid.detail.contains("approximate"), "{}", rapid.detail);
+        assert!(!rapid.detail.contains("undercounted"), "{}", rapid.detail);
         // Sorted most severe first
         assert!(findings.windows(2).all(|w| w[0].severity >= w[1].severity));
     }
@@ -2869,6 +2926,37 @@ mod tests {
     }
 
     #[test]
+    fn key_still_down_is_never_called_released() {
+        // W was flagged at the 2 s threshold, then the hold step relaxed the
+        // threshold to 15 s while W is still down: it is not a released long
+        // hold (and, the user being asked to hold keys, not stuck either)
+        let mut parts = ctx_parts();
+        let past = Instant::now() - Duration::from_secs(3);
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Press, past, 0));
+        assert_eq!(parts.2.check_stuck_keys(), vec![KeyCode(17)]);
+        parts.2.set_threshold(15_000);
+        let (t, _) = run_at_step(InputSource::Evdev, StepKind::Hold);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.category == "Long hold" || f.category == "Stuck key"),
+            "{:?}",
+            findings
+        );
+
+        // Once it is let go it is listed as a long hold, with its duration
+        parts
+            .2
+            .process_event(&evt(17, KeyEventType::Release, Instant::now(), 0));
+        let findings = t.analyze(&ctx!(parts));
+        let f = findings.iter().find(|f| f.category == "Long hold").unwrap();
+        assert!(f.detail.starts_with("W (1x, longest 3."), "{}", f.detail);
+    }
+
+    #[test]
     fn keys_held_on_purpose_are_not_stuck() {
         for step in [StepKind::Hold, StepKind::Rollover] {
             let mut parts = ctx_parts();
@@ -2890,6 +2978,34 @@ mod tests {
             let findings = t.analyze(&ctx!(parts));
             assert!(findings.iter().any(|f| f.category == "Stuck key"));
         }
+    }
+
+    #[test]
+    fn keyboard_disconnect_is_an_issue_and_names_the_device() {
+        let parts = ctx_parts();
+        let t = AutoTest::new(InputSource::Evdev);
+        // Nothing dropped: no connection finding, a clean summary
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Connection"));
+        assert!(!findings.iter().any(Finding::is_issue));
+
+        let devices = vec!["Logitech USB Receiver".to_string()];
+        let findings = t.analyze(&ctx!(parts, 2, &devices));
+        let f = findings
+            .iter()
+            .find(|f| f.category == "Connection")
+            .expect("connection finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.title.contains("2 time(s)"), "{}", f.title);
+        assert!(
+            f.detail.starts_with("Logitech USB Receiver. "),
+            "{}",
+            f.detail
+        );
+        // Worded as a condition: an unplug on purpose looks the same
+        assert!(f.advice.starts_with("If you did not unplug it"));
+        // The summary no longer says nothing was found
+        assert!(!findings.iter().any(|f| f.category == "Summary"));
     }
 
     #[test]

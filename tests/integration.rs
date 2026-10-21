@@ -340,12 +340,162 @@ fn dashboard_results_include_session_info() {
 
 #[test]
 fn no_events_produces_empty_report() {
-    let app = App::default();
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
     let report = app.generate_report();
 
     assert_eq!(report.summary.total_events, 0);
-    assert_eq!(report.summary.max_rollover, 0);
+    assert_eq!(report.summary.max_rollover, Some(0));
     assert_eq!(report.summary.issues_detected, 0);
+}
+
+#[test]
+fn press_only_rollover_is_not_presented_as_a_measurement() {
+    // A press-only terminal keeps each tap "down" for up to 750 ms, so
+    // typing "hello" quickly looks like 4 keys held at once (h, e, l, o)
+    // although the user never held more than one.
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    let t0 = Instant::now();
+    for (i, key) in [35u16, 18, 38, 38, 24].iter().enumerate() {
+        let when = t0 + Duration::from_millis(i as u64 * 110);
+        app.process_event(&timed(*key, KeyEventType::Press, when, 110_000));
+    }
+    assert_eq!(app.keyboard_state.max_rollover(), 4);
+
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    let max = dash.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "n/a (terminal input)");
+
+    let nkro = {
+        app.view = AppView::Rollover;
+        app.current_results()
+    };
+    let max = nkro.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "n/a (terminal input)");
+    assert!(!nkro.iter().any(|r| r.value.contains("4KRO")));
+
+    let report = app.generate_report();
+    assert_eq!(report.summary.max_rollover, None);
+    assert!(report.to_text().contains("Max Rollover:    n/a"));
+
+    // The auto test does not run (or judge) its rollover step either
+    app.start_auto_test();
+    assert!(!app.auto_test.steps().contains(&StepKind::Rollover));
+    app.abort_auto_test();
+    assert!(!app.findings.iter().any(|f| f.category == "Rollover"));
+
+    // With real releases the same view shows the measured peak
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalWithRelease);
+    for key in 30..36 {
+        app.process_event(&press(key, 1000));
+    }
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    assert_eq!(
+        dash.iter()
+            .find(|r| r.label == "Max Rollover")
+            .unwrap()
+            .value,
+        "6"
+    );
+    assert_eq!(app.generate_report().summary.max_rollover, Some(6));
+}
+
+#[test]
+fn keyboard_disconnect_is_a_finding_everywhere_not_only_at_exit() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    app.start_auto_test();
+    // The cable drops out mid-run: main.rs records it, then stops the run
+    app.keyboard_disconnected("USB Keyboard");
+    app.abort_auto_test();
+    app.keyboard_connected();
+
+    let connection = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Connection")
+        .expect("connection finding");
+    assert_eq!(connection.severity, Severity::Warning);
+    assert!(connection.detail.contains("USB Keyboard"));
+    assert_eq!(app.issue_count(), 1, "{:?}", app.findings);
+
+    // Dashboard
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    assert!(dash
+        .iter()
+        .any(|r| r.label.contains("Connection") && r.value.contains("disconnected 1 time")));
+    // Exported report
+    let report = app.generate_report();
+    assert_eq!(report.summary.issues_detected, 1);
+    assert!(report.to_csv().contains("Diagnostics,Connection"));
+
+    // A clean slate forgets it (e.g. replugged on purpose before a new run)
+    app.start_auto_test();
+    assert!(!app.findings.iter().any(|f| f.category == "Connection"));
+    app.keyboard_disconnected("USB Keyboard");
+    app.reset_all();
+    assert_eq!(app.keyboard_disconnects(), 0);
+    assert_eq!(app.issue_count(), 0);
+}
+
+#[test]
+fn export_includes_findings_from_the_last_moment() {
+    // A bounce typed right before Ctrl+E (no tick in between) is in the file
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let t0 = Instant::now();
+    app.process_event(&timed(30, KeyEventType::Press, t0, 0));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Release,
+        t0 + Duration::from_millis(1),
+        1000,
+    ));
+    app.process_event(&timed(
+        30,
+        KeyEventType::Press,
+        t0 + Duration::from_millis(2),
+        1000,
+    ));
+    let path = std::env::temp_dir().join(format!(
+        "keyboard-testkit-fresh-{}.json",
+        std::process::id()
+    ));
+    app.export_report(&path.to_string_lossy()).unwrap();
+    let json = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(json.contains("Switch bounce"), "{}", json);
+    assert!(json.contains("\"issues_detected\": 1"), "{}", json);
+}
+
+#[test]
+fn healthy_session_without_disconnects_reports_no_connection_issue() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    type_keys(&mut app, &[30, 31, 32], 1000);
+    app.keyboard_connected(); // a second keyboard plugged in is not a fault
+    app.refresh_findings();
+    assert!(!app.findings.iter().any(|f| f.category == "Connection"));
+    assert_eq!(app.issue_count(), 0, "{:?}", app.findings);
+}
+
+#[test]
+fn press_only_sticky_view_does_not_claim_no_stuck_keys() {
+    let mut app = App::default();
+    app.set_input_source(InputSource::TerminalPressOnly);
+    app.process_event(&press(14, 1000));
+    app.view = AppView::Stickiness;
+    let results = app.current_results();
+    let stuck = results.iter().find(|r| r.label == "Stuck Keys").unwrap();
+    assert_eq!(stuck.value, "n/a (terminal input)");
+    assert!(!results
+        .iter()
+        .any(|r| r.status != keyboard_testkit::tests::ResultStatus::Info));
 }
 
 #[test]

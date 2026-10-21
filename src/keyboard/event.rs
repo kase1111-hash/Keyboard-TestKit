@@ -90,6 +90,10 @@ struct KeyTrack {
     /// The key was idle before this press, so no autorepeat can be running:
     /// a report right after it is chatter (see [`MIN_REPRESS_GAP`]).
     idle_before: bool,
+    /// The press was a UI command, not test input (see
+    /// [`KeyboardListener::swallow_press`]): it, its autorepeat and its
+    /// release are not emitted.
+    silent: bool,
 }
 
 impl KeyTrack {
@@ -101,6 +105,7 @@ impl KeyTrack {
             repeated: false,
             pending: None,
             idle_before: false,
+            silent: false,
         }
     }
 }
@@ -190,6 +195,32 @@ impl KeyboardListener {
         self.press_at(ct_key, Instant::now())
     }
 
+    /// Note a key press that was a UI command rather than test input, such as
+    /// the `A` that starts the auto test.
+    ///
+    /// Nothing is emitted for it, but the key is known to be down, so its
+    /// autorepeat and its release (real or synthesized) are not mistaken for
+    /// a new keystroke either: a user holding `A` a little too long would
+    /// otherwise be told the idle step saw phantom input. The next genuine
+    /// press of the key is reported as usual.
+    pub fn swallow_press(&mut self, ct_key: CtKeyCode) {
+        self.swallow_press_at(ct_key, Instant::now());
+    }
+
+    fn swallow_press_at(&mut self, ct_key: CtKeyCode, now: Instant) {
+        let key = crossterm_to_keycode(ct_key);
+        if key.0 == 0 {
+            return;
+        }
+        self.keys.insert(
+            key,
+            KeyTrack {
+                silent: true,
+                ..KeyTrack::pressed(now)
+            },
+        );
+    }
+
     /// Feed a crossterm key repeat event. Keeps the key alive for auto-release
     /// purposes but never generates an event for a key that is down.
     pub fn send_repeat(&mut self, ct_key: CtKeyCode) {
@@ -217,7 +248,7 @@ impl KeyboardListener {
     /// Returns true if an event was sent.
     pub fn send_release(&mut self, ct_key: CtKeyCode) -> bool {
         let key = crossterm_to_keycode(ct_key);
-        if key.0 == 0 || !self.keys.remove(&key).is_some_and(|t| t.down) {
+        if key.0 == 0 || !self.keys.remove(&key).is_some_and(|t| t.down && !t.silent) {
             return false;
         }
         self.emit(key, KeyEventType::Release, Instant::now())
@@ -284,6 +315,14 @@ impl KeyboardListener {
             return false;
         }
         let since_report = now.saturating_duration_since(t.last_report);
+        let since_press = now.saturating_duration_since(t.pressed_at);
+        if t.silent && !t.repeated && since_press < MIN_AUTOREPEAT_DELAY {
+            // A command keystroke is not test input: a report too soon to
+            // tell a short-delay autorepeat from a re-press is its repeat.
+            t.repeated = true;
+            t.last_report = now;
+            return false;
+        }
         if t.repeated && since_report < AUTO_RELEASE_TIMEOUT {
             // Autorepeat continues (also for a key released early by
             // INITIAL_HOLD_TIMEOUT whose repeat started late).
@@ -299,7 +338,6 @@ impl KeyboardListener {
             t.last_report = now;
             return false;
         }
-        let since_press = now.saturating_duration_since(t.pressed_at);
         let may_be_first_repeat = !t.repeated && since_press < MAX_AUTOREPEAT_DELAY;
         if may_be_first_repeat && since_press >= MIN_AUTOREPEAT_DELAY {
             // First autorepeat of a held key, or a new tap: the next report
@@ -312,7 +350,7 @@ impl KeyboardListener {
         // autorepeat ended: a genuine new press. The release in between was
         // not reported; place it halfway so neither the hold nor the gap is
         // invented as zero.
-        if t.down {
+        if t.down && !t.silent {
             out.push((midpoint(t.pressed_at, now), key, KeyEventType::Release));
         }
         *t = KeyTrack::pressed(now);
@@ -326,7 +364,7 @@ impl KeyboardListener {
         let Some(at) = t.pending.take() else {
             return;
         };
-        if t.down {
+        if t.down && !t.silent {
             out.push((midpoint(t.pressed_at, at), key, KeyEventType::Release));
         }
         *t = KeyTrack::pressed(at);
@@ -352,7 +390,9 @@ impl KeyboardListener {
             if now >= deadline {
                 // Stamped at the deadline so the hold time does not depend on
                 // how often the main loop polls.
-                out.push((deadline, *key, KeyEventType::Release));
+                if !t.silent {
+                    out.push((deadline, *key, KeyEventType::Release));
+                }
                 t.down = false;
             }
         }
@@ -859,6 +899,78 @@ mod tests {
         // The doubled report of a chattering switch, read in the same batch
         let events = run_with_stalls(&[(0, 'a'), (6, 'a')], 1500, &[(0, 10)]);
         assert_eq!(presses(&events), 2);
+    }
+
+    /// Like [`run_press_only`], but the first report is a command keystroke
+    /// handed to [`KeyboardListener::swallow_press`].
+    fn run_swallowing_first(reports: &[(u64, char)], end_ms: u64) -> Vec<KeyEvent> {
+        let (mut l, rx) = listener();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut next = 0;
+        let mut frame = 0;
+        while frame <= end_ms {
+            l.poll_at(at(frame));
+            while next < reports.len() && reports[next].0 < frame + 16 {
+                let (ms, c) = reports[next];
+                if next == 0 {
+                    l.swallow_press_at(CtKeyCode::Char(c), at(ms));
+                } else {
+                    l.press_at(CtKeyCode::Char(c), at(ms));
+                }
+                next += 1;
+            }
+            frame += 16;
+        }
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn held_command_key_emits_nothing_in_press_only_mode() {
+        // The 'A' that starts the auto test, held past the autorepeat delay:
+        // neither its repeats nor its synthesized release are test input
+        for (delay, interval) in [(150, 15), (199, 40), (250, 30), (500, 33), (1000, 33)] {
+            let events = run_swallowing_first(&hold('A', delay, interval, 1800), 2500);
+            assert!(events.is_empty(), "delay {delay} ms: {events:?}");
+        }
+        // A short tap emits nothing either
+        assert!(run_swallowing_first(&[(0, 'A')], 2000).is_empty());
+    }
+
+    #[test]
+    fn later_presses_of_a_swallowed_key_are_reported() {
+        // Pressing A again later (the sweep asks for every key) is real input,
+        // after a held command key and after a tapped one
+        let mut reports = hold('A', 500, 33, 1200);
+        reports.push((4000, 'a'));
+        let events = run_swallowing_first(&reports, 5000);
+        assert_eq!(presses(&events), 1, "{events:?}");
+        assert_eq!(events[0].key, KeyCode(30));
+
+        // A second tap 300 ms after the command is a new keystroke too
+        let events = run_swallowing_first(&[(0, 'A'), (300, 'a')], 2000);
+        assert_eq!(presses(&events), 1, "{events:?}");
+        assert!(!events
+            .iter()
+            .any(|e| e.event_type == KeyEventType::Release && e.timestamp < events[0].timestamp));
+    }
+
+    #[test]
+    fn held_command_key_emits_nothing_when_releases_are_reported() {
+        let (mut l, rx) = listener();
+        l.set_release_reporting(true);
+        l.swallow_press(CtKeyCode::Char('a'));
+        // Kitty repeat events, Windows console repeats (as presses), release
+        for _ in 0..5 {
+            l.send_repeat(CtKeyCode::Char('a'));
+            assert!(!l.send_press(CtKeyCode::Char('A')));
+        }
+        assert!(!l.send_release(CtKeyCode::Char('a')));
+        assert_eq!(rx.try_iter().count(), 0);
+        // The next keystroke of the key is reported normally
+        assert!(l.send_press(CtKeyCode::Char('a')));
+        assert!(l.send_release(CtKeyCode::Char('a')));
+        assert_eq!(rx.try_iter().count(), 2);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! N-Key Rollover and Ghosting test module
 
+use super::auto_test::GOOD_ROLLOVER;
 use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashSet;
@@ -22,7 +23,8 @@ pub struct RolloverTest {
     /// Expected keys (for ghost detection - set by user)
     expected_keys: HashSet<KeyCode>,
     /// Whether key releases are real. With press-only terminal input releases
-    /// are synthesized on a timer, so held keys "let go" after ~120 ms.
+    /// are synthesized on a timer, so the number of keys "down" at once is
+    /// a guess.
     real_releases: bool,
 }
 
@@ -48,9 +50,15 @@ impl RolloverTest {
     }
 
     /// Tell the test where events come from. Without real releases the peak
-    /// count is only a lower bound and is not judged.
+    /// count is not a measurement and is not shown.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.real_releases = source.has_release_events();
+    }
+
+    /// Whether the peak rollover is a measurement with the current input
+    /// source (key releases are real).
+    pub fn rollover_measurable(&self) -> bool {
+        self.real_releases
     }
 
     /// Get current number of pressed keys
@@ -195,37 +203,53 @@ impl KeyboardTest for RolloverTest {
         ));
 
         // Max rollover
-        // 1-2 keys is not enough evidence either way (hold more keys to test).
-        // With synthesized releases only keys pressed within ~120 ms of each
-        // other count as held together, so the peak is a lower bound.
-        let status = match self.max_simultaneous {
-            _ if !self.real_releases => ResultStatus::Info,
-            0..=2 => ResultStatus::Info,
-            3..=5 => ResultStatus::Warning,
-            _ => ResultStatus::Ok,
-        };
-        results.push(TestResult::new(
-            "Max Rollover",
-            self.rollover_rating(),
-            status,
-        ));
-
-        results.push(TestResult::info(
-            "Peak Keys",
-            format!("{} simultaneous", self.max_simultaneous),
-        ));
         if !self.real_releases {
+            // Releases are guessed: a tap stays "down" for up to 750 ms, so
+            // fast typing looks like several keys held at once, while the
+            // keys of a held chord are let go once autorepeat moves on to
+            // the last one. The peak is neither an upper nor a lower bound.
+            results.push(TestResult::info("Max Rollover", "n/a (terminal input)"));
             results.push(TestResult::info(
                 "Terminal reports",
-                "presses only: peak is a lower bound",
+                "presses only; releases guessed",
+            ));
+            results.push(TestResult::info(
+                "rollover needs",
+                "releases: evdev or kitty protocol",
+            ));
+        } else {
+            // 1-2 keys is not enough evidence either way (hold more keys to
+            // test). 3-5 may be the keyboard's limit or just the number of
+            // keys the user held, which the test cannot tell apart.
+            let status = match self.max_simultaneous {
+                0..=2 => ResultStatus::Info,
+                n if n < GOOD_ROLLOVER => ResultStatus::Warning,
+                _ => ResultStatus::Ok,
+            };
+            results.push(TestResult::new(
+                "Max Rollover",
+                self.rollover_rating(),
+                status,
+            ));
+            results.push(TestResult::info(
+                "Peak Keys",
+                format!("{} simultaneous", self.max_simultaneous),
+            ));
+            if status == ResultStatus::Warning {
+                results.push(TestResult::info(
+                    format!("  Held more than {}?", self.max_simultaneous),
+                    "the keyboard limits rollover",
+                ));
+                results.push(TestResult::info(
+                    format!("  Held only {}?", self.max_simultaneous),
+                    format!("not a fault: hold {}+ keys", GOOD_ROLLOVER),
+                ));
+            }
+            results.push(TestResult::info(
+                "Avg Rollover",
+                format!("{:.1} keys", self.avg_rollover()),
             ));
         }
-
-        // Average rollover
-        results.push(TestResult::info(
-            "Avg Rollover",
-            format!("{:.1} keys", self.avg_rollover()),
-        ));
 
         // Ghost detections. A ghost arrives as an ordinary key press, so it
         // cannot be told apart without knowing which keys are really held.
@@ -486,23 +510,53 @@ mod tests {
             test.process_event(&press(KeyCode(key)));
         }
         assert_eq!(max_rollover_status(&test), ResultStatus::Ok);
+        assert!(!test
+            .get_results()
+            .iter()
+            .any(|r| r.label.contains("Held only")));
     }
 
     #[test]
-    fn press_only_input_does_not_judge_rollover() {
-        // Holding 6 keys one after another on a press-only terminal: the
-        // earlier ones are auto-released after ~120 ms, so only 4 overlap.
+    fn low_peak_is_worded_as_a_condition() {
+        // 4 keys at once: a 4KRO keyboard, or a user who held only 4 keys on
+        // a healthy one. The view must not call it the keyboard's limit.
         let mut test = RolloverTest::new();
-        test.set_input_source(InputSource::TerminalPressOnly);
+        test.set_input_source(InputSource::Evdev);
         for key in 30..34 {
             test.process_event(&press(KeyCode(key)));
         }
-        assert_eq!(test.max_rollover(), 4);
-        assert_eq!(max_rollover_status(&test), ResultStatus::Info);
-        assert!(test
-            .get_results()
+        let results = test.get_results();
+        let more = results
             .iter()
-            .any(|r| r.value.contains("lower bound")));
+            .find(|r| r.label.contains("Held more than 4?"))
+            .expect("condition for a real limit");
+        assert!(more.value.contains("limits rollover"));
+        let only = results
+            .iter()
+            .find(|r| r.label.contains("Held only 4?"))
+            .expect("condition for a user who held few keys");
+        assert!(only.value.contains("not a fault"), "{:?}", only);
+    }
+
+    #[test]
+    fn press_only_input_does_not_show_a_rollover_number() {
+        // A press-only terminal keeps a tap "down" for up to 750 ms: typing
+        // five letters quickly looks like five keys held at once, although
+        // the user never held more than one. No count, no grade.
+        let mut test = RolloverTest::new();
+        test.set_input_source(InputSource::TerminalPressOnly);
+        for key in 30..35 {
+            test.process_event(&press(KeyCode(key)));
+        }
+        assert_eq!(test.max_rollover(), 5);
+        assert!(!test.rollover_measurable());
+        let results = test.get_results();
+        let max = results.iter().find(|r| r.label == "Max Rollover").unwrap();
+        assert_eq!(max.status, ResultStatus::Info);
+        assert_eq!(max.value, "n/a (terminal input)");
+        assert!(!results
+            .iter()
+            .any(|r| r.value.contains("5KRO") || r.value.contains("5 simultaneous")));
     }
 
     #[test]
