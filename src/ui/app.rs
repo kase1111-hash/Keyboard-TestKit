@@ -894,6 +894,8 @@ impl App {
             FnKeyMode::RestoreWithModifier => FnKeyMode::Disabled,
         };
         self.oem_test.set_fn_mode(next_mode);
+        // Settings > Save writes the config: keep the mode in it
+        self.config.oem_keys.fn_mode = next_mode;
         let mode_name = match next_mode {
             FnKeyMode::Disabled => "Disabled",
             FnKeyMode::CaptureOnly => "Capture Only",
@@ -1691,6 +1693,19 @@ mod tests {
         app.reset_current();
         assert_eq!(app.rollover_test.current_count(), 1);
         assert_eq!(app.rollover_test.max_rollover(), 1);
+    }
+
+    #[test]
+    fn fn_mode_changes_reach_the_saved_config() {
+        let mut app = App::default();
+        let before = app.config.oem_keys.fn_mode;
+        app.settings_selected = 5;
+        app.adjust_setting(true);
+        assert_ne!(app.oem_test.fn_mode(), before);
+        assert_eq!(app.config.oem_keys.fn_mode, app.oem_test.fn_mode());
+        // 'f' in the OEM/FN view cycles the same way
+        app.cycle_fn_mode();
+        assert_eq!(app.config.oem_keys.fn_mode, app.oem_test.fn_mode());
     }
 
     #[test]
