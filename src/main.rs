@@ -45,7 +45,7 @@ use std::io::stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use keyboard_testkit::{
     config::Config,
@@ -489,6 +489,7 @@ fn run_app(
     if auto_start {
         app.start_auto_test();
     }
+    let mut held = HeldKeyFilter::default();
 
     // Main loop
     loop {
@@ -607,7 +608,7 @@ fn run_app(
         if event::poll(frame_interval(app.config.ui.refresh_rate_hz))? {
             loop {
                 if let Event::Key(key) = event::read()? {
-                    handle_terminal_key(&mut app, &mut listener, use_evdev, key);
+                    handle_terminal_key(&mut app, &mut listener, &mut held, use_evdev, key);
                 }
                 if app.state == AppState::Quitting || !event::poll(Duration::ZERO)? {
                     break;
@@ -719,6 +720,99 @@ enum Command {
     SettingsSave,
 }
 
+impl Command {
+    /// Whether the command may fire again while its key is held: moving
+    /// between views or settings values, which is what holding Tab or an
+    /// arrow key is for. Everything else changes state once per keystroke.
+    fn repeats_safely(self) -> bool {
+        matches!(
+            self,
+            Command::None
+                | Command::NextView
+                | Command::PrevView
+                | Command::ShowView(_)
+                | Command::SettingsUp
+                | Command::SettingsDown
+                | Command::SettingsIncrease
+                | Command::SettingsDecrease
+        )
+    }
+}
+
+/// How much of the keyboard the auto test claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoKeys {
+    /// No run in progress: the usual commands
+    Free,
+    /// A run is in progress: every key is test input but Ctrl+N and Ctrl+C
+    Running,
+    /// A run just ended while keys were still being pressed (see
+    /// `App::auto_test_just_ended`): plain keys are still test input, only
+    /// Ctrl chords are commands
+    Ending,
+}
+
+impl AutoKeys {
+    fn of(app: &App) -> Self {
+        if app.auto_test_running() {
+            AutoKeys::Running
+        } else if app.auto_test_just_ended() {
+            AutoKeys::Ending
+        } else {
+            AutoKeys::Free
+        }
+    }
+}
+
+/// Reports of a held key come this soon after the previous report of it:
+/// the first autorepeat after the repeat delay (Windows and GNOME 500 ms,
+/// KDE 600 ms, X11 660 ms, plus read latency), then one every 30-50 ms.
+const HELD_KEY_WINDOW: Duration = Duration::from_millis(750);
+
+/// Recognises a held command key. Legacy terminals and the Windows console
+/// report autorepeat as more presses of the same key (only the kitty
+/// protocol marks them as repeats), so holding Ctrl+N would skip one step
+/// per repeat and holding Ctrl+C would abort the auto test and then quit.
+///
+/// A press identical to the previous report (same key and modifiers) within
+/// [`HELD_KEY_WINDOW`] of it, with no release in between, is that key still
+/// held. The cost, on terminals without release events, is that pressing
+/// the same command key twice within 750 ms counts once.
+#[derive(Debug, Default)]
+struct HeldKeyFilter {
+    /// The latest report of a key and when it arrived
+    last: Option<(CtKeyCode, KeyModifiers, Instant)>,
+}
+
+impl HeldKeyFilter {
+    /// Note `key` arriving at `now`; returns whether it is a held key
+    /// reporting again rather than a new keystroke.
+    fn is_held(&mut self, key: &CtKeyEvent, now: Instant) -> bool {
+        let same = |(code, modifiers, _): &(CtKeyCode, KeyModifiers, Instant)| {
+            *code == key.code && *modifiers == key.modifiers
+        };
+        match key.kind {
+            KeyEventKind::Release => {
+                if self.last.as_ref().is_some_and(same) {
+                    self.last = None;
+                }
+                false
+            }
+            KeyEventKind::Repeat => {
+                self.last = Some((key.code, key.modifiers, now));
+                true
+            }
+            KeyEventKind::Press => {
+                let held = self.last.as_ref().is_some_and(|last| {
+                    same(last) && now.saturating_duration_since(last.2) < HELD_KEY_WINDOW
+                });
+                self.last = Some((key.code, key.modifiers, now));
+                held
+            }
+        }
+    }
+}
+
 /// Views whose purpose is pressing keys: there every plain key (letters,
 /// digits, Space, punctuation, with or without Shift) is test input, so
 /// mashing keys can never quit, reset, export or pause by accident.
@@ -760,7 +854,8 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 ///
 /// The rule, also shown in the help panel and README:
 /// - while the auto test runs, every key is test input except Ctrl+N (skip
-///   step) and Ctrl+C (abort);
+///   step) and Ctrl+C (abort), and right after it ends plain keys stay test
+///   input until the user stops typing (see [`AutoKeys::Ending`]);
 /// - everywhere else Tab / Shift+Tab switch views, Esc and Ctrl+C quit, and
 ///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export,
 ///   except in the Shortcuts view, where Ctrl combos are the test input;
@@ -771,10 +866,11 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 fn command_for_key(
     key: &CtKeyEvent,
     view: AppView,
-    auto_test_running: bool,
+    auto: AutoKeys,
     shortcuts_enabled: bool,
 ) -> Command {
-    // Controls only fire on the initial press, never on repeat or release.
+    // Controls only fire on the initial press, never on repeat or release
+    // (repeats a terminal reports as presses: see `HeldKeyFilter`).
     if key.kind != KeyEventKind::Press {
         return Command::None;
     }
@@ -788,7 +884,7 @@ fn command_for_key(
 
     // Ctrl+C: abort a running auto test, otherwise quit.
     if ctrl_char == Some('c') {
-        return if auto_test_running {
+        return if auto == AutoKeys::Running {
             Command::AbortAutoTest
         } else {
             Command::Quit
@@ -798,12 +894,18 @@ fn command_for_key(
     // While the auto test runs, every key is test input: only the two
     // Ctrl chords are interpreted, so 'q', 'r', Esc... can be verified like
     // any other key.
-    if auto_test_running {
+    if auto == AutoKeys::Running {
         return if ctrl_char == Some('n') {
             Command::SkipAutoStep
         } else {
             Command::None
         };
+    }
+    // The run just ended under the user's fingers (the rapid-tap step ends
+    // on a timer, a disconnect stops a sweep): the keys they are still
+    // pressing are not meant as commands.
+    if auto == AutoKeys::Ending && !ctrl {
+        return Command::None;
     }
 
     // Ctrl chords work in every view but Shortcuts, which records Ctrl
@@ -880,19 +982,30 @@ fn command_for_key(
     }
 }
 
+/// The command a terminal key event asks for, given what came before it.
+fn command_for_event(
+    key: &CtKeyEvent,
+    app: &App,
+    held: &mut HeldKeyFilter,
+    now: Instant,
+) -> Command {
+    let command = command_for_key(key, app.view, AutoKeys::of(app), app.shortcuts_enabled);
+    if held.is_held(key, now) && !command.repeats_safely() {
+        Command::None
+    } else {
+        command
+    }
+}
+
 /// Feed a terminal key event to the test pipeline and handle UI controls.
 fn handle_terminal_key(
     app: &mut App,
     listener: &mut KeyboardListener,
+    held: &mut HeldKeyFilter,
     use_evdev: bool,
     key: CtKeyEvent,
 ) {
-    let command = command_for_key(
-        &key,
-        app.view,
-        app.auto_test_running(),
-        app.shortcuts_enabled,
-    );
+    let command = command_for_event(&key, app, held, Instant::now());
 
     // When evdev is not in use, the terminal is the test input. Presses,
     // repeats and releases each mean something different to the tests.
@@ -1016,7 +1129,7 @@ mod tests {
     }
 
     fn cmd(key: CtKeyEvent, view: AppView) -> Command {
-        command_for_key(&key, view, false, true)
+        command_for_key(&key, view, AutoKeys::Free, true)
     }
 
     const TEST_VIEWS: [AppView; 8] = [
@@ -1129,7 +1242,7 @@ mod tests {
         }
         // Number keys freed with 'm'
         assert_eq!(
-            command_for_key(&plain('5'), AppView::Dashboard, false, false),
+            command_for_key(&plain('5'), AppView::Dashboard, AutoKeys::Free, false),
             Command::None
         );
     }
@@ -1162,7 +1275,8 @@ mod tests {
 
     #[test]
     fn running_auto_test_captures_every_key() {
-        let run = |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, true, true);
+        let run =
+            |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, AutoKeys::Running, true);
         for key in [
             plain('q'),
             plain(' '),
@@ -1178,6 +1292,131 @@ mod tests {
         }
         assert_eq!(run(ctrl('n')), Command::SkipAutoStep);
         assert_eq!(run(ctrl('c')), Command::AbortAutoTest);
+    }
+
+    #[test]
+    fn keys_still_typed_as_the_auto_test_ends_are_not_commands() {
+        // Tapping 'r' (or q, Space, a digit...) for the rapid-tap step a
+        // moment after it ended must not reset the run, quit or pause
+        let ending =
+            |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, AutoKeys::Ending, true);
+        for key in [
+            plain('q'),
+            plain('r'),
+            plain(' '),
+            plain('e'),
+            plain('5'),
+            legacy_shift('R'),
+            legacy_shift('A'),
+            press(CtKeyCode::Esc, KeyModifiers::NONE),
+            press(CtKeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            assert_eq!(ending(key), Command::None, "{:?}", key);
+        }
+        // Deliberate Ctrl chords still work (there is nothing left to skip)
+        assert_eq!(ending(ctrl('c')), Command::Quit);
+        assert_eq!(ending(ctrl('e')), Command::Export);
+        assert_eq!(ending(ctrl('n')), Command::None);
+        // Once the user has stopped typing the Auto view's keys are back
+        assert_eq!(cmd(plain('r'), AppView::AutoTest), Command::ResetCurrent);
+    }
+
+    /// Commands for `keys`, each `(ms after the first, key)`, fed to `app`
+    /// the way the main loop does, applying each command as it comes.
+    fn commands_for(app: &mut App, keys: &[(u64, CtKeyEvent)]) -> Vec<Command> {
+        let mut held = HeldKeyFilter::default();
+        let t0 = Instant::now();
+        keys.iter()
+            .map(|(ms, key)| {
+                let command =
+                    command_for_event(key, app, &mut held, t0 + Duration::from_millis(*ms));
+                apply_command(app, command);
+                command
+            })
+            .collect()
+    }
+
+    /// A key held down in a terminal without release events: the press, then
+    /// autorepeat after 500 ms every 33 ms until `until_ms`.
+    fn held_down(key: CtKeyEvent, until_ms: u64) -> Vec<(u64, CtKeyEvent)> {
+        let mut reports = vec![(0, key)];
+        reports.extend((500..=until_ms).step_by(33).map(|ms| (ms, key)));
+        reports
+    }
+
+    #[test]
+    fn holding_a_command_key_fires_it_once() {
+        // Ctrl+N held for 0.7 s during the auto test skips one step, not all
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(&mut app, &held_down(ctrl('n'), 700));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| **c == Command::SkipAutoStep)
+                .count(),
+            1
+        );
+        assert!(app.auto_test_running());
+
+        // Ctrl+C held a little long aborts the run but does not then quit
+        let commands = commands_for(&mut app, &held_down(ctrl('c'), 700));
+        assert_eq!(commands[0], Command::AbortAutoTest);
+        assert!(
+            commands[1..].iter().all(|c| *c == Command::None),
+            "{commands:?}"
+        );
+        assert_eq!(app.state, AppState::Running);
+
+        // Space held on the Dashboard pauses once, and stays paused
+        let mut app = App::default();
+        commands_for(&mut app, &held_down(plain(' '), 900));
+        assert_eq!(app.state, AppState::Paused);
+
+        // Esc held in Settings goes back, and does not quit from the Dashboard
+        let mut app = App::default();
+        app.view = AppView::Settings;
+        commands_for(
+            &mut app,
+            &held_down(press(CtKeyCode::Esc, KeyModifiers::NONE), 900),
+        );
+        assert_eq!(app.view, AppView::Dashboard);
+        assert_eq!(app.state, AppState::Running);
+    }
+
+    #[test]
+    fn separate_presses_and_moving_keys_still_work() {
+        // Two separate Ctrl+N presses skip two steps
+        let mut app = App::default();
+        app.start_auto_test();
+        let commands = commands_for(&mut app, &[(0, ctrl('n')), (1200, ctrl('n'))]);
+        assert_eq!(commands, vec![Command::SkipAutoStep; 2]);
+
+        // A reported release ends the keystroke (kitty, Windows console), so
+        // a quick second press is a new one
+        let release = CtKeyEvent::new_with_kind(
+            CtKeyCode::Char(' '),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let mut app = App::default();
+        commands_for(
+            &mut app,
+            &[(0, plain(' ')), (90, release), (200, plain(' '))],
+        );
+        assert_eq!(app.state, AppState::Running);
+
+        // Holding Tab or an arrow key keeps moving
+        let mut app = App::default();
+        let commands = commands_for(
+            &mut app,
+            &held_down(press(CtKeyCode::Tab, KeyModifiers::NONE), 600),
+        );
+        assert!(commands.iter().all(|c| *c == Command::NextView));
+        assert_eq!(
+            app.view,
+            AppView::from_index(commands.len() % AppView::all().len())
+        );
     }
 
     #[test]
@@ -1253,8 +1492,9 @@ mod tests {
         listener.set_release_reporting(source.has_release_events());
         let mut app = App::default();
         app.set_input_source(source);
+        let mut held = HeldKeyFilter::default();
         for key in keys {
-            handle_terminal_key(&mut app, &mut listener, false, *key);
+            handle_terminal_key(&mut app, &mut listener, &mut held, false, *key);
             listener.poll();
             while let Ok(event) = rx.try_recv() {
                 app.process_event(&event);

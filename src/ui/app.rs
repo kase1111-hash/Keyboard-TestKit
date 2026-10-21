@@ -28,6 +28,13 @@ const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// it, while a key that really stays down is still caught once the step ends.
 const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
 
+/// After the auto test ends (completed, or stopped), plain keys stay test
+/// input until the keyboard has been quiet this long. The rapid-tap step
+/// ends on a timer while the user is still tapping, and a run stopped by a
+/// disconnect ends mid-sweep: the next few keys would otherwise run the Auto
+/// view's single-key commands (`r` resets the run, `q` quits, Space pauses).
+pub const AFTER_RUN_GRACE: Duration = Duration::from_secs(2);
+
 /// Keyboard device nodes lost this close together are one unplug: one
 /// keyboard usually has several event nodes (keys, media keys, an NKRO
 /// interface) that all vanish when it is unplugged.
@@ -235,6 +242,8 @@ pub struct App {
     last_auto_step: Option<StepKind>,
     /// Keyboard disconnects since the tests were last reset
     disconnects: DisconnectLog,
+    /// Latest key press the tests saw (see [`App::auto_test_just_ended`])
+    last_key_press: Option<Instant>,
 }
 
 impl App {
@@ -301,6 +310,7 @@ impl App {
             findings_updated: None,
             last_auto_step: None,
             disconnects: DisconnectLog::default(),
+            last_key_press: None,
         };
         app.set_input_source(input_source);
         app
@@ -396,6 +406,12 @@ impl App {
         }
 
         self.total_events += 1;
+        if event.event_type == KeyEventType::Press {
+            self.last_key_press = Some(
+                self.last_key_press
+                    .map_or(event.timestamp, |t| t.max(event.timestamp)),
+            );
+        }
         self.keyboard_state.process_event(event);
 
         // Dispatch to all tests
@@ -576,6 +592,21 @@ impl App {
     /// Whether the guided auto test is currently running.
     pub fn auto_test_running(&self) -> bool {
         self.auto_test.is_running()
+    }
+
+    /// Whether the auto test ended so recently that plain keys are still
+    /// test input: less than [`AFTER_RUN_GRACE`] has passed since the run
+    /// ended and since the latest key press after that.
+    pub fn auto_test_just_ended(&self) -> bool {
+        self.auto_test_just_ended_at(Instant::now())
+    }
+
+    fn auto_test_just_ended_at(&self, now: Instant) -> bool {
+        let Some(ended) = self.auto_test.finished_at() else {
+            return false;
+        };
+        let last = self.last_key_press.map_or(ended, |t| t.max(ended));
+        now.saturating_duration_since(last) < AFTER_RUN_GRACE
     }
 
     /// Switch to the next view
@@ -1558,6 +1589,32 @@ mod tests {
         assert!(connection
             .detail
             .starts_with("Gaming Keyboard, Gaming Keyboard Consumer Control. "));
+    }
+
+    #[test]
+    fn keys_typed_as_the_auto_test_ends_stay_test_input() {
+        let mut app = app_at_auto_step(StepKind::RapidTap);
+        assert!(!app.auto_test_just_ended());
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let ms = |n: u64| ended + Duration::from_millis(n);
+        assert!(app.auto_test_just_ended_at(ms(100)));
+        // The user keeps tapping for a while after the step ends
+        for t in [80, 240, 400, 560] {
+            app.process_event(&event_at(30, KeyEventType::Press, ms(t)));
+            app.process_event(&event_at(30, KeyEventType::Release, ms(t + 40)));
+        }
+        assert!(app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE - Duration::from_millis(1)));
+        // Once the keyboard has been quiet for the grace period, commands work
+        assert!(!app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE));
+
+        // A run that ends while nobody is typing frees the keys after the
+        // grace period, and a fresh app has no run to protect
+        let mut app = app_at_auto_step(StepKind::Sweep);
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        assert!(!app.auto_test_just_ended_at(ended + AFTER_RUN_GRACE));
+        assert!(!App::default().auto_test_just_ended());
     }
 
     #[test]

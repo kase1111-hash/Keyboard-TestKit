@@ -157,7 +157,10 @@ reported as stuck, not dead.
 
 While the auto test runs every key is treated as test input, so `q`, `r`,
 `Esc` and the other shortcuts can be verified like any other key. `Ctrl+N`
-skips the current step and `Ctrl+C` aborts the run. The findings also appear
+skips the current step and `Ctrl+C` aborts the run. When the run ends (the
+rapid-tap step stops on a timer, a disconnect stops a sweep) the keys you are
+still pressing stay test input until you have stopped typing for 2 s, so a
+last tap of `r` or `q` does not wipe the run or quit. The findings also appear
 on the Dashboard (updated live, even without running the guided test), in the
 exported report and on stdout when you quit.
 
@@ -167,7 +170,9 @@ Keys you press while testing never trigger a command by accident: in the test
 views (Polling ... OEM/FN, `2`-`9`) every key is test input except `Tab`,
 `Esc` and `Ctrl` chords, and in the Shortcuts view `Ctrl` combos are test
 input too (except `Ctrl+C`, which quits). Single-key commands only work on
-the Dashboard, Auto and Help screens.
+the Dashboard, Auto and Help screens. Holding a command key runs it once,
+also in terminals that report a held key as repeated presses (only moving
+between views or Settings values may repeat).
 
 | Key | Where | Action |
 |-----|-------|--------|

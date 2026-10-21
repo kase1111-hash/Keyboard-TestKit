@@ -552,6 +552,12 @@ impl AutoTest {
         &self.outcomes
     }
 
+    /// When the run completed or was stopped (None while it runs or before
+    /// the first start).
+    pub fn finished_at(&self) -> Option<Instant> {
+        self.finished_at
+    }
+
     /// Time spent in the current step.
     pub fn step_elapsed(&self) -> Duration {
         self.step_started.map(|t| t.elapsed()).unwrap_or_default()
