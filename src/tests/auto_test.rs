@@ -1084,7 +1084,10 @@ impl AutoTest {
         }
 
         // --- Bounce / chatter (continuous) --------------------------------
-        if releases {
+        // Both need kernel timestamps: a terminal stamps events when the app
+        // reads them, so a press and release read in one burst look like a
+        // bounce (e.g. over SSH or while the app is busy drawing).
+        if self.input_source.has_precise_timestamps() {
             let bouncy = ctx.hold_release.bouncy_keys();
             if !bouncy.is_empty() {
                 let detail = bouncy
@@ -1112,11 +1115,12 @@ impl AutoTest {
                 findings.push(Finding::new(
                     Severity::Info,
                     "Key chatter",
-                    "Chatter cannot be measured with terminal input",
+                    "Chatter and bounce cannot be measured with terminal input",
                     "Terminal timestamps are taken when the app reads the event, so a \
                      switch firing twice cannot be told from a fast tap.",
                     if cfg!(target_os = "linux") {
-                        "Use the evdev input path (sudo or the 'input' group) to check for chatter."
+                        "Use the evdev input path (sudo or the 'input' group) to check for \
+                         chatter and bounce."
                     } else {
                         ""
                     },
@@ -2402,6 +2406,12 @@ mod tests {
         let t = AutoTest::new(InputSource::Evdev);
         let findings = t.analyze(&ctx!(parts));
         assert!(findings.iter().any(|f| f.category == "Switch bounce"));
+
+        // The same burst from a terminal is read-time stamps, not a bounce
+        let t = AutoTest::new(InputSource::TerminalWithRelease);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(|f| f.category == "Switch bounce"));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
     }
 
     #[test]
