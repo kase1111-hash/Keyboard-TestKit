@@ -799,11 +799,15 @@ enum Command {
 impl Command {
     /// Whether the command may fire again while its key is held: moving
     /// between views or settings values, which is what holding Tab or an
-    /// arrow key is for. Everything else changes state once per keystroke.
+    /// arrow key is for, and dismissing a run's result, which does nothing
+    /// once done (Enter pressed again and again on a terminal without
+    /// releases looks held). Everything else changes state once per
+    /// keystroke.
     fn repeats_safely(self) -> bool {
         matches!(
             self,
             Command::None
+                | Command::DismissAutoResult
                 | Command::NextView
                 | Command::PrevView
                 | Command::ShowView(_)
@@ -1520,6 +1524,44 @@ mod tests {
         assert!(!app.auto_result_pending());
         let command = command_for_event(&plain('q'), &app, &mut held, at(13_000));
         assert_eq!(command, Command::Quit);
+    }
+
+    #[test]
+    fn enter_pressed_again_and_again_dismisses_the_result_once_quiet() {
+        // A press-only terminal (no releases): the user taps on as the
+        // rapid-tap step ends, then presses Enter every 600 ms until the
+        // commands come back. Enter pressed again that soon looks held.
+        let mut app = App::default();
+        app.set_input_source(InputSource::TerminalPressOnly);
+        app.start_auto_test();
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let at = |ms: u64| ended + Duration::from_millis(ms);
+        app.process_event(&KeyEvent::new(
+            KeyCode(30),
+            keyboard_testkit::keyboard::KeyEventType::Press,
+            at(500),
+            0,
+        ));
+        let enter = press(CtKeyCode::Enter, KeyModifiers::NONE);
+        let mut held = HeldKeyFilter::default();
+        let mut commands = Vec::new();
+        for ms in (1_500..4_000).step_by(600) {
+            let command = command_for_event(&enter, &app, &mut held, at(ms));
+            apply_command(&mut app, command);
+            commands.push((ms, command));
+        }
+        assert_eq!(
+            commands,
+            vec![
+                (1_500, Command::None),
+                (2_100, Command::None),
+                (2_700, Command::DismissAutoResult),
+                (3_300, Command::None),
+                (3_900, Command::None),
+            ]
+        );
+        assert!(!app.auto_result_pending());
     }
 
     /// Commands for `keys`, each `(ms after the first, key)`, fed to `app`
