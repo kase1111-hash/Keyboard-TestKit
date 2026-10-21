@@ -205,8 +205,9 @@ is replaced by the 2000 ms default.
 
 A key counts as stuck only while it is still down past the threshold. Keys
 you held that long and then released are listed as long holds in the Sticky
-view, not as faults. While paused (`Space`) nothing new is recorded, but keys
-that were already down still register their release.
+view, not as faults (if you did not hold one that long, the key is
+sticking). While paused (`Space`) nothing new is recorded, but keys that were
+already down still register their release.
 
 ## Diagnostic Logic
 

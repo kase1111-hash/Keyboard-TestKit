@@ -11,7 +11,7 @@ struct StickyKeyRecord {
     key: KeyCode,
     duration_at_detection: Duration,
     occurrences: u32,
-    /// How many of those holds ended in a normal release
+    /// How many of those holds ended in a release
     released: u32,
     /// Longest of those released holds
     longest_released: Duration,
@@ -121,9 +121,9 @@ impl StickinessTest {
         stuck
     }
 
-    /// Keys that were held past the threshold and then released normally:
+    /// Keys that were held past the threshold and then released:
     /// (key, longest such hold, how many times). These are long holds, not
-    /// faults, unless nobody was holding the key.
+    /// faults, unless nobody was holding the key (then it is sticking).
     pub fn long_holds(&self) -> Vec<(KeyCode, Duration, u32)> {
         self.flagged_keys
             .iter()
@@ -238,13 +238,14 @@ impl KeyboardTest for StickinessTest {
             results.push(TestResult::info("  Not holding it?", "the switch is stuck"));
         }
 
-        // Past long holds that ended in a normal release. Only a fault if the
-        // key was not being held on purpose (then it is sticking).
+        // Past long holds that ended in a release. Only a fault if the key
+        // was not being held on purpose (then it is sticking); the test
+        // cannot tell, so say what to look for.
         let long_holds = self.long_holds();
         if !long_holds.is_empty() {
             results.push(TestResult::info(
                 "Long Holds",
-                format!("{} key(s), released normally", long_holds.len()),
+                format!("{} key(s), then released", long_holds.len()),
             ));
             for (key, longest, count) in &long_holds {
                 let key_info = keymap::get_key_info(*key);
@@ -253,6 +254,10 @@ impl KeyboardTest for StickinessTest {
                     format!("{}x, longest {:.1}s", count, longest.as_secs_f64()),
                 ));
             }
+            results.push(TestResult::info(
+                "  Not held that long?",
+                "the key is sticking",
+            ));
         }
 
         // Keys that are down but have not reached the threshold yet
@@ -401,6 +406,11 @@ mod tests {
         assert!(results
             .iter()
             .any(|r| r.label == "Long Holds" && r.status == ResultStatus::Info));
+        // The view cannot know the hold was deliberate; it says what a
+        // sticking key would look like instead of calling the release normal
+        assert!(results
+            .iter()
+            .any(|r| r.value == "the key is sticking" && r.status == ResultStatus::Info));
     }
 
     #[test]
