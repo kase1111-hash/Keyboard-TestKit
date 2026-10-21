@@ -153,9 +153,12 @@ const fn eviocgid() -> u64 {
 const BUS_USB: u16 = 0x03;
 const BUS_BLUETOOTH: u16 = 0x05;
 
+/// Logitech's USB vendor ID.
+const VENDOR_LOGITECH: u16 = 0x046d;
+
 /// Words in the names of 2.4 GHz receivers and of keyboards paired to them:
-/// "Logitech USB Receiver", "Logitech Wireless Keyboard PID:4023",
-/// "Microsoft Nano Transceiver", "2.4G Wireless Receiver", "... Dongle".
+/// "Logitech USB Receiver", "Microsoft Nano Transceiver", "2.4G Wireless
+/// Receiver", "2.4G Wireless Keyboard", "... Dongle".
 const RECEIVER_NAME_HINTS: [&str; 7] = [
     "receiver",
     "transceiver",
@@ -166,13 +169,13 @@ const RECEIVER_NAME_HINTS: [&str; 7] = [
     "dongle",
 ];
 
-/// The device's bus type (`BUS_*`), read with `EVIOCGID`.
-fn read_bus_type(file: &File) -> Option<u16> {
+/// The device's bus type (`BUS_*`) and vendor ID, read with `EVIOCGID`.
+fn read_bus_and_vendor(file: &File) -> Option<(u16, u16)> {
     let mut id = [0u16; 4];
     // SAFETY: EVIOCGID writes one struct input_id (four u16s, the size of
     // `id`) to the pointer we pass; the fd is an open evdev device.
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), eviocgid() as _, id.as_mut_ptr()) };
-    (rc >= 0).then_some(id[0])
+    (rc >= 0).then_some((id[0], id[1]))
 }
 
 /// Whether a sysfs path component names a HID device ("0003:046D:C52B.0003":
@@ -188,15 +191,21 @@ fn is_hid_device_dir(component: &str) -> bool {
 }
 
 /// Whether a keyboard reaches the computer over a radio link, whose reports
-/// can be held back and delivered late and together. `sysfs_path` is where
-/// its event node really lives (`/sys/class/input/eventN`, resolved).
+/// can be held back and delivered late and together. `id` is its bus type
+/// and vendor ID, `sysfs_path` where its event node really lives
+/// (`/sys/class/input/eventN`, resolved).
 ///
 /// Bluetooth keyboards have the Bluetooth bus type, also LE ones that
 /// bluetoothd feeds in through uhid. A 2.4 GHz receiver is a USB device: it
 /// shows in its name or its keyboard's, or (Logitech Unifying, Bolt and
 /// Lightspeed receivers) the paired keyboard is a HID device under the
 /// receiver's own. A receiver that does neither is taken for a cable.
-fn is_wireless_link(bus_type: Option<u16>, name: &str, sysfs_path: &Path) -> bool {
+///
+/// Logitech keyboards keep "LIGHTSPEED Wireless" in their name on the
+/// cable ("Logitech G915 TKL LIGHTSPEED Wireless RGB Mechanical Gaming
+/// Keyboard"), while Logitech receivers are named "USB Receiver" and the
+/// keyboards paired to them sit behind them: for Logitech only those count.
+fn is_wireless_link(id: Option<(u16, u16)>, name: &str, sysfs_path: &Path) -> bool {
     let name = name.to_lowercase();
     let paired_behind_receiver = || {
         sysfs_path
@@ -205,9 +214,12 @@ fn is_wireless_link(bus_type: Option<u16>, name: &str, sysfs_path: &Path) -> boo
             .count()
             >= 2
     };
-    bus_type == Some(BUS_BLUETOOTH)
-        || RECEIVER_NAME_HINTS.iter().any(|hint| name.contains(hint))
-        || (bus_type == Some(BUS_USB) && paired_behind_receiver())
+    match id {
+        Some((BUS_BLUETOOTH, _)) => true,
+        Some((BUS_USB, _)) if paired_behind_receiver() => true,
+        Some((BUS_USB, VENDOR_LOGITECH)) => name.contains("receiver"),
+        _ => RECEIVER_NAME_HINTS.iter().any(|hint| name.contains(hint)),
+    }
 }
 
 /// Which clock a device's event timestamps are expressed in.
@@ -575,7 +587,7 @@ fn open_device(path: &Path) -> io::Result<OpenDevice> {
     let name = device_name(path);
     let node = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let sysfs_path = fs::canonicalize(format!("/sys/class/input/{}", node)).unwrap_or_default();
-    let wireless = is_wireless_link(read_bus_type(&file), &name, &sysfs_path);
+    let wireless = is_wireless_link(read_bus_and_vendor(&file), &name, &sysfs_path);
     Ok(OpenDevice {
         file,
         path: path.to_path_buf(),
@@ -1108,38 +1120,38 @@ mod tests {
 
     #[test]
     fn wireless_keyboards_are_told_from_wired_ones() {
-        let wireless = |bus, name, sysfs: &str| is_wireless_link(bus, name, Path::new(sysfs));
+        let wireless = |id, name, sysfs: &str| is_wireless_link(id, name, Path::new(sysfs));
         // Bluetooth classic, and LE through bluetoothd's uhid device
         assert!(wireless(
-            Some(BUS_BLUETOOTH),
+            Some((BUS_BLUETOOTH, 0x05ac)),
             "Keychron K2",
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-10/1-10:1.0/bluetooth/hci0/\
              hci0:256/0005:05AC:024F.000A/input/input31/event22"
         ));
         assert!(wireless(
-            Some(BUS_BLUETOOTH),
+            Some((BUS_BLUETOOTH, VENDOR_LOGITECH)),
             "MX Keys Mini",
             "/sys/devices/virtual/misc/uhid/0005:046D:B369.0009/input/input30/event21"
         ));
         // A Logitech receiver's paired keyboard, renamed by hid-logitech-hidpp
         // so that its name gives nothing away: a HID device under another
         assert!(wireless(
-            Some(BUS_USB),
+            Some((BUS_USB, VENDOR_LOGITECH)),
             "Logitech K270",
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.2/0003:046D:C52B.0003/\
              0003:046D:4003.0004/input/input20/event7"
         ));
         // Receivers known by name
-        for name in [
-            "Logitech USB Receiver",
-            "Compx 2.4G Receiver",
-            "Microsoft Microsoft® Nano Transceiver v2.0",
-            "Logitech Wireless Keyboard PID:4023",
-            "Razer Razer Dongle",
+        for (vendor, name) in [
+            (VENDOR_LOGITECH, "Logitech USB Receiver"),
+            (0x1a2c, "Compx 2.4G Receiver"),
+            (0x045e, "Microsoft Microsoft® Nano Transceiver v2.0"),
+            (0x1a2c, "2.4G Wireless Keyboard"),
+            (0x1532, "Razer Razer Dongle"),
         ] {
             assert!(
                 wireless(
-                    Some(BUS_USB),
+                    Some((BUS_USB, vendor)),
                     name,
                     "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3/1-3:1.0/\
                      0003:1A2C:2124.0005/input/input9/event5"
@@ -1148,15 +1160,30 @@ mod tests {
                 name
             );
         }
+        // A Logitech keyboard on its cable keeps "LIGHTSPEED Wireless" in its
+        // name; paired to its receiver it sits behind it
+        let g915 = "Logitech G915 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard";
+        assert!(!wireless(
+            Some((BUS_USB, VENDOR_LOGITECH)),
+            g915,
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4:1.0/0003:046D:C343.0006/\
+             input/input11/event6"
+        ));
+        assert!(wireless(
+            Some((BUS_USB, VENDOR_LOGITECH)),
+            g915,
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4:1.2/0003:046D:C545.0007/\
+             0003:046D:408E.0008/input/input12/event7"
+        ));
         // Cables: a USB keyboard and a laptop's own
         assert!(!wireless(
-            Some(BUS_USB),
+            Some((BUS_USB, 0x04d9)),
             "Holtek USB Keyboard",
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0/0003:04D9:0169.0001/\
              input/input5/event3"
         ));
         assert!(!wireless(
-            Some(0x11),
+            Some((0x11, 0x0001)),
             "AT Translated Set 2 keyboard",
             "/sys/devices/platform/i8042/serio0/input/input3/event2"
         ));
