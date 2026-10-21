@@ -45,6 +45,12 @@ use std::sync::Arc;
 
 use libc;
 
+/// Exit status of a mapper with nothing to map ([`MapperError::NoMappings`],
+/// sysexits' EX_CONFIG). The service unit does not restart on it: a restart
+/// cannot help until the config changes, and `RestartSec` keeps the restarts
+/// under systemd's start limit, so they would go on every few seconds.
+pub const EXIT_NOTHING_TO_MAP: i32 = 78;
+
 /// Error type for mapper operations
 #[derive(Debug)]
 pub enum MapperError {
@@ -748,6 +754,8 @@ Type=simple
 ExecStart=/usr/local/bin/keyboard-testkit --mapper{preset_arg}{config_arg}
 Restart=on-failure
 RestartSec=3
+# Nothing to map: a restart cannot help until the config changes
+RestartPreventExitStatus={EXIT_NOTHING_TO_MAP}
 StandardOutput=journal
 StandardError=journal
 
@@ -926,6 +934,10 @@ mod tests {
         assert!(service.contains("[Install]"));
         assert!(service.contains("--mapper"));
         assert!(service.contains("--preset asus-g14"));
+        // Restarts every 3 s stay under systemd's start limit: a mapper with
+        // nothing to map would otherwise be restarted forever
+        assert!(service.contains("Restart=on-failure"));
+        assert!(service.contains(&format!("RestartPreventExitStatus={}", EXIT_NOTHING_TO_MAP)));
     }
 
     #[test]

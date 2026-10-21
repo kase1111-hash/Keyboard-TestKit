@@ -284,6 +284,10 @@ fn main() -> Result<()> {
                 mapper::run_mapper(preset.as_deref(), device, config.as_deref(), &[], running)
             {
                 error!("Mapper error: {}", e);
+                // Its own exit status, which the service does not restart on
+                if matches!(e, mapper::MapperError::NoMappings) {
+                    std::process::exit(mapper::EXIT_NOTHING_TO_MAP);
+                }
                 return Err(e.into());
             }
             return Ok(());
