@@ -886,7 +886,8 @@ impl AutoTest {
                      access, or use a terminal with the kitty keyboard protocol."
                 } else {
                     "Use a terminal that supports the kitty keyboard protocol \
-                     (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+)."
+                     (kitty, foot, Ghostty, Alacritty 0.13+, or WezTerm with \
+                     enable_kitty_keyboard = true)."
                 },
             ));
         }
@@ -1570,8 +1571,8 @@ fn unreportable_advice(source: InputSource) -> &'static str {
     if cfg!(target_os = "linux") {
         "Run with sudo (or add your user to the 'input' group) so evdev can check them."
     } else if source == InputSource::TerminalPressOnly {
-        "A terminal with the kitty keyboard protocol (kitty, WezTerm, Ghostty, \
-         Alacritty 0.13+) reports modifier keys."
+        "A terminal with the kitty keyboard protocol (kitty, Ghostty, Alacritty 0.13+, \
+         or WezTerm with enable_kitty_keyboard = true) reports modifier keys."
     } else {
         "This console does not report them; check them in another application."
     }

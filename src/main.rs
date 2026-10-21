@@ -490,7 +490,7 @@ fn run_app(
 
     // When the terminal is the test input, ask it for key-release events
     // where it supports them (kitty, foot, Ghostty, Alacritty 0.13+, WezTerm
-    // with enable_kitty_keyboard); Windows consoles report releases
+    // with enable_kitty_keyboard = true); Windows consoles report releases
     // natively. Evdev already has real releases, so the terminal is left in
     // its normal mode.
     let release_reporting =
