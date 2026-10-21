@@ -32,6 +32,9 @@ pub struct PollingRateTest {
     max_interval_us: Option<u64>,
     /// Whether event timestamps come from the device (needed for the estimate)
     precise_timestamps: bool,
+    /// Whether the source reports releases; without them fast taps after a
+    /// pause can be taken for autorepeat, so counts are approximate
+    real_releases: bool,
 }
 
 impl PollingRateTest {
@@ -48,6 +51,7 @@ impl PollingRateTest {
             min_interval_us: None,
             max_interval_us: None,
             precise_timestamps: true,
+            real_releases: true,
         }
     }
 
@@ -55,6 +59,7 @@ impl PollingRateTest {
     /// device (kernel) timestamps; terminal input is stamped when it is read.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.precise_timestamps = source.has_precise_timestamps();
+        self.real_releases = source.has_release_events();
     }
 
     /// Change the test duration (used for the progress display).
@@ -314,6 +319,13 @@ impl KeyboardTest for PollingRateTest {
     }
 
     fn get_results(&self) -> Vec<TestResult> {
+        // Without releases the terminal listener tells taps from autorepeat
+        // by their timing alone, so fast taps after a pause can go uncounted
+        let approximate = if self.real_releases {
+            ""
+        } else {
+            " (approximate: no key releases)"
+        };
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
@@ -334,7 +346,7 @@ impl KeyboardTest for PollingRateTest {
 
         results.push(TestResult::info(
             "Events Recorded",
-            format!("{}", self.event_count),
+            format!("{}{}", self.event_count, approximate),
         ));
 
         // Poll rate inferred from timestamp quantization (needs kernel timestamps)
@@ -389,14 +401,14 @@ impl KeyboardTest for PollingRateTest {
         if let Some(rate) = display_rate {
             results.push(TestResult::info(
                 "Burst Key Rate",
-                format!("{:.1} keys/s", rate),
+                format!("{:.1} keys/s{}", rate, approximate),
             ));
         }
 
         if let Some(avg) = self.avg_rate_hz() {
             results.push(TestResult::info(
                 "Avg Key Rate",
-                format!("{:.1} keys/s", avg),
+                format!("{:.1} keys/s{}", avg, approximate),
             ));
         }
 

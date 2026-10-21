@@ -32,7 +32,7 @@ src/
 │   ├── keymap.rs        # Key codes & names
 │   ├── layout.rs        # ANSI/ISO/JIS layout detection & rows
 │   ├── remap.rs         # OEM/FN key remapping
-│   └── evdev_listener.rs # Linux evdev support (reconnects, SYN_DROPPED)
+│   └── evdev_listener.rs # Linux evdev support (reconnects, SYN_DROPPED, wireless keyboards)
 ├── tests/               # Test implementations
 │   ├── mod.rs           # KeyboardTest trait & common structures
 │   ├── polling.rs       # Report-rate estimate from timestamp quantization
@@ -120,7 +120,11 @@ trait KeyboardTest {
 4. **EventTimingTest** - Gaps between key events: typing rhythm, never a
    keyboard rating (the poll interval comes from PollingRateTest)
 5. **HoldReleaseTest** - Hold times & switch chatter (same-key re-press
-   < 20-40 ms after release or < 40 ms after press, evdev only)
+   < 20-40 ms after release or < 40 ms after press, counted only with a
+   hold < 20 ms on either side, after a hold >= 500 ms, or from a keyboard
+   whose bus has no radio, `App::note_radio_free_keys`; evdev only;
+   bounces in events from a wireless keyboard, `App::note_wireless_keys`,
+   are never judged a fault)
 6. **ShortcutTest** - Modifier combos and known system shortcuts (n/a when
    the source does not report modifier keys)
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison
@@ -173,7 +177,13 @@ so the app can show them; saving over a file that did not load keeps it as
   q quit, S settings, t theme, m number keys, ? help
 - While the auto test runs every key is test input except Ctrl+N (skip a
   step) and Ctrl+C (abort); after it ends plain keys stay test input until
-  the keyboard has been quiet for 2 s (`App::auto_test_just_ended`)
+  the user presses Enter after 2 s without typing (`App::auto_result_pending`,
+  `App::auto_test_just_ended`)
+- A reset (Ctrl+R, r, R) does not count its own keystroke: its keys are not
+  carried over as held keys nor fed to the cleared tests
+  (`App::reset_current_on_chord`). The keys are mapped from the terminal's
+  character by US position (`keystroke_keys`), so with evdev on Colemak or
+  Dvorak the key that typed R still counts
 - A held key fires its command once, even where autorepeat arrives as
   presses (`HeldKeyFilter`); only view and Settings navigation repeats
 - Key handling is decided by `command_for_key` in main.rs (unit-tested)

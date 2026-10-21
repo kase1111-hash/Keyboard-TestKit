@@ -12,8 +12,9 @@ fn at(key: u16, kind: KeyEventType, when: Instant, delta_us: u64) -> KeyEvent {
 }
 
 /// A worn 'E' switch on a 125 Hz keyboard: one keystroke registers twice,
-/// 16 ms after the release (two reports), plus 30 quick taps for the polling
-/// view. Every event lands on the keyboard's 8 ms report grid.
+/// the contact closing again 16 ms after the release (two reports) for one
+/// report, plus 30 quick taps for the polling view. Every event lands on the
+/// keyboard's 8 ms report grid.
 fn feed_chattering_key_and_taps(app: &mut App) {
     let t0 = Instant::now();
     app.process_event(&at(18, KeyEventType::Press, t0, 0));
@@ -32,8 +33,8 @@ fn feed_chattering_key_and_taps(app: &mut App) {
     app.process_event(&at(
         18,
         KeyEventType::Release,
-        t0 + Duration::from_millis(152),
-        64_000,
+        t0 + Duration::from_millis(96),
+        8_000,
     ));
     let mut when = t0 + Duration::from_millis(400);
     for i in 0..30u64 {
@@ -84,8 +85,31 @@ fn terminal_input_shows_not_measurable_instead_of_green() {
         assert!(!bounce.iter().any(|r| r.status != ResultStatus::Info));
         assert_eq!(app.hold_release_test.total_bounces(), 0);
 
-        // Nothing unmeasurable in the dashboard or the export either
+        // Without releases, fast taps after a pause can be taken for
+        // autorepeat: the press counts and rates say they are approximate,
+        // in the Dashboard too
+        let approximate = source == InputSource::TerminalPressOnly;
         let dash = view(&mut app, AppView::Dashboard);
+        for (results, label) in [
+            (&bounce, "Total Presses"),
+            (&bounce, "Press Rate (any keys)"),
+            (&polling, "Events Recorded"),
+            (&polling, "Burst Key Rate"),
+            (&polling, "Avg Key Rate"),
+            (&dash, "Total Events"),
+            (&dash, "Event Rate"),
+        ] {
+            let r = row(results, label);
+            assert_eq!(
+                r.value.contains("approximate"),
+                approximate,
+                "{:?}: {:?}",
+                source,
+                r
+            );
+        }
+
+        // Nothing unmeasurable in the dashboard or the export either
         assert!(!dash.iter().any(|r| r.label == "Est. Poll Rate"));
         assert!(app
             .generate_report()
@@ -106,11 +130,32 @@ fn evdev_input_keeps_real_measurements() {
     let poll = row(&view(&mut app, AppView::PollingRate), "Est. Poll Rate");
     assert!(poll.value.starts_with("125 Hz"), "{:?}", poll);
 
+    // One bounce is a warning in the view, the finding and the export alike
     let bounce = view(&mut app, AppView::HoldRelease);
-    assert_eq!(row(&bounce, "Bounces Detected").status, ResultStatus::Error);
+    assert_eq!(
+        row(&bounce, "Bounces Detected").status,
+        ResultStatus::Warning
+    );
+    assert_eq!(row(&bounce, "  E").status, ResultStatus::Warning);
     assert_eq!(app.hold_release_test.bouncy_keys(), vec![(KeyCode(18), 1)]);
     app.refresh_findings();
-    assert!(app.findings.iter().any(|f| f.category == "Switch bounce"));
+    let finding = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Switch bounce")
+        .expect("bounce finding");
+    assert_eq!(finding.severity, Severity::Warning);
+    let exported = app.generate_report().tests.hold_release;
+    assert!(
+        exported.iter().any(|e| e.status == "warning"),
+        "{:?}",
+        exported
+    );
+    assert!(
+        !exported.iter().any(|e| e.status == "error"),
+        "{:?}",
+        exported
+    );
 }
 
 #[test]
