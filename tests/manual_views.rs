@@ -185,9 +185,19 @@ fn virtual_check_is_unavailable_with_evdev() {
     app.virtual_test.request_virtual_test();
     assert!(!app.virtual_test.has_pending_send());
     let results = view(&mut app, AppView::Virtual);
-    assert!(results
-        .iter()
-        .any(|r| r.label == "Status" && r.value.contains("evdev")));
+    let status = row(&results, "Status");
+    assert!(status.value.starts_with("Not available"), "{:?}", status);
+    // Without virtual-send the build is the reason, not evdev
+    let reason = if cfg!(feature = "virtual-send") {
+        "evdev"
+    } else {
+        "--features virtual-send"
+    };
+    assert!(
+        results.iter().any(|r| r.value.contains(reason)),
+        "{:?}",
+        results
+    );
 }
 
 #[test]

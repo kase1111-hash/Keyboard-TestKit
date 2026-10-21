@@ -12,16 +12,19 @@ use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Thresholds for virtual input detection.
-///
-/// Different keys pressed within a few ms of each other are normal (chords,
-/// Shift+letter, rolled typing, slamming keys in the NKRO test), so timing is
-/// only judged for the same key, or for presses made while no other key is
-/// held. Synthetic typing releases every key before pressing the next one.
-///
-/// Same-key re-press faster than this needs a ~65 Hz tap rate; the fastest
-/// same-key tapping is ~10-15 Hz.
-const MIN_HUMAN_INTERVAL_MS: f64 = 15.0;
+// Thresholds for virtual input detection.
+//
+// Different keys pressed within a few ms of each other are normal (chords,
+// Shift+letter, rolled typing, slamming keys in the NKRO test), and so are
+// modifiers landing together (Ctrl+Alt+..., a Hyper key sends four in one
+// report). So only separate keystrokes are timed: non-modifier presses made
+// while no other non-modifier key is held. Synthetic typing releases every
+// key before pressing the next one.
+//
+// The same key registering again within a few ms is not judged here either:
+// that is what a chattering switch produces, and the Hold & Release test
+// reports it as bounce.
+
 /// Interval variance (ms²) below which a sequence is machine-regular: human
 /// typing varies by tens of ms between keystrokes (variance in the 100s+).
 const PERFECT_TIMING_THRESHOLD: f64 = 0.5;
@@ -308,8 +311,6 @@ pub struct VirtualKeyboardTest {
     interval_mean: f64,
     /// Non-modifier keys currently held (a press while one is held is a chord)
     held: HashSet<KeyCode>,
-    /// Last press time per key (same-key timing)
-    last_press_by_key: HashMap<KeyCode, Instant>,
 
     // Virtual key testing
     /// Virtual key sender
@@ -359,7 +360,6 @@ impl VirtualKeyboardTest {
             interval_variance: 0.0,
             interval_mean: 0.0,
             held: HashSet::new(),
-            last_press_by_key: HashMap::new(),
             sender: VirtualKeySender::new(),
             expected_virtual_keys: Vec::new(),
             virtual_send_time: None,
@@ -473,26 +473,8 @@ impl VirtualKeyboardTest {
         self.test_mode_active = false;
     }
 
-    /// Flag the same key re-pressed faster than a finger can.
-    fn check_same_key_speed(&mut self, key: KeyCode, timestamp: Instant) -> bool {
-        let previous = self.last_press_by_key.insert(key, timestamp);
-        let Some(previous) = previous else {
-            return false;
-        };
-        let interval_ms = timestamp.saturating_duration_since(previous).as_secs_f64() * 1000.0;
-        if interval_ms < MIN_HUMAN_INTERVAL_MS {
-            self.record_anomaly(
-                format!("Inhuman speed: same key again after {:.1}ms", interval_ms),
-                timestamp,
-                AnomalySeverity::High,
-            );
-            return true;
-        }
-        false
-    }
-
-    /// Analyze the regularity of separate keystrokes (presses made while no
-    /// other key was held).
+    /// Analyze the regularity of separate keystrokes (non-modifier presses
+    /// made while no other non-modifier key was held).
     fn analyze_timing(&mut self, interval_ms: f64, timestamp: Instant) -> bool {
         let mut is_suspicious = false;
 
@@ -705,10 +687,12 @@ impl KeyboardTest for VirtualKeyboardTest {
             self.last_physical_press = Some(event.timestamp);
         }
 
-        // A press while another key is held is a chord or rolled typing, which
-        // people do all the time; only separate keystrokes are timed.
-        let chord = self.held.iter().any(|k| *k != event.key);
-        if !keymap::is_modifier(event.key) {
+        // A press while another key is held is a chord or rolled typing, and a
+        // modifier is only part of a combination; people do both all the
+        // time, so only separate non-modifier keystrokes are timed.
+        let modifier = keymap::is_modifier(event.key);
+        let separate = !modifier && !self.held.iter().any(|k| *k != event.key);
+        if !modifier {
             self.held.insert(event.key);
         }
 
@@ -718,9 +702,9 @@ impl KeyboardTest for VirtualKeyboardTest {
 
         self.last_interval_ms = interval_ms;
 
-        let mut is_virtual = self.check_same_key_speed(event.key, event.timestamp);
+        let mut is_virtual = false;
 
-        if !chord {
+        if separate {
             if let Some(interval) = interval_ms {
                 if self.analyze_timing(interval, event.timestamp) {
                     is_virtual = true;
@@ -770,7 +754,9 @@ impl KeyboardTest for VirtualKeyboardTest {
             TestResult::info("=== DIAGNOSTIC TEST ===", ""),
         ];
 
-        if !self.injected_keys_visible {
+        // A build without virtual-send says so (below); only then is evdev
+        // the reason the check cannot run.
+        if VirtualKeySender::is_available() && !self.injected_keys_visible {
             results.push(TestResult::info("Status", "Not available with evdev input"));
             results.push(TestResult::info(
                 "Info",
@@ -894,7 +880,6 @@ impl KeyboardTest for VirtualKeyboardTest {
         self.interval_variance = 0.0;
         self.interval_mean = 0.0;
         self.held.clear();
-        self.last_press_by_key.clear();
         self.expected_virtual_keys.clear();
         self.virtual_send_time = None;
         self.requested_at = None;
@@ -944,7 +929,7 @@ mod tests {
         sent_at
     }
 
-    // --- Inhuman-speed heuristics (K-A12) ---------------------------------
+    // --- Virtual-input heuristics (K-A12) --------------------------------
 
     #[test]
     fn chords_rollover_and_shift_are_not_virtual() {
@@ -994,14 +979,74 @@ mod tests {
         assert_eq!(test.classification(), InputClassification::Physical);
     }
 
+    /// A few seconds of ordinary typing (irregular gaps, released keys).
+    fn type_normally(test: &mut VirtualKeyboardTest, mut at: Instant) -> Instant {
+        for i in 0..12u64 {
+            tap(test, KeyCode(16 + (i % 10) as u16), at, ms(60));
+            at += ms(150 + i * 29 % 90);
+        }
+        at
+    }
+
     #[test]
-    fn same_key_faster_than_a_finger_is_flagged() {
+    fn modifier_combos_and_two_hand_slams_are_not_virtual() {
         let mut test = VirtualKeyboardTest::new();
-        let t0 = Instant::now();
-        tap(&mut test, KeyCode(30), t0, ms(2));
-        tap(&mut test, KeyCode(30), t0 + ms(5), ms(2));
-        assert_eq!(test.virtual_count, 1);
-        assert!(test.anomalies[0].description.contains("Inhuman speed"));
+        let mut at = type_normally(&mut test, Instant::now());
+        // NKRO view, both palms down: hid-input emits the modifier byte
+        // first, so six modifier presses then six letters, one timestamp
+        let mods = [29u16, 42, 56, 125, 97, 54];
+        for key in mods.into_iter().chain(30..36) {
+            test.process_event(&press_at(KeyCode(key), at, 0));
+        }
+        for key in mods.into_iter().chain(30..36) {
+            test.process_event(&release_at(KeyCode(key), at + ms(900)));
+        }
+        at += ms(1500);
+        // A Hyper key (Ctrl+Shift+Alt+Super in one report) resolved together
+        // with the letter by tap-hold firmware
+        for key in [29u16, 42, 56, 125] {
+            test.process_event(&press_at(KeyCode(key), at, 0));
+        }
+        tap(&mut test, KeyCode(19), at + ms(1), ms(50));
+        for key in [29u16, 42, 56, 125] {
+            test.process_event(&release_at(KeyCode(key), at + ms(80)));
+        }
+
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert_eq!(test.virtual_count, 0);
+        assert!(!is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn chattering_switch_is_not_virtual() {
+        // One keystroke registers twice (press, 1 ms blip, press again 3 ms
+        // in): a worn switch, which the Hold & Release test reports as
+        // bounce. It is physical input, not automation.
+        let mut test = VirtualKeyboardTest::new();
+        let at = type_normally(&mut test, Instant::now());
+        let key = KeyCode(18);
+        test.process_event(&press_at(key, at, 0));
+        test.process_event(&release_at(key, at + ms(1)));
+        test.process_event(&press_at(key, at + ms(3), 0));
+        test.process_event(&release_at(key, at + ms(70)));
+
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert!(!is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn rapid_fire_of_one_key_is_flagged() {
+        // A rapid-fire macro: the same key pressed and released every 8 ms
+        let mut test = VirtualKeyboardTest::new();
+        let at = type_normally(&mut test, Instant::now());
+        for i in 0..10u64 {
+            tap(&mut test, KeyCode(57), at + ms(8 * i), ms(3));
+        }
+        assert!(test
+            .anomalies
+            .iter()
+            .any(|a| a.description.contains("keys in 50ms")));
+        assert!(is_flagged_virtual(&test), "{:?}", test.classification());
     }
 
     #[test]
@@ -1111,7 +1156,18 @@ mod tests {
         let results = test.get_results();
         assert!(results
             .iter()
-            .any(|r| r.label == "Status" && r.value.contains("evdev")));
+            .any(|r| r.label == "Status" && r.value.starts_with("Not available")));
+        // The reason given is the real blocker: the build first, then evdev
+        let reason = if VirtualKeySender::is_available() {
+            "evdev"
+        } else {
+            "--features virtual-send"
+        };
+        assert!(
+            results.iter().any(|r| r.value.contains(reason)),
+            "{:?}",
+            results
+        );
         assert!(!results.iter().any(|r| r.status == ResultStatus::Warning));
         // Still unavailable after a reset
         test.reset();
