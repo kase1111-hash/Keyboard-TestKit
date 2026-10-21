@@ -81,15 +81,20 @@ make install          # Install to /usr/local/bin
 2. Create keyboard listener & event channels
 3. Try evdev listener on Linux; otherwise use terminal input (kitty keyboard
    protocol for key releases where supported, synthesized releases otherwise).
+   The kitty flags are pushed on the alternate screen (terminals keep one
+   flag stack per screen) and popped before leaving it, never with evdev.
    `App::set_input_source` tells every test what the source can measure.
-4. Main loop: poll evdev (keyboards that vanish or come back are reported to
-   `App::keyboard_disconnected` / `keyboard_connected` and stop a running auto
-   test), `app.tick()` (auto-test timers, stuck keys, live findings), render
+4. Main loop: poll evdev (keyboards that were typed on and vanish or come
+   back are reported to `App::keyboard_disconnected` / `keyboard_connected`
+   and stop a running auto test; other nodes only reach the status line),
+   `app.tick()` (auto-test timers, stuck keys, live findings), render
    at the configured refresh rate, drain all queued terminal events. The
    keystroke that starts the auto test is swallowed by the terminal listener
    (with its autorepeat and release) so it is never phantom input.
-5. Cleanup terminal on exit and print the findings summary (the same
-   `App::findings` the Dashboard and the exported report show)
+5. Cleanup terminal on exit (also from the panic hook: flags popped, cursor
+   shown) and print the findings summary (the same `App::findings` the
+   Dashboard and the exported report show). Nothing is printed to stderr
+   while the TUI is drawn: messages go to the status line.
 
 ### KeyboardTest Trait
 
