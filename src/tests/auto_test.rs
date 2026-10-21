@@ -1206,11 +1206,20 @@ impl AutoTest {
                 title,
                 if self.input_source.has_precise_timestamps() {
                     ""
-                } else {
-                    // Every tap is counted (the terminal listener tells taps
-                    // from autorepeat), but each is stamped when it was read.
+                } else if self.input_source.has_release_events() {
+                    // Every tap is counted (each has its release), but each
+                    // is stamped when it was read.
                     "Timed from when the terminal delivered the taps, so the rate is \
                      approximate."
+                } else {
+                    // Without releases the terminal listener tells taps from
+                    // autorepeat by their timing alone: taps resuming faster
+                    // than ~8 per second after a 0.2-2 s pause read as a held
+                    // key's autorepeat (as fast as some repeat rates) and are
+                    // not counted.
+                    "Without key releases taps are told from a held key's autorepeat by \
+                     their timing: fast taps after a pause can be missed, so the count \
+                     and the rate are approximate."
                 },
                 "",
             ));
@@ -1394,10 +1403,13 @@ impl AutoTest {
                     )),
                     StepKind::RapidTap => rows.push(TestResult::info(
                         "Presses",
-                        if self.rapid_started.is_some() {
+                        if self.rapid_started.is_none() {
+                            "waiting for first tap".to_string()
+                        } else if self.input_source.has_release_events() {
                             format!("{}", self.rapid_presses)
                         } else {
-                            "waiting for first tap".to_string()
+                            // Taps told from autorepeat by timing alone
+                            format!("{} (approximate: no key releases)", self.rapid_presses)
                         },
                     )),
                 }

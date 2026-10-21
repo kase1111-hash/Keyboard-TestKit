@@ -954,3 +954,98 @@ fn reset_all_clears_auto_test_and_findings() {
     assert_eq!(app.auto_test.state(), AutoTestState::Idle);
     assert_eq!(app.issue_count(), 0);
 }
+
+/// Run the auto test to its rapid-tap step and tap A `taps` times, 120 ms
+/// apart (with releases where the source has them).
+fn rapid_tap_run(source: InputSource, taps: u32) -> App {
+    let mut app = App::default();
+    app.set_input_source(source);
+    app.start_auto_test();
+    while app.auto_test.current_step() != Some(StepKind::RapidTap) {
+        app.skip_auto_step();
+    }
+    let start = Instant::now() + Duration::from_millis(10);
+    for i in 0..taps {
+        let at = start + Duration::from_millis(u64::from(i) * 120);
+        app.process_event(&timed(30, KeyEventType::Press, at, 120_000));
+        if source.has_release_events() {
+            let up = at + Duration::from_millis(50);
+            app.process_event(&timed(30, KeyEventType::Release, up, 50_000));
+        }
+    }
+    app.view = AppView::AutoTest;
+    app
+}
+
+#[test]
+fn press_only_tap_counts_are_not_presented_as_exact() {
+    for source in [
+        InputSource::TerminalPressOnly,
+        InputSource::TerminalWithRelease,
+        InputSource::Evdev,
+    ] {
+        let mut app = rapid_tap_run(source, 12);
+        let presses = app
+            .current_results()
+            .into_iter()
+            .find(|r| r.label == "Presses")
+            .expect("presses row");
+        let approximate = source == InputSource::TerminalPressOnly;
+        assert!(
+            presses.value.starts_with("12"),
+            "{source:?}: {}",
+            presses.value
+        );
+        assert_eq!(
+            presses.value.contains("approximate"),
+            approximate,
+            "{source:?}: {}",
+            presses.value
+        );
+
+        // Stopped with Ctrl+C at the end: the taps so far are judged
+        app.abort_auto_test();
+        let rapid = app
+            .findings
+            .iter()
+            .find(|f| f.category == "Rapid tap")
+            .expect("rapid tap finding");
+        assert!(rapid.title.starts_with("12 presses"), "{}", rapid.title);
+        // Only press-only input can miss taps; terminals time them roughly
+        assert_eq!(
+            rapid.detail.contains("count and the rate are approximate"),
+            approximate,
+            "{source:?}: {}",
+            rapid.detail
+        );
+        assert_eq!(
+            rapid.detail.contains("approximate"),
+            !source.has_precise_timestamps(),
+            "{source:?}: {}",
+            rapid.detail
+        );
+        assert_eq!(rapid.severity, Severity::Info);
+    }
+}
+
+#[test]
+fn the_auto_view_says_keys_stay_test_input_until_enter() {
+    let mut app = rapid_tap_run(InputSource::Evdev, 3);
+    app.abort_auto_test();
+    assert!(app.auto_result_pending());
+    let rows = app.current_results();
+    let status = rows.iter().position(|r| r.label == "Status").unwrap();
+    assert_eq!(rows[status + 1].label, "Keys");
+    assert!(
+        rows[status + 1].value.contains("Enter"),
+        "{:?}",
+        rows[status + 1]
+    );
+    assert!(app
+        .status_message
+        .as_deref()
+        .is_some_and(|m| m.contains("Enter")));
+
+    app.dismiss_auto_result();
+    assert!(!app.current_results().iter().any(|r| r.label == "Keys"));
+}

@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::keyboard::layout::KeyboardLayout;
 use crate::keyboard::remap::FnKeyMode;
-use crate::keyboard::{KeyEvent, KeyEventType, KeyboardState};
+use crate::keyboard::{KeyCode, KeyEvent, KeyEventType, KeyboardState};
 use crate::report::{ReportInput, SessionReport};
 use crate::tests::{
     expected_keys_for_layout, issues_status, AnalysisContext, AutoTest, EventTimingTest, Finding,
@@ -30,11 +30,23 @@ const FINDINGS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const HOLD_STEP_STUCK_THRESHOLD_MS: u64 = 15_000;
 
 /// After the auto test ends (completed, or stopped), plain keys stay test
-/// input until the keyboard has been quiet this long. The rapid-tap step
-/// ends on a timer while the user is still tapping, and a run stopped by a
-/// disconnect ends mid-sweep: the next few keys would otherwise run the Auto
-/// view's single-key commands (`r` resets the run, `q` quits, Space pauses).
+/// input until the user dismisses the result with Enter, and Enter only does
+/// that once the keyboard has been quiet this long. The rapid-tap step ends
+/// on a timer while the user is still tapping, and a run stopped by a
+/// disconnect ends mid-sweep, maybe while the user pauses and then goes on
+/// (a sweep includes Enter): keys would otherwise run the Auto view's
+/// single-key commands (`r` resets the run, `q` quits, Space pauses).
 pub const AFTER_RUN_GRACE: Duration = Duration::from_secs(2);
+
+/// How to get the single-key commands back after a run, for the status line
+/// and the Auto view.
+const AFTER_RUN_HINT: &str = "keys stay test input; pause, then Enter for commands";
+
+/// Keys that dismiss a finished auto test's result (Enter and keypad
+/// Enter). Their presses are not typing that delays the dismissal: the
+/// evdev copy of the Enter itself is read before the terminal delivers it,
+/// and a user pressing Enter again must not have to wait longer.
+const DISMISS_KEYS: [KeyCode; 2] = [KeyCode(28), KeyCode(96)];
 
 /// Keyboard device nodes lost this close together are one unplug: one
 /// keyboard usually has several event nodes (keys, media keys, an NKRO
@@ -71,6 +83,65 @@ impl DisconnectLog {
     fn node_found(&mut self) {
         self.last = None;
     }
+}
+
+/// The command keystroke that asked for the latest reset (Ctrl+R, r, R):
+/// its keys are not test input for the tests it cleared. Its press is read
+/// before the command (Ctrl) or right after it (the evdev or terminal copy of
+/// R), and its releases come later, so without this the NKRO view would read
+/// "1 keys + 1 modifier(s)" and the Sticky view count two keys right after a
+/// reset.
+#[derive(Debug, Default)]
+struct ResetChord {
+    /// The keystroke's keys (see `App::reset_current_on_chord`)
+    keys: Vec<KeyCode>,
+    /// When the reset was made. A press of one of `keys` stamped before it
+    /// is the keystroke's own (events carry the time the key went down).
+    at: Option<Instant>,
+    /// Keys of the keystroke the cleared tests have not seen go down: their
+    /// releases are kept from them too
+    hidden: Vec<KeyCode>,
+    /// The tests that were cleared (indices into `App::all_tests_mut`)
+    tests: Vec<usize>,
+}
+
+impl ResetChord {
+    /// Whether `event` belongs to the keystroke, and must not reach the
+    /// cleared tests. Notes a press it hides, so its release is hidden too.
+    fn hides(&mut self, event: &KeyEvent) -> bool {
+        match event.event_type {
+            KeyEventType::Press => {
+                let own = self.keys.contains(&event.key)
+                    && self.at.is_some_and(|at| event.timestamp <= at);
+                if own && !self.hidden.contains(&event.key) {
+                    self.hidden.push(event.key);
+                }
+                own
+            }
+            KeyEventType::Release => match self.hidden.iter().position(|k| *k == event.key) {
+                Some(i) => {
+                    self.hidden.swap_remove(i);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+}
+
+/// Whether `key`, down since `pressed_at`, is held for the command
+/// keystroke `chord` made at `now`, rather than a key that was down before:
+/// one of the keystroke's keys, not down past the stuck-key threshold
+/// `stuck_after`. A key held that long may be the jammed key the user resets
+/// to re-check (a jammed Ctrl turns R into Ctrl+R), so it is kept.
+fn held_for_chord(
+    key: KeyCode,
+    pressed_at: Instant,
+    chord: &[KeyCode],
+    now: Instant,
+    stuck_after: Duration,
+) -> bool {
+    chord.contains(&key) && now.saturating_duration_since(pressed_at) <= stuck_after
 }
 
 /// Stuck-key threshold (ms) to use during `step` of the auto test, given the
@@ -243,11 +314,14 @@ pub struct App {
     last_auto_step: Option<StepKind>,
     /// Keyboard disconnects since the tests were last reset
     disconnects: DisconnectLog,
-    /// Latest key press the tests saw (see [`App::auto_test_just_ended`])
+    /// The keystroke that asked for the latest reset
+    reset_chord: ResetChord,
+    /// Latest press of a key other than Enter the tests saw (see
+    /// [`App::auto_test_just_ended`])
     last_key_press: Option<Instant>,
-    /// The keyboard has been quiet since the auto test ended: the after-run
-    /// grace is over until the next run
-    after_run_quiet: bool,
+    /// The user dismissed the finished auto test's result: single keys are
+    /// commands again until the next run (see [`App::auto_result_pending`])
+    auto_result_dismissed: bool,
     /// The config file Settings > Save writes (the default location if None)
     config_path: Option<PathBuf>,
     /// The config file exists but could not be used: saving keeps a backup
@@ -320,8 +394,9 @@ impl App {
             findings_updated: None,
             last_auto_step: None,
             disconnects: DisconnectLog::default(),
+            reset_chord: ResetChord::default(),
             last_key_press: None,
-            after_run_quiet: false,
+            auto_result_dismissed: false,
             config_path: None,
             config_unreadable: false,
             config_notes: Vec::new(),
@@ -444,9 +519,7 @@ impl App {
         }
 
         self.total_events += 1;
-        if event.event_type == KeyEventType::Press {
-            // A press after a quiet spell is not the tail of the run
-            self.end_after_run_grace_if_quiet(event.timestamp);
+        if event.event_type == KeyEventType::Press && !DISMISS_KEYS.contains(&event.key) {
             self.last_key_press = Some(
                 self.last_key_press
                     .map_or(event.timestamp, |t| t.max(event.timestamp)),
@@ -454,9 +527,16 @@ impl App {
         }
         self.keyboard_state.process_event(event);
 
-        // Dispatch to all tests
-        for test in self.all_tests_mut() {
-            test.process_event(event);
+        // Dispatch to all tests, but not the keystroke that reset them
+        let hidden_from = if self.reset_chord.hides(event) {
+            self.reset_chord.tests.clone()
+        } else {
+            Vec::new()
+        };
+        for (index, test) in self.all_tests_mut().into_iter().enumerate() {
+            if !hidden_from.contains(&index) {
+                test.process_event(event);
+            }
         }
         self.auto_test.process_event(event);
 
@@ -503,7 +583,6 @@ impl App {
 
         let finished = self.auto_test.tick();
         self.apply_auto_step_transition();
-        self.end_after_run_grace_if_quiet(Instant::now());
 
         let stale = self
             .findings_updated
@@ -521,9 +600,9 @@ impl App {
     fn set_completion_status(&mut self) {
         let issues = self.issue_count();
         self.set_status(if issues == 0 {
-            "Auto test complete: no issues detected".to_string()
+            format!("Auto test complete: no issues detected - {AFTER_RUN_HINT}")
         } else {
-            format!("Auto test complete: {} issue(s) found", issues)
+            format!("Auto test complete: {issues} issue(s) found - {AFTER_RUN_HINT}")
         });
     }
 
@@ -585,19 +664,47 @@ impl App {
             .collect()
     }
 
+    /// The presses of the keys down right now (see
+    /// [`App::held_key_presses`]) that tests cleared by the command keystroke
+    /// `chord` at `now` keep, and the keys held for that keystroke (see
+    /// [`held_for_chord`]), which they do not.
+    fn held_keys_around_chord(
+        &self,
+        chord: &[KeyCode],
+        now: Instant,
+    ) -> (Vec<KeyEvent>, Vec<KeyCode>) {
+        let stuck_after = self.stickiness_test.threshold();
+        let (for_chord, kept): (Vec<KeyEvent>, Vec<KeyEvent>) = self
+            .held_key_presses()
+            .into_iter()
+            .partition(|press| held_for_chord(press.key, press.timestamp, chord, now, stuck_after));
+        (kept, for_chord.iter().map(|press| press.key).collect())
+    }
+
     /// Clear the keyboard state and every test, keeping the keys that are
-    /// still down (see [`App::held_key_presses`]).
-    fn reset_tests_keeping_held_keys(&mut self) {
+    /// still down (see [`App::held_key_presses`]) but those held for the
+    /// command keystroke `chord` that asked for it at `now`.
+    fn reset_tests_keeping_held_keys(&mut self, chord: &[KeyCode], now: Instant) {
         let held = self.held_key_presses();
+        let (kept, chord_held) = self.held_keys_around_chord(chord, now);
         self.keyboard_state.reset();
         for test in self.all_tests_mut() {
             test.reset();
         }
+        // The keyboard state shows what is down, the keystroke included
         for press in &held {
             self.keyboard_state.process_event(press);
+        }
+        for press in &kept {
             self.stickiness_test.process_event(press);
             self.rollover_test.process_event(press);
         }
+        self.reset_chord = ResetChord {
+            keys: chord.to_vec(),
+            at: Some(now),
+            hidden: chord_held,
+            tests: (0..self.all_tests().len()).collect(),
+        };
     }
 
     /// Start the automatic diagnostic and switch to its view.
@@ -606,13 +713,13 @@ impl App {
         // (a keyboard replugged before the run is not a fault of the run).
         // Keys down right now (a jammed key, the Shift used to type 'A') are
         // kept: the idle step is there to catch a key stuck before the run.
-        self.reset_tests_keeping_held_keys();
+        self.reset_tests_keeping_held_keys(&[], Instant::now());
         self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
         self.last_auto_step = None;
-        self.after_run_quiet = false;
+        self.auto_result_dismissed = false;
         self.auto_test.start();
         self.state = AppState::Running;
         self.view = AppView::AutoTest;
@@ -626,7 +733,7 @@ impl App {
             self.auto_test.abort();
             self.apply_auto_step_transition();
             self.refresh_findings();
-            self.set_status("Auto test aborted".to_string());
+            self.set_status(format!("Auto test aborted - {AFTER_RUN_HINT}"));
         }
     }
 
@@ -649,32 +756,42 @@ impl App {
         self.auto_test.is_running()
     }
 
-    /// Whether the auto test ended so recently that plain keys are still
-    /// test input: less than [`AFTER_RUN_GRACE`] has passed since the run
-    /// ended and since the latest key press after that. Once the keyboard
-    /// has been quiet that long the grace is over until the next run.
+    /// Whether a finished auto test's result is still up, not dismissed:
+    /// plain keys stay test input (a run can end under the user's fingers,
+    /// or be stopped by a disconnect while they pause and then go on with
+    /// the sweep) until the user presses Enter after a pause (see
+    /// [`App::dismiss_auto_result`]), resets the run or starts another.
+    pub fn auto_result_pending(&self) -> bool {
+        self.auto_test.finished_at().is_some() && !self.auto_result_dismissed
+    }
+
+    /// Whether keys are still being typed since the auto test ended, so
+    /// that Enter is test input too: its result is up (see
+    /// [`App::auto_result_pending`]) and less than [`AFTER_RUN_GRACE`] has
+    /// passed since the run ended and since the latest press of a key other
+    /// than Enter.
     pub fn auto_test_just_ended(&self) -> bool {
         self.auto_test_just_ended_at(Instant::now())
     }
 
-    fn auto_test_just_ended_at(&self, now: Instant) -> bool {
+    /// [`App::auto_test_just_ended`] at `now`.
+    pub fn auto_test_just_ended_at(&self, now: Instant) -> bool {
         let Some(ended) = self.auto_test.finished_at() else {
             return false;
         };
-        if self.after_run_quiet {
+        if self.auto_result_dismissed {
             return false;
         }
         let last = self.last_key_press.map_or(ended, |t| t.max(ended));
         now.saturating_duration_since(last) < AFTER_RUN_GRACE
     }
 
-    /// End the after-run grace for good once the keyboard has been quiet for
-    /// [`AFTER_RUN_GRACE`] since the run ended: keys typed later (in a test
-    /// view before pressing Tab, arrows in Settings) are not the tail of the
-    /// run, and must not turn the next command key into test input.
-    fn end_after_run_grace_if_quiet(&mut self, now: Instant) {
-        if self.auto_test.finished_at().is_some() && !self.auto_test_just_ended_at(now) {
-            self.after_run_quiet = true;
+    /// The user is done with the finished auto test's result: single keys
+    /// are commands again until the next run.
+    pub fn dismiss_auto_result(&mut self) {
+        if self.auto_result_pending() {
+            self.auto_result_dismissed = true;
+            self.set_status("Commands are back: A runs again, e exports, q quits".to_string());
         }
     }
 
@@ -730,7 +847,13 @@ impl App {
 
     /// Reset all tests. Keys that are still down stay down.
     pub fn reset_all(&mut self) {
-        self.reset_tests_keeping_held_keys();
+        self.reset_all_on_chord(&[]);
+    }
+
+    /// [`App::reset_all`] asked for by a command keystroke made of `chord`
+    /// (see [`App::reset_current_on_chord`]).
+    pub fn reset_all_on_chord(&mut self, chord: &[KeyCode]) {
+        self.reset_tests_keeping_held_keys(chord, Instant::now());
         self.auto_test.reset();
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
@@ -743,6 +866,20 @@ impl App {
 
     /// Reset current test
     pub fn reset_current(&mut self) {
+        self.reset_current_on_chord(&[]);
+    }
+
+    /// [`App::reset_current`] asked for by a command keystroke made of
+    /// `chord`: the command key and both keys of each modifier it was typed
+    /// with (Ctrl and R for Ctrl+R). The keystroke is not test input for the
+    /// cleared test: its keys are not carried over as held keys, and their
+    /// presses and releases read after the reset do not reach it. A key held
+    /// before it (a jammed key) is still carried over.
+    pub fn reset_current_on_chord(&mut self, chord: &[KeyCode]) {
+        self.reset_current_on_chord_at(chord, Instant::now());
+    }
+
+    fn reset_current_on_chord_at(&mut self, chord: &[KeyCode], now: Instant) {
         if self.view == AppView::AutoTest {
             self.auto_test.reset();
             // Restores the stuck-key threshold if a step had relaxed it
@@ -753,17 +890,23 @@ impl App {
         }
         if let Some(idx) = Self::test_index_for_view(self.view) {
             let name = self.all_tests()[idx].name().to_string();
+            let (kept, chord_held) = self.held_keys_around_chord(chord, now);
             self.all_tests_mut()[idx].reset();
             // The Sticky and NKRO views track keys that are down: a jammed
             // key reset away would read "None detected" while still down
-            let held = self.held_key_presses();
-            for press in &held {
+            for press in &kept {
                 match self.view {
                     AppView::Stickiness => self.stickiness_test.process_event(press),
                     AppView::Rollover => self.rollover_test.process_event(press),
                     _ => {}
                 }
             }
+            self.reset_chord = ResetChord {
+                keys: chord.to_vec(),
+                at: Some(now),
+                hidden: chord_held,
+                tests: vec![idx],
+            };
             self.set_status(format!("{} reset", name));
         }
     }
@@ -786,7 +929,18 @@ impl App {
     pub fn current_results(&self) -> Vec<TestResult> {
         match self.view {
             AppView::Dashboard => self.dashboard_results(),
-            AppView::AutoTest => self.auto_test.results(&self.findings),
+            AppView::AutoTest => {
+                let mut rows = self.auto_test.results(&self.findings);
+                if self.auto_result_pending() {
+                    // Right under the status, which offers single-key commands
+                    let at = rows
+                        .iter()
+                        .position(|r| r.label == "Status")
+                        .map_or(0, |i| i + 1);
+                    rows.insert(at, TestResult::warning("Keys", AFTER_RUN_HINT));
+                }
+                rows
+            }
             AppView::Help | AppView::Settings => Vec::new(),
             other => {
                 if let Some(idx) = Self::test_index_for_view(other) {
@@ -1714,9 +1868,11 @@ mod tests {
     fn keys_typed_as_the_auto_test_ends_stay_test_input() {
         let mut app = app_at_auto_step(StepKind::RapidTap);
         assert!(!app.auto_test_just_ended());
+        assert!(!app.auto_result_pending());
         app.abort_auto_test();
         let ended = app.auto_test.finished_at().unwrap();
         let ms = |n: u64| ended + Duration::from_millis(n);
+        assert!(app.auto_result_pending());
         assert!(app.auto_test_just_ended_at(ms(100)));
         // The user keeps tapping for a while after the step ends
         for t in [80, 240, 400, 560] {
@@ -1724,49 +1880,73 @@ mod tests {
             app.process_event(&event_at(30, KeyEventType::Release, ms(t + 40)));
         }
         assert!(app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE - Duration::from_millis(1)));
-        // Once the keyboard has been quiet for the grace period, commands work
+        // Once the keyboard has been quiet for the grace period Enter may
+        // dismiss the result; until then every plain key is test input
         assert!(!app.auto_test_just_ended_at(ms(560) + AFTER_RUN_GRACE));
+        assert!(app.auto_result_pending());
 
-        // A run that ends while nobody is typing frees the keys after the
-        // grace period, and a fresh app has no run to protect
+        // A run that ends while nobody is typing lets Enter dismiss it after
+        // the grace period, and a fresh app has no run to protect
         let mut app = app_at_auto_step(StepKind::Sweep);
         app.abort_auto_test();
         let ended = app.auto_test.finished_at().unwrap();
         assert!(!app.auto_test_just_ended_at(ended + AFTER_RUN_GRACE));
         assert!(!App::default().auto_test_just_ended());
+        assert!(!App::default().auto_result_pending());
     }
 
     #[test]
-    fn keys_are_commands_for_good_once_the_keyboard_went_quiet_after_a_run() {
-        // The grace is for the keys still being typed as the run ends. Once
-        // the keyboard has been quiet, typing later (in a test view, then
-        // Tab; Down, Down in Settings; t, t on the Dashboard) must not make
-        // the next key within 2 s test input again, for the whole session.
-        let mut app = app_at_auto_step(StepKind::RapidTap);
+    fn the_result_of_a_run_keeps_keys_as_test_input_until_dismissed() {
+        // A disconnect stops the sweep; the user waits for the keyboard to
+        // come back and goes on with the sweep: pausing must not turn plain
+        // keys into commands (q quits, r wipes the run)
+        let mut app = app_at_auto_step(StepKind::Sweep);
+        app.keyboard_disconnected("USB Keyboard");
         app.abort_auto_test();
         let ended = app.auto_test.finished_at().unwrap();
         let ms = |n: u64| ended + Duration::from_millis(n);
-        // Ten seconds later the user types in the Polling view
-        for t in [10_000, 10_150, 10_300] {
+        app.tick();
+        assert!(app.auto_result_pending());
+        // Going on after 10 s: Enter right after another key is typing too
+        for t in [10_000, 10_400, 10_900] {
             app.process_event(&event_at(31, KeyEventType::Press, ms(t)));
             app.process_event(&event_at(31, KeyEventType::Release, ms(t + 60)));
         }
-        // ...and presses Tab half a second after the last key
-        assert!(!app.auto_test_just_ended_at(ms(10_800)));
+        assert!(app.auto_result_pending());
+        assert!(app.auto_test_just_ended_at(ms(11_500)));
+        // Enter itself is not typing: pressing it again does not delay it
+        app.process_event(&event_at(28, KeyEventType::Press, ms(13_000)));
+        assert!(!app.auto_test_just_ended_at(ms(13_010)));
+        // The Auto view says how to get the commands back
+        app.view = AppView::AutoTest;
+        assert!(app
+            .current_results()
+            .iter()
+            .any(|r| r.label == "Keys" && r.value == AFTER_RUN_HINT));
 
-        // The quiet spell noticed by the main loop's tick ends it too
-        let mut app = app_at_auto_step(StepKind::RapidTap);
-        app.abort_auto_test();
-        let quiet = app.auto_test.finished_at().unwrap() + AFTER_RUN_GRACE;
-        app.end_after_run_grace_if_quiet(quiet);
-        let first_key = quiet + Duration::from_millis(10);
-        app.process_event(&event_at(31, KeyEventType::Press, first_key));
-        assert!(!app.auto_test_just_ended_at(first_key + Duration::from_millis(500)));
+        app.dismiss_auto_result();
+        assert!(!app.auto_result_pending());
+        assert!(!app
+            .current_results()
+            .iter()
+            .any(|r| r.value == AFTER_RUN_HINT));
+        // Single keys are commands for the rest of the session: typing later
+        // (in a test view, then Tab; t, t on the Dashboard) does not make the
+        // next key test input again
+        for t in [20_000, 20_150, 20_300] {
+            app.process_event(&event_at(20, KeyEventType::Press, ms(t)));
+        }
+        assert!(!app.auto_test_just_ended_at(ms(20_400)));
+        assert!(!app.auto_result_pending());
 
-        // A new run brings the grace back for its own end
+        // A new run brings it back for its own end; resetting the run ends it
         app.start_auto_test();
         app.abort_auto_test();
+        assert!(app.auto_result_pending());
         assert!(app.auto_test_just_ended());
+        app.view = AppView::AutoTest;
+        app.reset_current();
+        assert!(!app.auto_result_pending());
     }
 
     #[test]
@@ -1819,6 +1999,99 @@ mod tests {
         app.reset_current();
         assert_eq!(app.rollover_test.current_count(), 1);
         assert_eq!(app.rollover_test.max_rollover(), 1);
+    }
+
+    #[test]
+    fn the_reset_keystroke_is_kept_from_the_cleared_test_only() {
+        use KeyEventType::{Press, Release};
+        let ctrl_r = [KeyCode(19), KeyCode(29), KeyCode(97)];
+        let now = Instant::now();
+        let ms = |n: i64| {
+            if n < 0 {
+                now - Duration::from_millis(n.unsigned_abs())
+            } else {
+                now + Duration::from_millis(n as u64)
+            }
+        };
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.view = AppView::Rollover;
+        app.process_event(&event_at(29, Press, ms(-300)));
+        app.reset_current_on_chord_at(&ctrl_r, now);
+        // The R press, read after the command
+        app.process_event(&event_at(19, Press, ms(-20)));
+        assert_eq!(app.rollover_test.current_count(), 0);
+        // Tests that were not cleared see the keystroke as before
+        assert_eq!(app.stickiness_test.held_keys().len(), 2);
+        app.process_event(&event_at(19, Release, ms(60)));
+        app.process_event(&event_at(29, Release, ms(80)));
+        assert_eq!(app.rollover_test.max_rollover(), 0);
+        // The same keys pressed again later are test input
+        app.process_event(&event_at(29, Press, ms(400)));
+        app.process_event(&event_at(19, Press, ms(450)));
+        assert_eq!(app.rollover_test.peak_summary(), "1 + 1 modifier(s)");
+
+        // Press-only input: the R press and its synthesized release
+        let mut app = App::default();
+        app.set_input_source(InputSource::TerminalPressOnly);
+        app.view = AppView::Stickiness;
+        app.reset_current_on_chord_at(&ctrl_r, now);
+        app.process_event(&event_at(19, Press, ms(-1)));
+        app.process_event(&event_at(19, Release, ms(749)));
+        assert!(app.stickiness_test.held_keys().is_empty());
+        assert_eq!(
+            app.current_results()
+                .iter()
+                .find(|r| r.label == "Keys Tested")
+                .map(|r| r.value.clone()),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn only_a_chord_key_pressed_for_the_command_is_part_of_it() {
+        let chord = [KeyCode(19), KeyCode(29), KeyCode(97)];
+        let now = Instant::now();
+        let stuck_after = Duration::from_millis(2000);
+        let down_for = |ms: u64| now - Duration::from_millis(ms);
+        // Ctrl pressed for the command, even slowly
+        assert!(held_for_chord(
+            KeyCode(29),
+            down_for(300),
+            &chord,
+            now,
+            stuck_after
+        ));
+        assert!(held_for_chord(
+            KeyCode(97),
+            down_for(1900),
+            &chord,
+            now,
+            stuck_after
+        ));
+        // A key that is no part of it, or a Ctrl jammed past the threshold
+        assert!(!held_for_chord(
+            KeyCode(30),
+            down_for(300),
+            &chord,
+            now,
+            stuck_after
+        ));
+        assert!(!held_for_chord(
+            KeyCode(29),
+            down_for(5000),
+            &chord,
+            now,
+            stuck_after
+        ));
+        // No keystroke (Reset from code, the auto test starting)
+        assert!(!held_for_chord(
+            KeyCode(29),
+            down_for(300),
+            &[],
+            now,
+            stuck_after
+        ));
     }
 
     #[test]

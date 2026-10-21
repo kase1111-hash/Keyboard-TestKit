@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use keyboard_testkit::{
     config::Config,
-    keyboard::{KeyEvent, KeyboardListener},
+    keyboard::{crossterm_to_keycode, keymap, KeyCode, KeyEvent, KeyboardListener},
     tests::{Finding, InputSource},
     ui::{
         App, AppState, AppView, HelpPanel, KeyboardVisual, ResultsPanel, SettingsPanel,
@@ -635,6 +635,12 @@ fn run_app(
             loop {
                 if let Event::Key(key) = event::read()? {
                     handle_terminal_key(&mut app, &mut listener, &mut held, use_evdev, key);
+                    // The tests see each keystroke before the next key's
+                    // command is decided: an Enter read in the same burst
+                    // as other keys is typing, not a pause (AutoKeys::Ended)
+                    while let Ok(key_event) = event_rx.try_recv() {
+                        app.process_event(&key_event);
+                    }
                 }
                 if app.state == AppState::Quitting || !event::poll(Duration::ZERO)? {
                     break;
@@ -771,6 +777,7 @@ enum Command {
     PrevView,
     ShowView(AppView),
     StartAutoTest,
+    DismissAutoResult,
     TogglePause,
     ResetCurrent,
     ResetAll,
@@ -815,18 +822,21 @@ enum AutoKeys {
     Free,
     /// A run is in progress: every key is test input but Ctrl+N and Ctrl+C
     Running,
-    /// A run just ended while keys were still being pressed (see
-    /// `App::auto_test_just_ended`): plain keys are still test input, only
-    /// Ctrl chords are commands
-    Ending,
+    /// A run ended and its result is still up (see
+    /// `App::auto_result_pending`): plain keys are still test input and only
+    /// Ctrl chords are commands, except that Enter dismisses the result once
+    /// the keyboard has been `quiet` (see `App::auto_test_just_ended`)
+    Ended { quiet: bool },
 }
 
 impl AutoKeys {
-    fn of(app: &App) -> Self {
+    fn of(app: &App, now: Instant) -> Self {
         if app.auto_test_running() {
             AutoKeys::Running
-        } else if app.auto_test_just_ended() {
-            AutoKeys::Ending
+        } else if app.auto_result_pending() {
+            AutoKeys::Ended {
+                quiet: !app.auto_test_just_ended_at(now),
+            }
         } else {
             AutoKeys::Free
         }
@@ -938,8 +948,8 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 ///
 /// The rule, also shown in the help panel and README:
 /// - while the auto test runs, every key is test input except Ctrl+N (skip
-///   step) and Ctrl+C (abort), and right after it ends plain keys stay test
-///   input until the user stops typing (see [`AutoKeys::Ending`]);
+///   step) and Ctrl+C (abort), and after it ends plain keys stay test input
+///   until the user pauses and presses Enter (see [`AutoKeys::Ended`]);
 /// - everywhere else Tab / Shift+Tab switch views, Esc and Ctrl+C quit, and
 ///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export,
 ///   except in the Shortcuts view, where Ctrl combos are the test input;
@@ -985,11 +995,18 @@ fn command_for_key(
             Command::None
         };
     }
-    // The run just ended under the user's fingers (the rapid-tap step ends
-    // on a timer, a disconnect stops a sweep): the keys they are still
-    // pressing are not meant as commands.
-    if auto == AutoKeys::Ending && !ctrl {
-        return Command::None;
+    // The run ended, maybe under the user's fingers (the rapid-tap step ends
+    // on a timer, a disconnect stops a sweep the user may go on with after a
+    // pause): plain keys are not commands until the user says so with Enter,
+    // and an Enter typed along with other keys (a sweep has one) does not.
+    if let AutoKeys::Ended { quiet } = auto {
+        if !ctrl {
+            return if quiet && key.code == CtKeyCode::Enter {
+                Command::DismissAutoResult
+            } else {
+                Command::None
+            };
+        }
     }
 
     // Ctrl chords work in every view but Shortcuts, which records Ctrl
@@ -1073,7 +1090,7 @@ fn command_for_event(
     held: &mut HeldKeyFilter,
     now: Instant,
 ) -> Command {
-    let command = command_for_key(key, app.view, AutoKeys::of(app), app.shortcuts_enabled);
+    let command = command_for_key(key, app.view, AutoKeys::of(app, now), app.shortcuts_enabled);
     if held.is_held(key, now) && !command.repeats_safely() {
         Command::None
     } else {
@@ -1112,7 +1129,43 @@ fn handle_terminal_key(
         }
     }
 
-    apply_command(app, command);
+    // A reset clears the tests under the keystroke that asked for it: its
+    // keys (Ctrl and R) are not rollover or stuck-key input for them
+    match command {
+        Command::ResetCurrent => app.reset_current_on_chord(&keystroke_keys(&key)),
+        Command::ResetAll => app.reset_all_on_chord(&keystroke_keys(&key)),
+        _ => apply_command(app, command),
+    }
+}
+
+/// The keys of a command keystroke: the key itself and both keys of each
+/// modifier it was typed with (the terminal does not say which one was
+/// held). Legacy terminals send Shift+r as 'R'.
+fn keystroke_keys(key: &CtKeyEvent) -> Vec<KeyCode> {
+    let mut keys = vec![crossterm_to_keycode(key.code)];
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT)
+        || matches!(key.code, CtKeyCode::Char(c) if c.is_uppercase());
+    for (held, pair) in [
+        (
+            key.modifiers.contains(KeyModifiers::CONTROL),
+            [keymap::KEY_LCTRL, keymap::KEY_RCTRL],
+        ),
+        (shift, [keymap::KEY_LSHIFT, keymap::KEY_RSHIFT]),
+        (
+            key.modifiers.contains(KeyModifiers::ALT),
+            [keymap::KEY_LALT, keymap::KEY_RALT],
+        ),
+        (
+            key.modifiers.contains(KeyModifiers::SUPER),
+            [keymap::KEY_LSUPER, keymap::KEY_RSUPER],
+        ),
+    ] {
+        if held {
+            keys.extend(pair);
+        }
+    }
+    keys.retain(|k| k.0 != 0);
+    keys
 }
 
 /// Carry out a command.
@@ -1127,6 +1180,7 @@ fn apply_command(app: &mut App, command: Command) {
         Command::PrevView => app.prev_view(),
         Command::ShowView(view) => app.view = view,
         Command::StartAutoTest => app.start_auto_test(),
+        Command::DismissAutoResult => app.dismiss_auto_result(),
         Command::TogglePause => app.toggle_pause(),
         Command::ResetCurrent => app.reset_current(),
         Command::ResetAll => app.reset_all(),
@@ -1381,28 +1435,91 @@ mod tests {
     #[test]
     fn keys_still_typed_as_the_auto_test_ends_are_not_commands() {
         // Tapping 'r' (or q, Space, a digit...) for the rapid-tap step a
-        // moment after it ended must not reset the run, quit or pause
-        let ending =
-            |key: CtKeyEvent| command_for_key(&key, AppView::AutoTest, AutoKeys::Ending, true);
-        for key in [
-            plain('q'),
-            plain('r'),
-            plain(' '),
-            plain('e'),
-            plain('5'),
-            legacy_shift('R'),
-            legacy_shift('A'),
-            press(CtKeyCode::Esc, KeyModifiers::NONE),
-            press(CtKeyCode::Tab, KeyModifiers::NONE),
-        ] {
-            assert_eq!(ending(key), Command::None, "{:?}", key);
+        // moment after it ended must not reset the run, quit or pause, and
+        // neither may those keys after a pause
+        let enter = press(CtKeyCode::Enter, KeyModifiers::NONE);
+        for quiet in [false, true] {
+            let ended = |key: CtKeyEvent| {
+                command_for_key(&key, AppView::AutoTest, AutoKeys::Ended { quiet }, true)
+            };
+            for key in [
+                plain('q'),
+                plain('r'),
+                plain(' '),
+                plain('e'),
+                plain('5'),
+                legacy_shift('R'),
+                legacy_shift('A'),
+                press(CtKeyCode::Esc, KeyModifiers::NONE),
+                press(CtKeyCode::Tab, KeyModifiers::NONE),
+            ] {
+                assert_eq!(ended(key), Command::None, "{:?}", key);
+            }
+            // Deliberate Ctrl chords still work (there is nothing left to skip)
+            assert_eq!(ended(ctrl('c')), Command::Quit);
+            assert_eq!(ended(ctrl('e')), Command::Export);
+            assert_eq!(ended(ctrl('r')), Command::ResetCurrent);
+            assert_eq!(ended(ctrl('n')), Command::None);
+            // Enter typed along with other keys is test input; after a
+            // pause it gives the commands back
+            let dismiss = if quiet {
+                Command::DismissAutoResult
+            } else {
+                Command::None
+            };
+            assert_eq!(ended(enter), dismiss);
         }
-        // Deliberate Ctrl chords still work (there is nothing left to skip)
-        assert_eq!(ending(ctrl('c')), Command::Quit);
-        assert_eq!(ending(ctrl('e')), Command::Export);
-        assert_eq!(ending(ctrl('n')), Command::None);
-        // Once the user has stopped typing the Auto view's keys are back
+        // Once the result is dismissed the Auto view's keys are back
         assert_eq!(cmd(plain('r'), AppView::AutoTest), Command::ResetCurrent);
+        assert_eq!(cmd(enter, AppView::AutoTest), Command::None);
+    }
+
+    #[test]
+    fn pausing_after_a_disconnect_stops_the_run_does_not_free_command_keys() {
+        // The keyboard drops out mid-sweep and comes back; the user goes on
+        // with the sweep after a pause of several seconds
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.start_auto_test();
+        app.keyboard_disconnected("USB Keyboard");
+        app.abort_auto_test();
+        let ended = app.auto_test.finished_at().unwrap();
+        let at = |ms: u64| ended + Duration::from_millis(ms);
+        let mut held = HeldKeyFilter::default();
+        for (ms, key) in [
+            (6_000, plain('q')),
+            (6_400, plain('r')),
+            (6_900, legacy_shift('R')),
+            (7_300, plain(' ')),
+            (7_800, press(CtKeyCode::Esc, KeyModifiers::NONE)),
+            (8_200, press(CtKeyCode::Tab, KeyModifiers::NONE)),
+        ] {
+            let command = command_for_event(&key, &app, &mut held, at(ms));
+            assert_eq!(command, Command::None, "{key:?} {ms} ms after the stop");
+            apply_command(&mut app, command);
+            // The evdev copy of the key, read in the same frame
+            app.process_event(&KeyEvent::new(
+                crossterm_to_keycode(key.code),
+                keyboard_testkit::keyboard::KeyEventType::Press,
+                at(ms),
+                0,
+            ));
+        }
+        // An Enter typed in the sweep, right after other keys, is test input
+        let enter = press(CtKeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            command_for_event(&enter, &app, &mut held, at(8_700)),
+            Command::None
+        );
+        assert!(app.auto_result_pending());
+
+        // Enter after a pause gives the commands back
+        let command = command_for_event(&enter, &app, &mut held, at(12_000));
+        assert_eq!(command, Command::DismissAutoResult);
+        apply_command(&mut app, command);
+        assert!(!app.auto_result_pending());
+        let command = command_for_event(&plain('q'), &app, &mut held, at(13_000));
+        assert_eq!(command, Command::Quit);
     }
 
     /// Commands for `keys`, each `(ms after the first, key)`, fed to `app`
@@ -1792,6 +1909,135 @@ mod tests {
         // Quitting with Ctrl still held is not a key without a release either
         app.refresh_findings();
         assert!(issues(&app).is_empty(), "{:?}", app.findings);
+    }
+
+    /// An evdev key event: kernel time `at`.
+    fn evdev(key: u16, kind: keyboard_testkit::keyboard::KeyEventType, at: Instant) -> KeyEvent {
+        KeyEvent::new(keyboard_testkit::keyboard::KeyCode(key), kind, at, 0)
+    }
+
+    #[test]
+    fn the_reset_chord_is_not_counted_as_rollover() {
+        use keyboard_testkit::keyboard::KeyEventType::{Press, Release};
+        const CTRL: u16 = 29;
+        const R: u16 = 19;
+        // Evdev: Ctrl is read from the device long before the terminal
+        // delivers Ctrl+R; the R press is read either just before the
+        // terminal key (`r_first`) or on the next loop iteration
+        for r_first in [false, true] {
+            let mut app = App::default();
+            app.set_input_source(InputSource::Evdev);
+            app.view = AppView::Rollover;
+            let t0 = Instant::now() - Duration::from_millis(300);
+            app.process_event(&evdev(CTRL, Press, t0));
+            let r_down = t0 + Duration::from_millis(150);
+            if r_first {
+                app.process_event(&evdev(R, Press, r_down));
+            }
+            let (tx, _rx) = mpsc::channel();
+            let mut listener = KeyboardListener::new(tx);
+            let mut held = HeldKeyFilter::default();
+            handle_terminal_key(&mut app, &mut listener, &mut held, true, ctrl('r'));
+            if !r_first {
+                app.process_event(&evdev(R, Press, r_down));
+            }
+            let later = Instant::now() + Duration::from_millis(100);
+            app.process_event(&evdev(R, Release, later));
+            app.process_event(&evdev(CTRL, Release, later));
+            assert_eq!(
+                app.rollover_test.max_rollover(),
+                0,
+                "R read first: {r_first}"
+            );
+            assert_eq!(app.rollover_test.rollover_rating(), "Not tested");
+            assert_eq!(app.rollover_test.peak_summary(), "0");
+
+            // The next keys are counted as usual
+            let t = Instant::now() + Duration::from_millis(200);
+            for key in [30, 31, 32] {
+                app.process_event(&evdev(key, Press, t));
+            }
+            assert_eq!(app.rollover_test.rollover_rating(), "3KRO");
+        }
+
+        // Kitty protocol: Ctrl comes as a key of its own; Shift+R (Reset All)
+        // on the Dashboard the same way
+        let ctrl_key = CtKeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl);
+        let shift_key = CtKeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift);
+        let up =
+            |code, modifiers| CtKeyEvent::new_with_kind(code, modifiers, KeyEventKind::Release);
+        for (view, modifier, modifiers, key) in [
+            (AppView::Rollover, ctrl_key, KeyModifiers::CONTROL, 'r'),
+            (AppView::Dashboard, shift_key, KeyModifiers::SHIFT, 'r'),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let mut listener = KeyboardListener::new(tx);
+            listener.set_release_reporting(true);
+            let mut app = App::default();
+            app.set_input_source(InputSource::TerminalWithRelease);
+            app.view = view;
+            let mut held = HeldKeyFilter::default();
+            for event in [
+                press(modifier, modifiers),
+                press(CtKeyCode::Char(key), modifiers),
+                up(CtKeyCode::Char(key), modifiers),
+                up(modifier, KeyModifiers::NONE),
+            ] {
+                handle_terminal_key(&mut app, &mut listener, &mut held, false, event);
+                while let Ok(event) = rx.try_recv() {
+                    app.process_event(&event);
+                }
+            }
+            assert_eq!(app.rollover_test.max_rollover(), 0, "{view:?}");
+            assert_eq!(app.stickiness_test.held_keys().len(), 0, "{view:?}");
+        }
+    }
+
+    #[test]
+    fn keys_held_before_the_reset_chord_are_kept() {
+        use keyboard_testkit::keyboard::KeyEventType::Press;
+        const CTRL: u16 = 29;
+        const J: u16 = 36;
+        let reset = |app: &mut App| {
+            let (tx, _rx) = mpsc::channel();
+            let mut listener = KeyboardListener::new(tx);
+            let mut held = HeldKeyFilter::default();
+            handle_terminal_key(app, &mut listener, &mut held, true, ctrl('r'));
+        };
+        let stuck = |app: &App| -> Vec<u16> {
+            app.stickiness_test
+                .stuck_keys()
+                .iter()
+                .map(|(k, _)| k.0)
+                .collect()
+        };
+        // A jammed J, then Ctrl+R in the Sticky view to re-check it
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.view = AppView::Stickiness;
+        let now = Instant::now();
+        app.process_event(&evdev(J, Press, now - Duration::from_secs(5)));
+        app.process_event(&evdev(CTRL, Press, now - Duration::from_millis(300)));
+        reset(&mut app);
+        assert_eq!(stuck(&app), vec![J]);
+
+        // A jammed Ctrl: pressing R alone types Ctrl+R. Ctrl has been down
+        // past the stuck-key threshold, so it is no part of the keystroke
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.view = AppView::Stickiness;
+        app.process_event(&evdev(CTRL, Press, now - Duration::from_secs(5)));
+        reset(&mut app);
+        assert_eq!(stuck(&app), vec![CTRL]);
+
+        // A key held for rollover while Ctrl+R is pressed still counts
+        let mut app = App::default();
+        app.set_input_source(InputSource::Evdev);
+        app.view = AppView::Rollover;
+        app.process_event(&evdev(30, Press, now - Duration::from_millis(800)));
+        app.process_event(&evdev(CTRL, Press, now - Duration::from_millis(300)));
+        reset(&mut app);
+        assert_eq!(app.rollover_test.peak_summary(), "1");
     }
 
     #[test]
