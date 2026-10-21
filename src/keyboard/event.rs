@@ -113,7 +113,8 @@ struct KeyTrack {
     repeat_interval: Option<Duration>,
     /// The key was a held-back press settled as a key of its own (see
     /// [`HeldBack`]): the key down whose autorepeat it may still have been.
-    /// The two come up together.
+    /// The two come up together, unless that key comes up first without
+    /// Shift/AltGr (see [`KeyboardListener::send_release_with`]).
     repeat_of: Option<KeyCode>,
 }
 
@@ -237,7 +238,10 @@ fn midpoint(a: Instant, b: Instant) -> Instant {
 /// autorepeat of the one before), and the key stays one keystroke until it
 /// comes up. Otherwise it is a key of its own, reported with the time it
 /// went down, but it and the held key come up together: whichever character
-/// the physical key comes up as, neither is left down. The cost: a
+/// the physical key comes up as, neither is left down. Only when the held
+/// key comes up first typing a character without Shift/AltGr does the new
+/// key stay down: that character is what the held key's autorepeat would
+/// have typed, so the new code was not it. The cost: a
 /// different key tapped shorter than that window while such a symbol key is
 /// still down (Shift already up), repeating or down for an autorepeat delay,
 /// is taken for the symbol key's last repeat, and one held longer comes up
@@ -413,14 +417,18 @@ impl KeyboardListener {
         now: Instant,
     ) -> bool {
         let key = crossterm_to_keycode(ct_key);
+        let release_shifted = level_shifted(modifiers);
         match self.held_back {
             // The held-back key code comes up before the next autorepeat
             // would have shown which it is: the held key's last repeat
             // (the key let go right after Shift), or the held key comes up
-            // at its own code (Shift back down), after its last repeat
+            // at its own code with Shift/AltGr back down, after its last
+            // repeat. Coming up at its own code without them (a US layout,
+            // where '!' and '1' are one key code), it would have repeated
+            // at that code too: the held-back press is a key of its own.
             Some(h)
                 if key.0 != 0
-                    && (h.key == key || h.of == key)
+                    && (h.key == key || (h.of == key && release_shifted))
                     && now.saturating_duration_since(h.at) < h.window =>
             {
                 self.held_back = None;
@@ -441,19 +449,33 @@ impl KeyboardListener {
                 .or_else(|| self.take_aliased(key))
         };
         let Some((key, track)) =
-            tracked.or_else(|| self.take_unmatched_press(ct_key, level_shifted(modifiers)))
+            tracked.or_else(|| self.take_unmatched_press(ct_key, release_shifted))
         else {
             return false;
         };
         // A held-back press settled as a key of its own and the key whose
-        // autorepeat it may have been are one physical key at most: whichever
-        // comes up, the other does too (see [`KeyTrack::repeat_of`])
+        // autorepeat it may have been are one physical key at most (see
+        // [`KeyTrack::repeat_of`]): when the settled key comes up, the other
+        // does too. When the other comes up without Shift/AltGr, it typed
+        // what its autorepeat would have typed without them, and that was
+        // not the settled key's code (that key would have matched the
+        // release itself): the settled key is a key of its own and stays
+        // down, no longer linked.
         let linked: Vec<KeyCode> = self
             .keys
             .iter()
-            .filter(|(k, t)| t.down && (t.repeat_of == Some(key) || track.repeat_of == Some(**k)))
+            .filter(|(k, t)| {
+                t.down
+                    && ((t.repeat_of == Some(key) && release_shifted)
+                        || track.repeat_of == Some(**k))
+            })
             .map(|(k, _)| *k)
             .collect();
+        for t in self.keys.values_mut() {
+            if t.repeat_of == Some(key) {
+                t.repeat_of = None;
+            }
+        }
         let mut out = Vec::new();
         for (k, t) in std::iter::once((key, track)).chain(
             linked
@@ -511,7 +533,9 @@ impl KeyboardListener {
         }
         let shifted = level_shifted(modifiers);
         if let Some(h) = self.held_back {
-            if (h.key == key || h.of == key) && now.saturating_duration_since(h.at) < h.window {
+            if (h.key == key || (h.of == key && shifted))
+                && now.saturating_duration_since(h.at) < h.window
+            {
                 // Reported again this soon: autorepeat, which a key that
                 // has just gone down cannot produce yet. It is the held
                 // key, typing another character since Shift/AltGr came up.
@@ -1631,6 +1655,97 @@ mod tests {
         assert_eq!(
             x,
             vec![(45, KeyEventType::Press), (45, KeyEventType::Release)]
+        );
+    }
+
+    #[test]
+    fn the_next_key_rolled_onto_after_a_long_shifted_symbol_registers() {
+        let shift = KeyModifiers::SHIFT;
+        let none = KeyModifiers::NONE;
+        let at = |events: &[KeyEvent], key: u16, kind: KeyEventType| {
+            events
+                .iter()
+                .find(|e| e.key.0 == key && e.event_type == kind)
+                .map(|e| e.timestamp - events[0].timestamp)
+        };
+        // US layout: '!' (Shift+1) held a while, Shift let go, X pressed
+        // while the 1 key is still down, the 1 key coming up as '1' (the
+        // same key code) just after: X is a keystroke of its own, from its
+        // press to its release, whether the 1 key comes up inside the
+        // held-back window or after it
+        for one_up in [300, 450] {
+            let (events, down) = console_at(&[
+                (0, true, '!', shift),
+                (280, true, 'x', none),
+                (one_up, false, '1', none),
+                (600, false, 'x', none),
+            ]);
+            assert!(down.is_empty(), "1 up at {one_up}: {down:?} still down");
+            assert_eq!(
+                at(&events, 45, KeyEventType::Press),
+                Some(Duration::from_millis(280)),
+                "1 up at {one_up}: {events:?}"
+            );
+            assert_eq!(
+                at(&events, 45, KeyEventType::Release),
+                Some(Duration::from_millis(600)),
+                "1 up at {one_up}: {events:?}"
+            );
+            assert_eq!(
+                at(&events, 2, KeyEventType::Release),
+                Some(Duration::from_millis(one_up)),
+                "1 up at {one_up}: {events:?}"
+            );
+        }
+
+        // German layout: '"' (Shift+2) held a while, Shift let go, H pressed,
+        // the 2 key coming up as '2' after the held-back window: H stays
+        // down until it comes up itself
+        let (events, down) = console_at(&[
+            (0, true, '"', shift),
+            (280, true, 'h', none),
+            (450, false, '2', none),
+            (600, false, 'h', none),
+        ]);
+        assert!(down.is_empty(), "{down:?} still down");
+        assert_eq!(
+            summary(&events),
+            vec![
+                (40, KeyEventType::Press),
+                (35, KeyEventType::Press),
+                (40, KeyEventType::Release),
+                (35, KeyEventType::Release),
+            ]
+        );
+        assert_eq!(
+            at(&events, 35, KeyEventType::Release),
+            Some(Duration::from_millis(600))
+        );
+
+        // Once the symbol key is up the link is gone: pressed again while X
+        // is still down, it is not let go with X
+        let (events, down) = console_at(&[
+            (0, true, '!', shift),
+            (280, true, 'x', none),
+            (300, false, '1', none),
+            (500, true, '1', none),
+            (600, false, 'x', none),
+            (700, false, '1', none),
+        ]);
+        assert!(down.is_empty(), "{down:?} still down");
+        let ones: Vec<_> = events
+            .iter()
+            .filter(|e| e.key.0 == 2)
+            .map(|e| (e.event_type, e.timestamp - events[0].timestamp))
+            .collect();
+        assert_eq!(
+            ones,
+            vec![
+                (KeyEventType::Press, Duration::ZERO),
+                (KeyEventType::Release, Duration::from_millis(300)),
+                (KeyEventType::Press, Duration::from_millis(500)),
+                (KeyEventType::Release, Duration::from_millis(700)),
+            ]
         );
     }
 
