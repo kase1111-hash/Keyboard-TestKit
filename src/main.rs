@@ -1036,11 +1036,11 @@ fn handle_terminal_key(
                 listener.swallow_press(key.code);
             }
             KeyEventKind::Press => {
-                listener.send_press(key.code);
+                listener.send_press_with(key.code, key.modifiers);
             }
             KeyEventKind::Repeat => listener.send_repeat(key.code),
             KeyEventKind::Release => {
-                listener.send_release(key.code);
+                listener.send_release_with(key.code, key.modifiers);
             }
         }
     }

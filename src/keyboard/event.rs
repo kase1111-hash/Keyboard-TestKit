@@ -1,7 +1,7 @@
 //! Keyboard event types and crossterm-based listener
 
 use super::KeyCode;
-use crossterm::event::KeyCode as CtKeyCode;
+use crossterm::event::{KeyCode as CtKeyCode, KeyModifiers};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -94,6 +94,12 @@ struct KeyTrack {
     /// [`KeyboardListener::swallow_press`]): it, its autorepeat and its
     /// release are not emitted.
     silent: bool,
+    /// The press typed a character other than a letter, so the key it maps
+    /// to depends on the layout and on Shift/AltGr (see
+    /// [`KeyboardListener::send_release_with`])
+    symbol: bool,
+    /// The press was typed with Shift or AltGr held
+    shifted: bool,
 }
 
 impl KeyTrack {
@@ -106,8 +112,23 @@ impl KeyTrack {
             pending: None,
             idle_before: false,
             silent: false,
+            symbol: false,
+            shifted: false,
         }
     }
+}
+
+/// Whether `modifiers` select another character on the same key: Shift, or
+/// AltGr (reported as Ctrl+Alt on Windows).
+fn level_shifted(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT)
+        || modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+/// Whether `ct_key` is a character that is not a letter (digits and
+/// punctuation: other keys on other layouts, other characters with Shift).
+fn is_symbol(ct_key: CtKeyCode) -> bool {
+    matches!(ct_key, CtKeyCode::Char(c) if !c.is_alphabetic())
 }
 
 /// A key event the listener has decided to emit.
@@ -192,7 +213,21 @@ impl KeyboardListener {
     /// key repeat and generates nothing. Without it, see the type docs.
     /// Returns true if a press event was sent.
     pub fn send_press(&mut self, ct_key: CtKeyCode) -> bool {
-        self.press_at(ct_key, Instant::now())
+        self.send_press_with(ct_key, KeyModifiers::NONE)
+    }
+
+    /// [`KeyboardListener::send_press`] with the modifiers the terminal
+    /// reported, which [`KeyboardListener::send_release_with`] needs to
+    /// match the release to the press.
+    pub fn send_press_with(&mut self, ct_key: CtKeyCode, modifiers: KeyModifiers) -> bool {
+        let sent = self.press_at(ct_key, Instant::now());
+        if sent && self.release_reporting {
+            if let Some(t) = self.keys.get_mut(&crossterm_to_keycode(ct_key)) {
+                t.symbol = is_symbol(ct_key);
+                t.shifted = level_shifted(modifiers);
+            }
+        }
+        sent
     }
 
     /// Note a key press that was a UI command rather than test input, such as
@@ -258,11 +293,57 @@ impl KeyboardListener {
     /// Releases for keys that are not currently pressed are ignored.
     /// Returns true if an event was sent.
     pub fn send_release(&mut self, ct_key: CtKeyCode) -> bool {
+        self.send_release_with(ct_key, KeyModifiers::NONE)
+    }
+
+    /// [`KeyboardListener::send_release`] with the modifiers the terminal
+    /// reported.
+    ///
+    /// A key is identified by the character it types, and the Windows
+    /// console reports the character of a release for the modifiers held at
+    /// that moment. Releasing Shift before the key (ordinary typing) turns
+    /// the release of a German Shift+2 (`"`, the quote key on US layouts)
+    /// into a `2`, and AltGr+Q (`@`) released after AltGr into a `q`: the
+    /// release matches no key down and the pressed key would stay down for
+    /// good (a stuck key on a healthy keyboard). So a character release that
+    /// matches no key down releases the most recent key down that typed a
+    /// non-letter with Shift/AltGr, or one this release types with them:
+    /// the physical key cannot be recovered from the characters.
+    pub fn send_release_with(&mut self, ct_key: CtKeyCode, modifiers: KeyModifiers) -> bool {
         let key = crossterm_to_keycode(ct_key);
-        if key.0 == 0 || !self.keys.remove(&key).is_some_and(|t| t.down && !t.silent) {
+        let tracked = if key.0 == 0 {
+            None
+        } else {
+            self.keys.remove(&key).map(|t| (key, t))
+        };
+        let Some((key, track)) =
+            tracked.or_else(|| self.take_unmatched_press(ct_key, level_shifted(modifiers)))
+        else {
+            return false;
+        };
+        if !track.down || track.silent {
             return false;
         }
         self.emit(key, KeyEventType::Release, Instant::now())
+    }
+
+    /// The key down that a character release matching no key down belongs
+    /// to (see [`KeyboardListener::send_release_with`]); forgets it.
+    fn take_unmatched_press(
+        &mut self,
+        ct_key: CtKeyCode,
+        release_shifted: bool,
+    ) -> Option<(KeyCode, KeyTrack)> {
+        if !self.release_reporting || !matches!(ct_key, CtKeyCode::Char(_)) {
+            return None;
+        }
+        let key = self
+            .keys
+            .iter()
+            .filter(|(_, t)| t.down && t.symbol && (t.shifted || release_shifted))
+            .max_by_key(|(_, t)| t.pressed_at)
+            .map(|(k, _)| *k)?;
+        self.keys.remove(&key).map(|t| (key, t))
     }
 
     fn press_at(&mut self, ct_key: CtKeyCode, now: Instant) -> bool {
@@ -1049,6 +1130,70 @@ mod tests {
             crossterm_to_keycode(CtKeyCode::Modifier(Mk::LeftSuper)),
             KeyCode(125)
         );
+    }
+
+    /// A release-reporting listener fed `(press?, char, modifiers)` reports.
+    fn console(
+        reports: &[(bool, char, KeyModifiers)],
+    ) -> (KeyboardListener, mpsc::Receiver<KeyEvent>) {
+        let (mut l, rx) = listener();
+        l.set_release_reporting(true);
+        for &(is_press, c, modifiers) in reports {
+            if is_press {
+                l.send_press_with(CtKeyCode::Char(c), modifiers);
+            } else {
+                l.send_release_with(CtKeyCode::Char(c), modifiers);
+            }
+        }
+        (l, rx)
+    }
+
+    #[test]
+    fn release_typed_with_other_modifiers_still_releases_the_key() {
+        let shift = KeyModifiers::SHIFT;
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let none = KeyModifiers::NONE;
+        for (case, reports) in [
+            // German layout, Shift let go before the 2: '"' then '2'
+            ("Shift+2", vec![(true, '"', shift), (false, '2', none)]),
+            // The other way round: 2 down, Shift down, 2 up as '"'
+            ("2 then Shift", vec![(true, '2', none), (false, '"', shift)]),
+            // AltGr+Q types '@'; AltGr let go first, the release is 'q'
+            ("AltGr+Q", vec![(true, '@', altgr), (false, 'q', none)]),
+            // Shift+ß types '?'; the release 'ß' maps to no key at all
+            ("Shift+ß", vec![(true, '?', shift), (false, 'ß', none)]),
+            // AZERTY: Shift+& types '1', released as '&'
+            ("AZERTY 1", vec![(true, '1', shift), (false, '&', none)]),
+        ] {
+            let (l, rx) = console(&reports);
+            let events: Vec<KeyEvent> = rx.try_iter().collect();
+            assert!(l.pressed_keys().is_empty(), "{case}: still down");
+            let kinds: Vec<KeyEventType> = events.iter().map(|e| e.event_type).collect();
+            assert_eq!(
+                kinds,
+                vec![KeyEventType::Press, KeyEventType::Release],
+                "{case}"
+            );
+            assert_eq!(events[0].key, events[1].key, "{case}");
+        }
+    }
+
+    #[test]
+    fn unrelated_releases_do_not_release_held_keys() {
+        let none = KeyModifiers::NONE;
+        let shift = KeyModifiers::SHIFT;
+        // A letter held with Shift maps to its key whatever the modifiers;
+        // a digit held without Shift is not released by another digit's
+        // release; and the Enter that launched the app is ignored
+        let (mut l, _rx) = console(&[(true, 'A', shift), (true, '2', none), (false, '5', none)]);
+        assert!(!l.send_release_with(CtKeyCode::Enter, none));
+        let mut down: Vec<u16> = l.pressed_keys().iter().map(|k| k.0).collect();
+        down.sort_unstable();
+        assert_eq!(down, vec![3, 30]);
+        // Normal releases still match exactly
+        assert!(l.send_release_with(CtKeyCode::Char('2'), none));
+        assert!(l.send_release_with(CtKeyCode::Char('a'), none));
+        assert!(l.pressed_keys().is_empty());
     }
 
     #[test]
