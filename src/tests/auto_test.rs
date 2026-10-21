@@ -1137,7 +1137,7 @@ impl AutoTest {
 
         // --- Polling / timing --------------------------------------------
         if self.input_source.has_precise_timestamps() {
-            let samples = ctx.polling.intervals_us().len();
+            let samples = ctx.polling.quantization_samples();
             if samples >= super::polling::MIN_QUANTIZATION_SAMPLES {
                 match ctx.polling.estimated_poll_interval_us() {
                     Some(step_us) => {
@@ -1151,7 +1151,7 @@ impl AutoTest {
                                 hz
                             ),
                             format!(
-                                "Inferred from timestamp quantization over {} rapid presses.",
+                                "Inferred from the timing of {} gaps between key events.",
                                 samples
                             ),
                             if hz < 200.0 {
@@ -1168,7 +1168,7 @@ impl AutoTest {
                         Severity::Info,
                         "Polling rate",
                         "No 125/250/500 Hz report grid visible (1000+ Hz, or Bluetooth)",
-                        format!("{} rapid-press samples analysed.", samples),
+                        format!("{} gaps between key events analysed.", samples),
                         "",
                     )),
                 }
