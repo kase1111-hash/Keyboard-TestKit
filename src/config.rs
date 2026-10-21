@@ -30,7 +30,7 @@ use crate::keyboard::remap::FnKeyMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Error type for configuration operations
@@ -385,7 +385,84 @@ impl OemKeyConfig {
     }
 }
 
+/// What reading the config file gave: the settings in effect, and what the
+/// user has to be told about the file. A file that fails to load must not
+/// pass silently: the app then runs on defaults, and saving would replace
+/// the file (and the key mappings in it) with them.
+#[derive(Debug, Default)]
+pub struct ConfigLoad {
+    /// The settings in effect (the defaults if the file could not be used)
+    pub config: Config,
+    /// The file read and saved to (`None` without a config directory)
+    pub path: Option<PathBuf>,
+    /// Out-of-range values that were clamped or replaced (see `sanitize`)
+    pub adjusted: Vec<String>,
+    /// Why the file could not be used; the defaults are in effect
+    pub error: Option<String>,
+}
+
+impl ConfigLoad {
+    /// Whether a config file exists that could not be used, so saving over
+    /// it would lose what it holds (see [`Config::save_to_backing_up`]).
+    pub fn unreadable(&self) -> bool {
+        self.error.is_some() && self.path.as_deref().is_some_and(Path::exists)
+    }
+
+    /// One line per thing the user should know about the file.
+    pub fn notes(&self) -> Vec<String> {
+        let file = self
+            .path
+            .as_deref()
+            .map_or("config file".to_string(), |p| p.display().to_string());
+        let mut notes = Vec::new();
+        if let Some(error) = &self.error {
+            notes.push(format!(
+                "{}: not used, defaults in effect ({})",
+                file, error
+            ));
+        }
+        notes.extend(self.adjusted.iter().map(|a| format!("{}: {}", file, a)));
+        notes
+    }
+}
+
 impl Config {
+    /// Load the config file like [`Config::load`], but keep what went wrong
+    /// (a file that does not parse, values that were clamped) for the user.
+    pub fn load_reporting() -> ConfigLoad {
+        match config_path() {
+            Ok(path) => Self::load_reporting_from(&path),
+            Err(e) => ConfigLoad {
+                error: Some(e.to_string()),
+                ..ConfigLoad::default()
+            },
+        }
+    }
+
+    /// [`Config::load_reporting`] for a specific file. A missing file gives
+    /// the defaults without a note.
+    pub fn load_reporting_from(path: &Path) -> ConfigLoad {
+        let mut load = ConfigLoad {
+            path: Some(path.to_path_buf()),
+            ..ConfigLoad::default()
+        };
+        if !path.exists() {
+            return load;
+        }
+        let parsed = fs::read_to_string(path)
+            .map_err(ConfigError::from)
+            .and_then(|contents| toml::from_str::<Config>(&contents).map_err(ConfigError::from));
+        match parsed {
+            Ok(mut config) => {
+                load.adjusted = config.sanitize();
+                load.config = config;
+            }
+            // toml errors quote the offending line over several lines
+            Err(e) => load.error = Some(e.to_string().replace('\n', " ")),
+        }
+        load
+    }
+
     /// Load configuration from the default config file.
     ///
     /// Returns the default configuration if the file doesn't exist.
@@ -511,6 +588,19 @@ impl Config {
         let contents = toml::to_string_pretty(self)?;
         fs::write(path, &contents)?;
         Ok(())
+    }
+
+    /// Save over a file that could not be loaded, keeping the old file as
+    /// `<name>.bak` first (its key mappings would be lost otherwise).
+    /// Returns where the old file was kept. Nothing is written if it cannot
+    /// be kept.
+    pub fn save_to_backing_up(&self, path: &PathBuf) -> Result<PathBuf, ConfigError> {
+        let mut backup = path.clone().into_os_string();
+        backup.push(".bak");
+        let backup = PathBuf::from(backup);
+        fs::copy(path, &backup)?;
+        self.save_to(path)?;
+        Ok(backup)
     }
 
     /// Get UI refresh interval as Duration
@@ -927,6 +1017,56 @@ show_notifications = true
         // The rest of the file is kept
         assert_eq!(config.ui.theme, Theme::Light);
         assert_eq!(config.oem_keys.key_mappings, vec![(100, 97)]);
+    }
+
+    #[test]
+    fn a_file_that_does_not_load_is_reported_not_silently_replaced() {
+        // Hand edits the README invites: a lowercase theme, a float
+        for (name, contents) in [
+            (
+                "lowercase",
+                "[ui]\ntheme = \"light\"\n[oem_keys]\nkey_mappings = [[148, 125]]\n",
+            ),
+            ("float", "[stickiness]\nstuck_threshold_ms = 2000.0\n"),
+        ] {
+            let path = temp_path(name);
+            fs::write(&path, contents).unwrap();
+            let load = Config::load_reporting_from(&path);
+            assert!(load.error.is_some(), "{name}");
+            assert!(load.unreadable());
+            let notes = load.notes();
+            assert_eq!(notes.len(), 1);
+            assert!(
+                notes[0].contains("not used, defaults in effect"),
+                "{:?}",
+                notes
+            );
+            assert!(!notes[0].contains('\n'), "{:?}", notes);
+
+            // Saving keeps the user's file instead of overwriting it
+            let backup = load.config.save_to_backing_up(&path).unwrap();
+            assert_eq!(fs::read_to_string(&backup).unwrap(), contents);
+            assert!(Config::load_from(&path).is_ok());
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&backup);
+        }
+    }
+
+    #[test]
+    fn clamped_values_are_reported() {
+        let path = temp_path("clamp-report");
+        fs::write(&path, "[ui]\nrefresh_rate_hz = 0\n").unwrap();
+        let load = Config::load_reporting_from(&path);
+        let _ = fs::remove_file(&path);
+        assert!(load.error.is_none());
+        assert!(!load.unreadable());
+        assert_eq!(load.config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(load.adjusted.len(), 1);
+        assert!(load.notes()[0].contains("ui.refresh_rate_hz = 0"));
+
+        // A missing file is the defaults, nothing to report
+        let load = Config::load_reporting_from(&temp_path("missing"));
+        assert!(load.error.is_none() && load.notes().is_empty());
     }
 
     #[test]

@@ -571,11 +571,14 @@ pub fn run_mapper(
         }
     }
 
-    // Also load from config file if available
-    if let Ok(config) = Config::load() {
-        for (from, to) in &config.oem_keys.key_mappings {
-            mappings.insert(*from, *to);
-        }
+    // Also load from the config file, saying so when it cannot be used
+    // (the mappings in it would otherwise be missing without a word)
+    let load = Config::load_reporting();
+    for note in load.notes() {
+        eprintln!("Config: {}", note);
+    }
+    for (from, to) in &load.config.oem_keys.key_mappings {
+        mappings.insert(*from, *to);
     }
 
     // Apply extra mappings (override preset/config)

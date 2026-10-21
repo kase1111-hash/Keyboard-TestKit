@@ -359,6 +359,9 @@ fn main() -> Result<()> {
                 println!("      {}", f.detail);
             }
         }
+        for note in &summary.config_notes {
+            println!("Config: {}", note);
+        }
     }
 
     result.map(|_| ())
@@ -366,6 +369,8 @@ fn main() -> Result<()> {
 
 /// What the TUI session reports on exit.
 struct SessionOutcome {
+    /// Problems with the config file (it could not be used, values clamped)
+    config_notes: Vec<String>,
     input_source: &'static str,
     total_events: u64,
     elapsed: String,
@@ -434,8 +439,8 @@ fn run_app(
     auto_start: bool,
 ) -> Result<Option<SessionOutcome>> {
     // TODO: Support --config <path> CLI argument for custom config locations.
-    let config = Config::load().unwrap_or_default();
-    let mut app = App::new(config.clone());
+    let config_load = Config::load_reporting();
+    let mut app = App::new(config_load.config.clone());
 
     // Create keyboard event channel
     let (event_tx, event_rx) = mpsc::channel::<KeyEvent>();
@@ -485,6 +490,8 @@ fn run_app(
         InputSource::TerminalPressOnly
     };
     app.set_input_source(input_source);
+    // After the evdev status: a config file that could not be used must be seen
+    app.set_config_load(&config_load);
 
     if auto_start {
         app.start_auto_test();
@@ -634,6 +641,7 @@ fn run_app(
 
     app.refresh_findings();
     Ok(Some(SessionOutcome {
+        config_notes: app.config_notes().to_vec(),
         input_source: app.input_source.name(),
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),

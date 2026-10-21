@@ -227,7 +227,13 @@ loaded (for example `ui.refresh_rate_hz` to 10-240 Hz,
 ranges), and missing entries fall back to their defaults. The Settings view
 (`S`) stays within the same ranges. A stuck threshold below 250 ms, such as
 the 50 ms that older versions saved as their default, is replaced by the
-2000 ms default.
+2000 ms default. Adjusted values are listed on the Dashboard and on exit.
+
+A `config.toml` that cannot be read at all (a syntax error, `theme =
+"light"` instead of `"Light"`, `2000.0` where a whole number is expected)
+is not used: the status line, the Dashboard and the exit summary say so and
+the defaults are in effect. Saving from Settings then keeps the old file as
+`config.toml.bak` before writing, so its key mappings are not lost.
 
 A key counts as stuck only while it is still down past the threshold. Keys
 you held that long and then released are listed as long holds in the Sticky

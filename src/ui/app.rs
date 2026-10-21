@@ -1,9 +1,10 @@
 //! Main application state and logic
 
 use crate::config::{
-    Config, Theme, BOUNCE_WINDOW_MS_MAX, BOUNCE_WINDOW_MS_MIN, POLLING_DURATION_SECS_MAX,
-    POLLING_DURATION_SECS_MIN, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN, STUCK_THRESHOLD_MS_MAX,
-    STUCK_THRESHOLD_MS_MIN, WARNING_DURATION_SECS_MAX, WARNING_DURATION_SECS_MIN,
+    config_path, Config, ConfigLoad, Theme, BOUNCE_WINDOW_MS_MAX, BOUNCE_WINDOW_MS_MIN,
+    POLLING_DURATION_SECS_MAX, POLLING_DURATION_SECS_MIN, REFRESH_RATE_HZ_MAX, REFRESH_RATE_HZ_MIN,
+    STUCK_THRESHOLD_MS_MAX, STUCK_THRESHOLD_MS_MIN, WARNING_DURATION_SECS_MAX,
+    WARNING_DURATION_SECS_MIN,
 };
 use crate::keyboard::layout::KeyboardLayout;
 use crate::keyboard::remap::FnKeyMode;
@@ -16,7 +17,7 @@ use crate::tests::{
 };
 use crate::ui::theme::ThemeColors;
 use crate::ui::widgets::SettingsItem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How often the live diagnostic findings are recomputed.
@@ -244,6 +245,12 @@ pub struct App {
     disconnects: DisconnectLog,
     /// Latest key press the tests saw (see [`App::auto_test_just_ended`])
     last_key_press: Option<Instant>,
+    /// The config file Settings > Save writes (the default location if None)
+    config_path: Option<PathBuf>,
+    /// The config file exists but could not be used: saving keeps a backup
+    config_unreadable: bool,
+    /// What the user should know about the config file (see [`ConfigLoad::notes`])
+    config_notes: Vec<String>,
 }
 
 impl App {
@@ -311,9 +318,35 @@ impl App {
             last_auto_step: None,
             disconnects: DisconnectLog::default(),
             last_key_press: None,
+            config_path: None,
+            config_unreadable: false,
+            config_notes: Vec::new(),
         };
         app.set_input_source(input_source);
         app
+    }
+
+    /// Tell the app how loading its config went (`App::new` got the
+    /// resulting settings): where to save, and what to tell the user. A
+    /// file that could not be used is announced in the status line, on the
+    /// Dashboard and on exit, and saving over it keeps it as a backup.
+    pub fn set_config_load(&mut self, load: &ConfigLoad) {
+        self.config_path = load.path.clone();
+        self.config_unreadable = load.unreadable();
+        self.config_notes = load.notes();
+        if load.error.is_some() {
+            self.set_status("config.toml not used: defaults in effect - see Dashboard".to_string());
+        } else if !load.adjusted.is_empty() {
+            self.set_status(format!(
+                "config.toml: {} value(s) out of range were adjusted - see Dashboard",
+                load.adjusted.len()
+            ));
+        }
+    }
+
+    /// What the user should know about the config file, one line each.
+    pub fn config_notes(&self) -> &[String] {
+        &self.config_notes
     }
 
     /// Record that an input device of the keyboard went away (unplugged,
@@ -790,6 +823,20 @@ impl App {
 
         results.push(TestResult::info("Input", self.input_source.name()));
 
+        if !self.config_notes.is_empty() {
+            results.push(TestResult::info("", ""));
+            results.push(TestResult::info("--- Config File ---", ""));
+            if self.config_unreadable {
+                results.push(TestResult::warning(
+                    "Config",
+                    "not used: defaults in effect; Save keeps it as .bak",
+                ));
+            }
+            for note in self.config_notes.iter().take(4) {
+                results.push(TestResult::info("", note.clone()));
+            }
+        }
+
         // Live diagnostics summary
         results.push(TestResult::info("", ""));
         results.push(TestResult::info("--- Auto Diagnostics ---", ""));
@@ -1082,9 +1129,33 @@ impl App {
         }
     }
 
-    /// Save current config to disk
+    /// Save current config to disk. A file that could not be loaded is kept
+    /// as `config.toml.bak` first: it holds the user's settings and key
+    /// mappings, which the defaults in effect would otherwise replace.
     pub fn save_config(&mut self) {
-        match self.config.save() {
+        let path = match self.config_path.clone().map_or_else(config_path, Ok) {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_status(format!("Save failed: {}", e));
+                return;
+            }
+        };
+        if self.config_unreadable {
+            match self.config.save_to_backing_up(&path) {
+                Ok(backup) => {
+                    self.config_unreadable = false;
+                    self.set_status(format!(
+                        "Config saved; the file that could not be read is kept as {}",
+                        backup.display()
+                    ));
+                }
+                Err(e) => {
+                    self.set_status(format!("Not saved (could not keep the old file): {}", e))
+                }
+            }
+            return;
+        }
+        match self.config.save_to(&path) {
             Ok(()) => self.set_status("Config saved".to_string()),
             Err(e) => self.set_status(format!("Save failed: {}", e)),
         }
@@ -1706,6 +1777,50 @@ mod tests {
         // 'f' in the OEM/FN view cycles the same way
         app.cycle_fn_mode();
         assert_eq!(app.config.oem_keys.fn_mode, app.oem_test.fn_mode());
+    }
+
+    #[test]
+    fn unreadable_config_is_announced_and_kept_on_save() {
+        // A hand-edited file with a lowercase theme does not parse: the app
+        // runs on defaults. Saving after fixing the theme in Settings must
+        // not silently replace the user's key mappings.
+        let dir = std::env::temp_dir().join(format!("kt-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "[ui]\ntheme = \"light\"\n[oem_keys]\nkey_mappings = [[148, 125]]\n";
+        std::fs::write(&path, original).unwrap();
+        let load = Config::load_reporting_from(&path);
+        let mut app = App::new(load.config.clone());
+        app.set_config_load(&load);
+        assert!(app.get_status().unwrap().contains("not used"));
+        assert_eq!(app.config_notes().len(), 1);
+        let dash = app.current_results();
+        let row = dash
+            .iter()
+            .find(|r| r.label == "Config")
+            .expect("config row");
+        assert_eq!(row.status, crate::tests::ResultStatus::Warning);
+
+        app.toggle_theme();
+        app.save_config();
+        assert!(
+            app.get_status().unwrap().contains(".bak"),
+            "{:?}",
+            app.get_status()
+        );
+        let backup = dir.join("config.toml.bak");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        assert_eq!(Config::load_from(&path).unwrap().ui.theme, Theme::Light);
+        // The next save is an ordinary one (the backup is not overwritten)
+        app.save_config();
+        assert_eq!(app.get_status(), Some("Config saved"));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A healthy file: no notes, no Config rows
+        let app = App::default();
+        assert!(app.config_notes().is_empty());
+        assert!(!app.current_results().iter().any(|r| r.label == "Config"));
     }
 
     #[test]

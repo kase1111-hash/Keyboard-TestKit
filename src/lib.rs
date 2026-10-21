@@ -49,5 +49,5 @@ pub mod tests;
 pub mod ui;
 pub mod utils;
 
-pub use config::{config_path, Config, ConfigError};
+pub use config::{config_path, Config, ConfigError, ConfigLoad};
 pub use report::SessionReport;
