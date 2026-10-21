@@ -54,13 +54,14 @@ pub fn is_switch_chatter(previous_hold: Option<Duration>, repress_hold: Option<D
     previous_hold.is_some_and(short) || repress_hold.is_some_and(short)
 }
 
-/// Whether `bounces` on one key are a switch fault rather than something to
-/// check again. Once is worth a look but not yet a pattern. Over a wireless
-/// link nothing is conclusive: a radio stall that ends by delivering a whole
-/// keystroke (release, press, release) at once has the shape of a release
-/// bounce, and a flaky link stalls again and again.
-pub fn bounces_are_fault(bounces: u32, over_wireless: bool) -> bool {
-    bounces >= 2 && !over_wireless
+/// Whether `bounces` on one key, `over_wireless` of them counted from events
+/// that came from a wireless keyboard, are a switch fault rather than
+/// something to check again. Once is worth a look but not yet a pattern.
+/// Over a wireless link nothing is conclusive: a radio stall that ends by
+/// delivering a whole keystroke (release, press, release) at once has the
+/// shape of a release bounce, and a flaky link stalls again and again.
+pub fn bounces_are_fault(bounces: u32, over_wireless: u32) -> bool {
+    bounces.saturating_sub(over_wireless) >= 2
 }
 
 /// A key whose keystrokes are all shorter than this is released by the
@@ -121,8 +122,16 @@ struct KeyHoldStats {
     /// The current press is a suspect re-press after a finger-length
     /// keystroke: chatter only if its own hold turns out short
     suspect: bool,
-    /// Events of this key came from a wireless keyboard since the last reset
-    over_wireless: bool,
+    /// Bounces counted from events that came from a wireless keyboard
+    wireless_bounces: u32,
+}
+
+impl KeyHoldStats {
+    /// Whether the key bounced, but only in events that came from a wireless
+    /// keyboard, which a radio stall can explain.
+    fn bounced_only_over_wireless(&self) -> bool {
+        self.bounce_count > 0 && self.wireless_bounces == self.bounce_count
+    }
 }
 
 /// Test for hold down, release, and bounce detection
@@ -149,6 +158,9 @@ pub struct HoldReleaseTest {
     /// are pressed, not autorepeat: evdev and the terminal listener drop
     /// autorepeat, so holding a key adds nothing here.
     press_intervals: VecDeque<u64>,
+    /// Keys whose events, until the next
+    /// [`HoldReleaseTest::note_wireless_keys`], come from a wireless keyboard
+    wireless_keys: Vec<KeyCode>,
 }
 
 impl HoldReleaseTest {
@@ -169,6 +181,7 @@ impl HoldReleaseTest {
             start_time: None,
             last_event_time: None,
             press_intervals: VecDeque::new(),
+            wireless_keys: Vec::new(),
         }
     }
 
@@ -249,20 +262,20 @@ impl HoldReleaseTest {
             .collect()
     }
 
-    /// Record that events of `keys` came from a wireless keyboard (Bluetooth
-    /// or a 2.4 GHz receiver), whose radio can deliver reports late and
-    /// together. Kept until the next reset, so a retest on the cable starts
-    /// clean.
+    /// Say which keys' events, from now until the next call, come from a
+    /// wireless keyboard (Bluetooth or a 2.4 GHz receiver), whose radio can
+    /// deliver reports late and together. Called before each batch of
+    /// events, so a bounce is put down to the link it came over: the same
+    /// key typed on a cable or a laptop's own keyboard is still judged.
     pub fn note_wireless_keys(&mut self, keys: &[KeyCode]) {
-        for key in keys {
-            self.key_stats.entry(*key).or_default().over_wireless = true;
-        }
+        self.wireless_keys.clear();
+        self.wireless_keys.extend_from_slice(keys);
     }
 
-    /// Whether events of `key` came from a wireless keyboard since the last
-    /// reset (see [`HoldReleaseTest::note_wireless_keys`]).
-    pub fn key_over_wireless(&self, key: KeyCode) -> bool {
-        self.key_stats.get(&key).is_some_and(|s| s.over_wireless)
+    /// How many of `key`'s bounces were counted from events that came from a
+    /// wireless keyboard (see [`HoldReleaseTest::note_wireless_keys`]).
+    pub fn wireless_bounces(&self, key: KeyCode) -> u32 {
+        self.key_stats.get(&key).map_or(0, |s| s.wireless_bounces)
     }
 
     /// Get currently held keys with durations
@@ -297,6 +310,7 @@ impl KeyboardTest for HoldReleaseTest {
 
         let bounce_window = self.bounce_window;
         let check_bounce = self.precise_timestamps;
+        let over_wireless = self.wireless_keys.contains(&event.key);
         let stats = self.key_stats.entry(event.key).or_default();
 
         match event.event_type {
@@ -317,6 +331,7 @@ impl KeyboardTest for HoldReleaseTest {
                 {
                     if is_switch_chatter(stats.last_hold, None) {
                         stats.bounce_count += 1;
+                        stats.wireless_bounces += u32::from(over_wireless);
                         self.total_bounces += 1;
                     } else {
                         // After a finger's keystroke this may be a release
@@ -360,6 +375,7 @@ impl KeyboardTest for HoldReleaseTest {
                     }
                     if std::mem::take(&mut stats.suspect) && is_switch_chatter(None, Some(hold)) {
                         stats.bounce_count += 1;
+                        stats.wireless_bounces += u32::from(over_wireless);
                         self.total_bounces += 1;
                     }
                     stats.last_hold = Some(hold);
@@ -425,7 +441,7 @@ impl KeyboardTest for HoldReleaseTest {
             } else if self
                 .key_stats
                 .values()
-                .all(|s| s.bounce_count == 0 || s.over_wireless)
+                .all(|s| s.bounce_count == 0 || s.bounced_only_over_wireless())
             {
                 // A radio stall can look the same: not a verdict on the switch
                 results.push(TestResult::warning(
@@ -482,7 +498,11 @@ impl KeyboardTest for HoldReleaseTest {
             for (key, count) in bouncy.iter().take(5) {
                 let key_info = keymap::get_key_info(*key);
                 let label = format!("  {}", key_info.name);
-                results.push(if self.key_over_wireless(*key) {
+                let over_wireless = self
+                    .key_stats
+                    .get(key)
+                    .is_some_and(KeyHoldStats::bounced_only_over_wireless);
+                results.push(if over_wireless {
                     TestResult::warning(label, format!("{} bounces (wireless)", count))
                 } else {
                     TestResult::error(label, format!("{} bounces", count))
@@ -514,6 +534,7 @@ impl KeyboardTest for HoldReleaseTest {
         self.start_time = None;
         self.last_event_time = None;
         self.press_intervals.clear();
+        self.wireless_keys.clear();
     }
 }
 
@@ -726,6 +747,7 @@ mod tests {
         // back by the radio and arrived 0.2 ms before the next press. Both
         // keystrokes are a finger's (60+ ms down), so nothing chattered.
         let mut test = HoldReleaseTest::default();
+        test.note_wireless_keys(&[KEY]);
         let t0 = Instant::now();
         let us = Duration::from_micros;
         test.process_event(&press_at(KEY, t0, 0));
@@ -736,15 +758,13 @@ mod tests {
 
         // The same over a 125 Hz 2.4 GHz receiver, which hands over one
         // queued report per poll: release and press 8 ms apart
-        feed(
-            &mut test,
-            KEY,
-            t0 + ms(1000),
-            &[(0, true), (112, false), (120, true), (184, false)],
-        );
+        let receiver_tap = [(0, true), (112, false), (120, true), (184, false)];
+        feed(&mut test, KEY, t0 + ms(1000), &receiver_tap);
         assert_eq!(test.total_bounces(), 0, "{:?}", test.bouncy_keys());
-        // Whatever the link: the same timeline on any keyboard is not judged
-        test.note_wireless_keys(&[KEY]);
+        // Whatever the link: on a receiver taken for a cable it is not
+        // judged either
+        test.note_wireless_keys(&[]);
+        feed(&mut test, KEY, t0 + ms(2000), &receiver_tap);
         assert_eq!(
             row(&test.get_results(), "Bounces Detected").status,
             ResultStatus::Ok
@@ -791,8 +811,8 @@ mod tests {
             test.process_event(&release_at(KEY, s + ms(150) + us(160)));
         }
         assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
-        assert!(test.key_over_wireless(KEY));
-        assert!(!bounces_are_fault(3, true));
+        assert_eq!(test.wireless_bounces(KEY), 3);
+        assert!(!bounces_are_fault(3, 3));
         let results = test.get_results();
         let bounces = row(&results, "Bounces Detected");
         assert_eq!(bounces.status, ResultStatus::Warning);
@@ -812,7 +832,7 @@ mod tests {
             t0 + ms(5300),
             &[(0, true), (2, false), (5, true), (84, false)],
         );
-        assert!(!test.key_over_wireless(KeyCode(30)));
+        assert_eq!(test.wireless_bounces(KeyCode(30)), 0);
         assert_eq!(
             row(&test.get_results(), "Bounces Detected").status,
             ResultStatus::Error
@@ -820,7 +840,56 @@ mod tests {
 
         // Reset (a retest on the cable) forgets the link
         test.reset();
-        assert!(!test.key_over_wireless(KEY));
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(6000),
+            &[(0, true), (80, false), (82, true), (84, false)],
+        );
+        assert_eq!(test.wireless_bounces(KEY), 0);
+        assert_eq!(
+            row(&test.get_results(), "Bounces Detected").status,
+            ResultStatus::Error
+        );
+    }
+
+    #[test]
+    fn bounces_are_put_down_to_the_link_they_came_over() {
+        // A laptop with a Bluetooth keyboard: E typed on the Bluetooth one
+        // through a radio stall, then on the laptop's own keyboard, whose
+        // switch chatters twice. The radio does not excuse the laptop's key.
+        let mut test = HoldReleaseTest::default();
+        let t0 = Instant::now();
+        let us = Duration::from_micros;
+        test.note_wireless_keys(&[KEY]);
+        test.process_event(&press_at(KEY, t0, 0));
+        test.process_event(&release_at(KEY, t0 + ms(150)));
+        test.process_event(&press_at(KEY, t0 + ms(150) + us(80), 0));
+        test.process_event(&release_at(KEY, t0 + ms(150) + us(160)));
+        assert_eq!(test.wireless_bounces(KEY), 1);
+        let results = test.get_results();
+        assert_eq!(
+            row(&results, "Bounces Detected").status,
+            ResultStatus::Warning
+        );
+
+        // Later polls bring events of the laptop keyboard only
+        test.note_wireless_keys(&[]);
+        let chatter = [(0, true), (80, false), (82, true), (85, false)];
+        feed(&mut test, KEY, t0 + ms(1000), &chatter);
+        assert!(!bounces_are_fault(2, test.wireless_bounces(KEY)));
+        feed(&mut test, KEY, t0 + ms(2000), &chatter);
+        assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
+        assert_eq!(test.wireless_bounces(KEY), 1);
+        assert!(bounces_are_fault(3, 1));
+        let results = test.get_results();
+        assert_eq!(
+            row(&results, "Bounces Detected").status,
+            ResultStatus::Error
+        );
+        let key_row = row(&results, &format!("  {}", keymap::get_key_info(KEY).name));
+        assert_eq!(key_row.status, ResultStatus::Error);
+        assert!(!key_row.value.contains("wireless"), "{:?}", key_row);
     }
 
     #[test]
@@ -837,9 +906,12 @@ mod tests {
         assert!(!is_switch_chatter(finger, None));
         assert!(!is_switch_chatter(None, None));
 
-        assert!(!bounces_are_fault(1, false));
-        assert!(bounces_are_fault(2, false));
-        assert!(!bounces_are_fault(2, true));
+        assert!(!bounces_are_fault(1, 0));
+        assert!(bounces_are_fault(2, 0));
+        // only the bounces that came over a cable count towards a fault
+        assert!(!bounces_are_fault(2, 1));
+        assert!(!bounces_are_fault(5, 5));
+        assert!(bounces_are_fault(5, 3));
     }
 
     #[test]
