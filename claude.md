@@ -175,7 +175,11 @@ so the app can show them; saving over a file that did not load keeps it as
   q quit, S settings, t theme, m number keys, ? help
 - While the auto test runs every key is test input except Ctrl+N (skip a
   step) and Ctrl+C (abort); after it ends plain keys stay test input until
-  the keyboard has been quiet for 2 s (`App::auto_test_just_ended`)
+  the user presses Enter after 2 s without typing (`App::auto_result_pending`,
+  `App::auto_test_just_ended`)
+- A reset (Ctrl+R, r, R) does not count its own keystroke: its keys are not
+  carried over as held keys nor fed to the cleared tests
+  (`App::reset_current_on_chord`)
 - A held key fires its command once, even where autorepeat arrives as
   presses (`HeldKeyFilter`); only view and Settings navigation repeats
 - Key handling is decided by `command_for_key` in main.rs (unit-tested)

@@ -131,9 +131,11 @@ foot, Ghostty, Alacritty 0.13+, and WezTerm with `enable_kitty_keyboard =
 true` in its config; it is off by default) still report key releases, other
 terminals only report presses: a key reported again within 200 ms is counted
 as a new press (unless it comes faster than a finger can press, which is
-autorepeat), a held key is recognised by its autorepeat, and releases are
-estimated, so hold times, stuck keys and rollover cannot be measured: those
-views show "n/a (terminal input)" instead of a number.
+autorepeat), a held key is recognised by its autorepeat (so taps resuming
+faster than ~8 per second after a short pause can be taken for it: tap counts
+are marked approximate), and releases are estimated, so hold times, stuck
+keys and rollover cannot be measured: those views show "n/a (terminal
+input)" instead of a number.
 
 ### Automatic Diagnostic
 
@@ -159,11 +161,13 @@ reported as stuck, not dead.
 While the auto test runs every key is treated as test input, so `q`, `r`,
 `Esc` and the other shortcuts can be verified like any other key. `Ctrl+N`
 skips the current step and `Ctrl+C` aborts the run. When the run ends (the
-rapid-tap step stops on a timer, a disconnect stops a sweep) the keys you are
-still pressing stay test input until you have stopped typing for 2 s, so a
-last tap of `r` or `q` does not wipe the run or quit. The findings also appear
-on the Dashboard (updated live, even without running the guided test), in the
-exported report and on stdout when you quit.
+rapid-tap step stops on a timer, a disconnect stops a sweep you may go on
+with after a pause) keys stay test input, so a last tap of `r` or `q` does
+not wipe the run or quit: stop typing for 2 s and press `Enter` to get the
+single-key commands back (the Auto view says so; `Ctrl` chords work
+throughout). The findings also appear on the Dashboard (updated live, even
+without running the guided test), in the exported report and on stdout when
+you quit.
 
 ### Keyboard Controls
 
@@ -186,6 +190,7 @@ between views or Settings values may repeat).
 | `a` / `f` / `c` | OEM/FN view | Add last unknown key as FN scancode / cycle FN key mode / clear OEM key mappings |
 | `A` | Dashboard, Auto, Help | Run the automatic diagnostic |
 | `Ctrl+N` | Auto test running | Skip the current auto-test step |
+| `Enter` | Auto, after a run | Back to single-key commands (after 2 s without typing) |
 | `1-9`, `0` | Dashboard, Auto, Help | Jump to specific view |
 | `m` | Dashboard, Auto, Help | Toggle menu shortcuts (free number keys for testing) |
 | `Space` | Dashboard, Auto, Help | Pause/resume testing |
@@ -249,7 +254,8 @@ view, not as faults (if you did not hold one that long, the key is
 sticking). While paused (`Space` or `Ctrl+P`) nothing new is recorded, but
 keys that were already down still register their release. Resetting (`r`,
 `R`, `Ctrl+R`) forgets keystrokes, not keys that are still down: a jammed
-key stays listed as stuck.
+key stays listed as stuck. The reset keystroke itself (Ctrl and R) is not
+counted by the tests it clears.
 
 ## Diagnostic Logic
 
