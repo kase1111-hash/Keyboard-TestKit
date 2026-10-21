@@ -67,9 +67,11 @@ pub const HELD_KEY_MS: u64 = 500;
 /// [`is_switch_chatter`]) is still the contact opening for a moment rather
 /// than a release a radio delivered late: on a keyboard whose bus carries no
 /// radio (`radio_free`: a laptop's own keyboard on i8042, I2C or SPI, a PS/2
-/// one), or after a key held [`HELD_KEY_MS`] or more (`previous_hold`).
-pub fn is_contact_dropout(previous_hold: Option<Duration>, radio_free: bool) -> bool {
-    radio_free || previous_hold.is_some_and(|hold| hold >= Duration::from_millis(HELD_KEY_MS))
+/// one), or after a key held [`HELD_KEY_MS`] or more (`held_for`: since the
+/// finger pressed it, through any dropout already counted, as no finger let
+/// go in between).
+pub fn is_contact_dropout(held_for: Option<Duration>, radio_free: bool) -> bool {
+    radio_free || held_for.is_some_and(|hold| hold >= Duration::from_millis(HELD_KEY_MS))
 }
 
 /// Whether `bounces` on one key, `over_wireless` of them counted from events
@@ -134,6 +136,12 @@ struct KeyHoldStats {
     last_release: Option<Instant>,
     /// How long the previous keystroke of this key was held
     last_hold: Option<Duration>,
+    /// When the finger pressed the key for the current hold: a re-press
+    /// counted as a bounce at once continues the hold before it
+    hold_started: Option<Instant>,
+    /// How long the key had been held, from `hold_started`, when it last
+    /// came up (see [`is_contact_dropout`])
+    last_held_for: Option<Duration>,
     /// Whether the key reports its own releases (a keystroke lasted at least
     /// [`MIN_REPORTED_HOLD`]); keys the driver auto-releases are not judged
     reports_releases: bool,
@@ -372,6 +380,7 @@ impl KeyboardTest for HoldReleaseTest {
                 // times, so this is only judged with device timestamps, and
                 // only for keys whose releases come from the key itself.
                 stats.suspect = false;
+                let mut continues_hold = false;
                 if check_bounce
                     && stats.reports_releases
                     && is_chatter_press(
@@ -382,16 +391,20 @@ impl KeyboardTest for HoldReleaseTest {
                     )
                 {
                     if is_switch_chatter(stats.last_hold, None)
-                        || is_contact_dropout(stats.last_hold, radio_free)
+                        || is_contact_dropout(stats.last_held_for, radio_free)
                     {
                         stats.bounce_count += 1;
                         stats.wireless_bounces += u32::from(over_wireless);
                         self.total_bounces += 1;
+                        continues_hold = true;
                     } else {
                         // After a finger's keystroke this may be a release
                         // the radio delivered late: its own hold decides
                         stats.suspect = true;
                     }
+                }
+                if !continues_hold || stats.hold_started.is_none() {
+                    stats.hold_started = Some(event.timestamp);
                 }
                 stats.last_press = Some(event.timestamp);
                 stats.is_pressed = true;
@@ -433,6 +446,9 @@ impl KeyboardTest for HoldReleaseTest {
                         self.total_bounces += 1;
                     }
                     stats.last_hold = Some(hold);
+                    stats.last_held_for = stats
+                        .hold_started
+                        .map(|from| event.timestamp.saturating_duration_since(from));
                     let hold_ms = hold.as_secs_f64() * 1000.0;
                     stats.total_hold_ms += hold_ms;
 
@@ -890,6 +906,34 @@ mod tests {
         feed(&mut test, KEY, t0 + ms(3000), &dropout);
         assert_eq!(test.bouncy_keys(), vec![(KEY, 2)]);
         assert_eq!(test.wireless_bounces(KEY), 1);
+
+        // A contact that keeps dropping out under the held key: each time
+        // counts, the hold going on from the finger's press
+        let mut test = HoldReleaseTest::default();
+        feed(
+            &mut test,
+            KEY,
+            t0,
+            &[
+                (0, true),
+                (1200, false),
+                (1203, true),
+                (1250, false),
+                (1254, true),
+                (1300, false),
+                (1302, true),
+                (2000, false),
+            ],
+        );
+        assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
+        // and the next keystroke, a typed one, starts a hold of its own
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(3000),
+            &[(0, true), (80, false), (95, true), (170, false)],
+        );
+        assert_eq!(test.bouncy_keys(), vec![(KEY, 3)]);
 
         // Released after a long hold and pressed again by a finger 40 ms
         // later: no bounce
