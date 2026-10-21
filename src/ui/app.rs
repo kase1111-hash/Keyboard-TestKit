@@ -977,6 +977,14 @@ impl App {
     /// Get dashboard summary results
     fn dashboard_results(&self) -> Vec<TestResult> {
         let mut results = Vec::new();
+        // Without releases the terminal listener tells taps from autorepeat
+        // by their timing alone (and estimates the releases), as the Bounce
+        // and Polling views say of their counts too
+        let approximate = if self.input_source.has_release_events() {
+            ""
+        } else {
+            " (approximate: no key releases)"
+        };
 
         results.push(TestResult::info(
             "Session Time",
@@ -985,7 +993,7 @@ impl App {
 
         results.push(TestResult::info(
             "Total Events",
-            format!("{}", self.total_events),
+            format!("{}{}", self.total_events, approximate),
         ));
 
         results.push(TestResult::info(
@@ -1007,7 +1015,7 @@ impl App {
         if let Some(rate) = self.keyboard_state.global_polling_rate_hz() {
             results.push(TestResult::info(
                 "Event Rate",
-                format!("{:.1} events/s", rate),
+                format!("{:.1} events/s{}", rate, approximate),
             ));
         }
         if let Some(hz) = self.polling_test.estimated_poll_rate_hz() {

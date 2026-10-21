@@ -340,9 +340,15 @@ impl KeyboardTest for RolloverTest {
             results.push(TestResult::info("Active Keys", key_names.join(" + ")));
         }
 
+        // Without releases the terminal listener tells taps from autorepeat
+        // by their timing alone and estimates the releases
         results.push(TestResult::info(
             "Total Events",
-            format!("{}", self.total_events),
+            if self.real_releases {
+                format!("{}", self.total_events)
+            } else {
+                format!("{} (approximate: no key releases)", self.total_events)
+            },
         ));
 
         results
@@ -671,6 +677,13 @@ mod tests {
         assert!(!results
             .iter()
             .any(|r| r.value.contains("5KRO") || r.value.contains("5 simultaneous")));
+        // Taps can be taken for autorepeat: the count says it is approximate
+        let total = results.iter().find(|r| r.label == "Total Events").unwrap();
+        assert_eq!(total.value, "5 (approximate: no key releases)");
+        test.set_input_source(InputSource::TerminalWithRelease);
+        let results = test.get_results();
+        let total = results.iter().find(|r| r.label == "Total Events").unwrap();
+        assert_eq!(total.value, "5");
     }
 
     #[test]
