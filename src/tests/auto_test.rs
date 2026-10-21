@@ -2020,7 +2020,7 @@ mod tests {
         // sweep. It is reported as stuck (and later as a long hold if it
         // frees up), not as a dead key with "replace the switch" advice.
         let mut parts = ctx_parts();
-        let jammed = Instant::now() - Duration::from_secs(150);
+        let jammed = Instant::now() - Duration::from_secs(5);
         parts
             .2
             .process_event(&evt(14, KeyEventType::Press, jammed, 0));

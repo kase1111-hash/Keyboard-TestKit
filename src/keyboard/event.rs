@@ -212,6 +212,16 @@ impl KeyboardListener {
         if key.0 == 0 {
             return;
         }
+        // An earlier keystroke of the same key (typed just before) ends
+        // here: emit what is still owed for it, a held-back tap and its
+        // release, so the tests do not keep it down for good.
+        let mut out = Vec::new();
+        if let Some(t) = self.keys.get_mut(&key) {
+            Self::settle_pending_as_tap(key, t, &mut out);
+            if t.down && !t.silent {
+                out.push((midpoint(t.pressed_at, now), key, KeyEventType::Release));
+            }
+        }
         self.keys.insert(
             key,
             KeyTrack {
@@ -219,6 +229,7 @@ impl KeyboardListener {
                 ..KeyTrack::pressed(now)
             },
         );
+        self.emit_all(out);
     }
 
     /// Feed a crossterm key repeat event. Keeps the key alive for auto-release
@@ -953,6 +964,24 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| e.event_type == KeyEventType::Release && e.timestamp < events[0].timestamp));
+    }
+
+    #[test]
+    fn keystroke_typed_just_before_the_command_key_is_completed() {
+        // "a" typed, then Shift+A 300 ms later starts the auto test: the
+        // first "a" still gets its release instead of staying down for good
+        let (mut l, rx) = listener();
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        assert!(l.press_at(CtKeyCode::Char('a'), t0));
+        l.swallow_press_at(CtKeyCode::Char('A'), ms(300));
+        l.poll_at(ms(3000));
+        let summary: Vec<(KeyEventType, Instant)> =
+            rx.try_iter().map(|e| (e.event_type, e.timestamp)).collect();
+        assert_eq!(
+            summary,
+            vec![(KeyEventType::Press, t0), (KeyEventType::Release, ms(150))]
+        );
     }
 
     #[test]
