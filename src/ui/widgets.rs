@@ -53,12 +53,8 @@ impl<'a> Widget for ResultsPanel<'a> {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut y = inner.y;
-        for result in self.results {
-            if y >= inner.y + inner.height {
-                break;
-            }
-
+        let rows = inner.y..inner.y + inner.height;
+        for (y, result) in rows.zip(self.results.iter()) {
             let is_header = result.label.starts_with("---") || result.label.starts_with("===");
 
             if is_header {
@@ -86,7 +82,6 @@ impl<'a> Widget for ResultsPanel<'a> {
                 ]);
                 buf.set_line(inner.x, y, &line, inner.width);
             }
-            y += 1;
         }
     }
 }
