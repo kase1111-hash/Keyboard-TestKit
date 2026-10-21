@@ -233,7 +233,9 @@ A key counts as stuck only while it is still down past the threshold. Keys
 you held that long and then released are listed as long holds in the Sticky
 view, not as faults (if you did not hold one that long, the key is
 sticking). While paused (`Space` or `Ctrl+P`) nothing new is recorded, but
-keys that were already down still register their release.
+keys that were already down still register their release. Resetting (`r`,
+`R`, `Ctrl+R`) forgets keystrokes, not keys that are still down: a jammed
+key stays listed as stuck.
 
 ## Diagnostic Logic
 

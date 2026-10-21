@@ -528,24 +528,27 @@ impl App {
         self.findings.iter().filter(|f| f.is_issue()).count()
     }
 
-    /// Start the automatic diagnostic and switch to its view.
-    pub fn start_auto_test(&mut self) {
-        // Keys down right now (a jammed key, the Shift used to type 'A'): a
-        // key that went down before the run sends no new press, so forgetting
-        // it would hide a stuck key from the idle step and the sweep would
-        // call it dead. Their presses are carried over, with the original
-        // times, to the trackers that judge held keys.
-        let held: Vec<KeyEvent> = self
-            .keyboard_state
+    /// Presses of the keys that are down right now, with their original
+    /// times. A key that is down sends no new press (evdev and the terminal
+    /// listener drop autorepeat), so a reset that forgot it would hide a
+    /// jammed key for good: the Sticky view would say "None detected" and a
+    /// later sweep would call the key dead. Resets carry these presses over
+    /// to the trackers of held keys.
+    fn held_key_presses(&self) -> Vec<KeyEvent> {
+        self.keyboard_state
             .pressed_keys()
             .iter()
             .filter_map(|&key| {
                 let pressed_at = self.keyboard_state.get_key_state(key)?.last_press?;
                 Some(KeyEvent::new(key, KeyEventType::Press, pressed_at, 0))
             })
-            .collect();
-        // Give the run a clean slate so old data does not pollute the findings
-        // (a keyboard replugged before the run is not a fault of the run)
+            .collect()
+    }
+
+    /// Clear the keyboard state and every test, keeping the keys that are
+    /// still down (see [`App::held_key_presses`]).
+    fn reset_tests_keeping_held_keys(&mut self) {
+        let held = self.held_key_presses();
         self.keyboard_state.reset();
         for test in self.all_tests_mut() {
             test.reset();
@@ -553,7 +556,17 @@ impl App {
         for press in &held {
             self.keyboard_state.process_event(press);
             self.stickiness_test.process_event(press);
+            self.rollover_test.process_event(press);
         }
+    }
+
+    /// Start the automatic diagnostic and switch to its view.
+    pub fn start_auto_test(&mut self) {
+        // Give the run a clean slate so old data does not pollute the findings
+        // (a keyboard replugged before the run is not a fault of the run).
+        // Keys down right now (a jammed key, the Shift used to type 'A') are
+        // kept: the idle step is there to catch a key stuck before the run.
+        self.reset_tests_keeping_held_keys();
         self.disconnects = DisconnectLog::default();
         self.total_events = 0;
         self.stickiness_test
@@ -660,12 +673,9 @@ impl App {
         self.state = AppState::Quitting;
     }
 
-    /// Reset all tests
+    /// Reset all tests. Keys that are still down stay down.
     pub fn reset_all(&mut self) {
-        self.keyboard_state.reset();
-        for test in self.all_tests_mut() {
-            test.reset();
-        }
+        self.reset_tests_keeping_held_keys();
         self.auto_test.reset();
         self.stickiness_test
             .set_threshold(self.config.stickiness.stuck_threshold_ms);
@@ -689,6 +699,16 @@ impl App {
         if let Some(idx) = Self::test_index_for_view(self.view) {
             let name = self.all_tests()[idx].name().to_string();
             self.all_tests_mut()[idx].reset();
+            // The Sticky and NKRO views track keys that are down: a jammed
+            // key reset away would read "None detected" while still down
+            let held = self.held_key_presses();
+            for press in &held {
+                match self.view {
+                    AppView::Stickiness => self.stickiness_test.process_event(press),
+                    AppView::Rollover => self.rollover_test.process_event(press),
+                    _ => {}
+                }
+            }
             self.set_status(format!("{} reset", name));
         }
     }
@@ -1161,11 +1181,14 @@ mod tests {
         let mut app = App::default();
         app.process_event(&press(30, 1000));
         app.process_event(&press(31, 1000));
-        assert_eq!(app.total_events, 2);
+        app.process_event(&release(30, 1000));
+        app.process_event(&release(31, 1000));
+        assert_eq!(app.total_events, 4);
 
         app.reset_all();
         assert_eq!(app.total_events, 0);
         assert_eq!(app.keyboard_state.current_rollover(), 0);
+        assert_eq!(app.keyboard_state.max_rollover(), 0);
     }
 
     #[test]
@@ -1616,6 +1639,58 @@ mod tests {
         let ended = app.auto_test.finished_at().unwrap();
         assert!(!app.auto_test_just_ended_at(ended + AFTER_RUN_GRACE));
         assert!(!App::default().auto_test_just_ended());
+    }
+
+    #[test]
+    fn resets_keep_a_jammed_key_down() {
+        // Backspace jammed 5 s ago; "potentially stuck" makes the user reset
+        // to re-check. The key sends no new press, so it must not vanish.
+        let jammed = || {
+            let mut app = App::default();
+            app.set_input_source(InputSource::Evdev);
+            app.process_event(&event_at(
+                14,
+                KeyEventType::Press,
+                ago(Duration::from_secs(5)),
+            ));
+            app.process_event(&press(30, 1000));
+            app.process_event(&release(30, 1000));
+            app.tick();
+            app
+        };
+        let stuck = |app: &App| -> Vec<KeyCode> {
+            app.stickiness_test
+                .stuck_keys()
+                .iter()
+                .map(|(k, _)| *k)
+                .collect()
+        };
+
+        let mut app = jammed();
+        app.reset_all();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+        assert_eq!(app.keyboard_state.pressed_keys(), &[KeyCode(14)]);
+        assert_eq!(app.rollover_test.current_count(), 1);
+        app.refresh_findings();
+        assert!(app.findings.iter().any(|f| f.category == "Stuck key"));
+        // ...and an auto test started after it still knows the key is down
+        app.start_auto_test();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+
+        // Ctrl+R in the Sticky view
+        let mut app = jammed();
+        app.view = AppView::Stickiness;
+        app.reset_current();
+        assert_eq!(stuck(&app), vec![KeyCode(14)]);
+        // Released keys are forgotten as before
+        assert_eq!(app.stickiness_test.held_keys().len(), 1);
+
+        // Ctrl+R in the NKRO view keeps the current count right
+        let mut app = jammed();
+        app.view = AppView::Rollover;
+        app.reset_current();
+        assert_eq!(app.rollover_test.current_count(), 1);
+        assert_eq!(app.rollover_test.max_rollover(), 1);
     }
 
     #[test]
