@@ -85,6 +85,26 @@ fn terminal_input_shows_not_measurable_instead_of_green() {
         assert!(!bounce.iter().any(|r| r.status != ResultStatus::Info));
         assert_eq!(app.hold_release_test.total_bounces(), 0);
 
+        // Without releases, fast taps after a pause can be taken for
+        // autorepeat: the press counts and rates say they are approximate
+        let approximate = source == InputSource::TerminalPressOnly;
+        for (results, label) in [
+            (&bounce, "Total Presses"),
+            (&bounce, "Press Rate (any keys)"),
+            (&polling, "Events Recorded"),
+            (&polling, "Burst Key Rate"),
+            (&polling, "Avg Key Rate"),
+        ] {
+            let r = row(results, label);
+            assert_eq!(
+                r.value.contains("approximate"),
+                approximate,
+                "{:?}: {:?}",
+                source,
+                r
+            );
+        }
+
         // Nothing unmeasurable in the dashboard or the export either
         let dash = view(&mut app, AppView::Dashboard);
         assert!(!dash.iter().any(|r| r.label == "Est. Poll Rate"));

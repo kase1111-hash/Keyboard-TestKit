@@ -453,6 +453,13 @@ impl KeyboardTest for HoldReleaseTest {
     }
 
     fn get_results(&self) -> Vec<TestResult> {
+        // Without releases the terminal listener tells taps from autorepeat
+        // by their timing alone, so fast taps after a pause can go uncounted
+        let approximate = if self.real_releases {
+            ""
+        } else {
+            " (approximate: no key releases)"
+        };
         let mut results = Vec::new();
 
         // Tooltip: Explain what this test measures
@@ -473,7 +480,7 @@ impl KeyboardTest for HoldReleaseTest {
 
         results.push(TestResult::info(
             "Total Presses",
-            format!("{}", self.total_presses),
+            format!("{}{}", self.total_presses, approximate),
         ));
 
         // Bounce detection results
@@ -554,7 +561,7 @@ impl KeyboardTest for HoldReleaseTest {
         if let Some(rate) = self.press_rate_hz() {
             results.push(TestResult::info(
                 "Press Rate (any keys)",
-                format!("{:.1} presses/sec", rate),
+                format!("{:.1} presses/sec{}", rate, approximate),
             ));
         }
 

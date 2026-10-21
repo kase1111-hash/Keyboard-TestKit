@@ -132,10 +132,10 @@ true` in its config; it is off by default) still report key releases, other
 terminals only report presses: a key reported again within 200 ms is counted
 as a new press (unless it comes faster than a finger can press, which is
 autorepeat), a held key is recognised by its autorepeat (so taps resuming
-faster than ~8 per second after a short pause can be taken for it: tap counts
-are marked approximate), and releases are estimated, so hold times, stuck
-keys and rollover cannot be measured: those views show "n/a (terminal
-input)" instead of a number.
+faster than ~8 per second after a short pause can be taken for it: press
+counts and rates are marked approximate), and releases are estimated, so hold
+times, stuck keys and rollover cannot be measured: those views show "n/a
+(terminal input)" instead of a number.
 
 ### Automatic Diagnostic
 
