@@ -16,13 +16,15 @@
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // Lightweight logging macros to replace log + env_logger crates.
-// info!/warn!/error! print to stderr; debug! is no-op in release builds.
+// info!/error! print to stderr, so they are only used outside the TUI (the
+// mapper, before the alternate screen is entered); inside it messages go to
+// the status line.
 macro_rules! info    { ($($arg:tt)*) => { eprintln!("[INFO]  {}", format_args!($($arg)*)) } }
-macro_rules! warn    { ($($arg:tt)*) => { eprintln!("[WARN]  {}", format_args!($($arg)*)) } }
+#[cfg_attr(not(target_os = "linux"), allow(unused_macros))]
 macro_rules! error   { ($($arg:tt)*) => { eprintln!("[ERROR] {}", format_args!($($arg)*)) } }
-macro_rules! debug   { ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!("[DEBUG] {}", format_args!($($arg)*)); } } }
 
 use crossterm::{
+    cursor,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode,
         KeyEvent as CtKeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -61,15 +63,23 @@ use keyboard_testkit::keyboard::{evdev_status, EvdevDeviceChange, EvdevListener}
 #[cfg(target_os = "linux")]
 use keyboard_testkit::mapper;
 
-/// Restore the terminal to its original state.
-///
-/// Called from the panic hook, signal handler cleanup, and normal exit.
+/// Restore the terminal to its original state after a panic.
 fn restore_terminal() {
-    if KEYBOARD_ENHANCED.load(Ordering::SeqCst) {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
+    let _ = leave_tui(
+        &mut std::io::stdout(),
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    );
     let _ = disable_raw_mode();
-    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+/// Leave the TUI screen: pop the keyboard flags (if `enhanced`) while still
+/// on the alternate screen, whose flag stack they were pushed on, then
+/// switch back to the shell's screen and show the cursor ratatui hid.
+fn leave_tui(out: &mut impl std::io::Write, enhanced: bool) -> std::io::Result<()> {
+    if enhanced {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
+    execute!(out, LeaveAlternateScreen, DisableMouseCapture, cursor::Show)
 }
 
 /// Whether kitty keyboard-protocol enhancement flags were pushed (must be popped on exit).
@@ -77,14 +87,16 @@ static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 /// Try to enable key-release reporting (kitty keyboard protocol).
 ///
+/// Call it on the alternate screen: terminals keep separate flag stacks for
+/// the main and alternate screens, so flags pushed before entering it would
+/// not apply to the TUI (presses only, no releases) and would be left
+/// active on the shell's screen after exit.
+///
 /// Returns true when the terminal supports it and the flags were pushed.
-fn enable_keyboard_enhancement() -> bool {
+fn enable_keyboard_enhancement(out: &mut impl std::io::Write) -> bool {
     match crossterm::terminal::supports_keyboard_enhancement() {
         Ok(true) => {
-            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
-            if execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok() {
+            if push_keyboard_flags(out).is_ok() {
                 KEYBOARD_ENHANCED.store(true, Ordering::SeqCst);
                 return true;
             }
@@ -92,6 +104,14 @@ fn enable_keyboard_enhancement() -> bool {
         }
         _ => false,
     }
+}
+
+/// Ask for press/repeat/release events for every key, modifiers included.
+fn push_keyboard_flags(out: &mut impl std::io::Write) -> std::io::Result<()> {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    execute!(out, PushKeyboardEnhancementFlags(flags))
 }
 
 /// Global flag for signal handler to indicate shutdown.
@@ -303,10 +323,6 @@ fn main() -> Result<()> {
 
     // Setup terminal
     enable_raw_mode()?;
-    // Ask for key-release events where the terminal supports them
-    // (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+). Windows consoles
-    // report releases natively.
-    let release_reporting = cfg!(windows) || enable_keyboard_enhancement();
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -318,22 +334,19 @@ fn main() -> Result<()> {
     install_signal_handler(running.clone());
 
     // Run the application; cleanup runs regardless of success or failure
-    let result = run_app(&mut terminal, running, release_reporting, auto_start);
+    let result = run_app(&mut terminal, running, auto_start);
 
     // Cleanup terminal — always runs, even after signal or error
-    if KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst) {
-        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    }
-    disable_raw_mode()?;
-    execute!(
+    let left = leave_tui(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+        KEYBOARD_ENHANCED.swap(false, Ordering::SeqCst),
+    );
+    disable_raw_mode()?;
+    left?;
 
     if let Ok(Some(summary)) = &result {
         println!("\nKeyboard TestKit session complete.");
+        println!("Input source: {}", summary.input_source);
         println!("Total events processed: {}", summary.total_events);
         println!("Session duration: {}", summary.elapsed);
         // Same findings as the Dashboard and the exported report (keyboard
@@ -353,6 +366,7 @@ fn main() -> Result<()> {
 
 /// What the TUI session reports on exit.
 struct SessionOutcome {
+    input_source: &'static str,
     total_events: u64,
     elapsed: String,
     findings: Vec<Finding>,
@@ -417,21 +431,10 @@ fn print_help() {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     running: Arc<AtomicBool>,
-    release_reporting: bool,
     auto_start: bool,
 ) -> Result<Option<SessionOutcome>> {
     // TODO: Support --config <path> CLI argument for custom config locations.
-    let config = Config::load().unwrap_or_else(|e| {
-        warn!("Failed to load config: {}. Using defaults.", e);
-        Config::default()
-    });
-    debug!(
-        "Config: polling={}s/{}ms, refresh={}Hz, theme={:?}",
-        config.polling.test_duration_secs,
-        config.polling.sample_window_ms,
-        config.ui.refresh_rate_hz,
-        config.ui.theme,
-    );
+    let config = Config::load().unwrap_or_default();
     let mut app = App::new(config.clone());
 
     // Create keyboard event channel
@@ -439,7 +442,6 @@ fn run_app(
 
     // Create keyboard listener (crossterm-based fallback for non-Linux)
     let mut listener = KeyboardListener::new(event_tx.clone());
-    listener.set_release_reporting(release_reporting);
 
     // On Linux, try to use evdev for better OEM key detection
     #[cfg(target_os = "linux")]
@@ -466,6 +468,15 @@ fn run_app(
     #[cfg(not(target_os = "linux"))]
     let use_evdev = false;
 
+    // When the terminal is the test input, ask it for key-release events
+    // where it supports them (kitty, foot, Ghostty, Alacritty 0.13+, WezTerm
+    // with enable_kitty_keyboard); Windows consoles report releases
+    // natively. Evdev already has real releases, so the terminal is left in
+    // its normal mode.
+    let release_reporting =
+        !use_evdev && (cfg!(windows) || enable_keyboard_enhancement(terminal.backend_mut()));
+    listener.set_release_reporting(release_reporting);
+
     let input_source = if use_evdev {
         InputSource::Evdev
     } else if release_reporting {
@@ -474,7 +485,6 @@ fn run_app(
         InputSource::TerminalPressOnly
     };
     app.set_input_source(input_source);
-    info!("Input source: {}", input_source.name());
 
     if auto_start {
         app.start_auto_test();
@@ -605,17 +615,13 @@ fn run_app(
             }
         }
 
-        // Execute pending virtual key sends
+        // Execute pending virtual key sends. (Nothing may be printed to
+        // stderr while the TUI is up: it would land at the hidden cursor,
+        // where ratatui never repaints it. Results go to the status line.)
         if app.virtual_test.has_pending_send() {
             match app.virtual_test.execute_virtual_send() {
-                Ok(()) => {
-                    debug!("Virtual keys sent (z, x, c)");
-                    app.set_status("Virtual keys sent (z, x, c)".to_string());
-                }
-                Err(e) => {
-                    error!("Virtual send failed: {}", e);
-                    app.set_status(format!("Virtual send failed: {}", e));
-                }
+                Ok(()) => app.set_status("Virtual keys sent (z, x, c)".to_string()),
+                Err(e) => app.set_status(format!("Virtual send failed: {}", e)),
             }
         }
 
@@ -626,12 +632,8 @@ fn run_app(
     }
 
     app.refresh_findings();
-    info!(
-        "Session ended: {} events in {}",
-        app.total_events,
-        app.elapsed_formatted()
-    );
     Ok(Some(SessionOutcome {
+        input_source: app.input_source.name(),
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),
         findings: app.findings.clone(),
@@ -940,12 +942,10 @@ fn apply_command(app: &mut App, command: Command) {
                     .as_secs();
                 format!("keyboard_report_{}.json", secs)
             };
-            match app.export_report(&filename) {
-                Ok(_) => info!("Report exported to {}", filename),
-                Err(e) => {
-                    error!("Export failed: {}", e);
-                    app.set_status(format!("Export failed: {}", e));
-                }
+            // The outcome goes to the status line (export_report sets it on
+            // success), never to stderr while the TUI is drawn
+            if let Err(e) = app.export_report(&filename) {
+                app.set_status(format!("Export failed: {}", e));
             }
         }
         Command::ToggleShortcuts => app.toggle_shortcuts(),
@@ -1301,6 +1301,46 @@ mod tests {
         ];
         let findings = idle_findings_after(InputSource::TerminalPressOnly, &keys);
         assert!(findings.iter().any(|f| f.category == "Phantom input"));
+    }
+
+    /// Escape sequences crossterm writes for the terminal modes involved.
+    #[cfg(unix)]
+    mod seq {
+        pub const ALT_SCREEN_ON: &str = "\x1b[?1049h";
+        pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
+        pub const FLAGS_PUSH: &str = "\x1b[>";
+        pub const FLAGS_POP: &str = "\x1b[<1u";
+        pub const CURSOR_SHOW: &str = "\x1b[?25h";
+    }
+
+    // (Unix only: on Windows crossterm drives the console through its API
+    // rather than writing these sequences.)
+    #[cfg(unix)]
+    #[test]
+    fn keyboard_flags_live_on_the_alternate_screen_and_the_cursor_comes_back() {
+        // Terminals keep one flag stack per screen: the flags must be pushed
+        // after entering the alternate screen and popped before leaving it,
+        // or the TUI gets no releases and the shell keeps the flags.
+        let mut out = Vec::new();
+        execute!(out, EnterAlternateScreen).unwrap();
+        push_keyboard_flags(&mut out).unwrap();
+        leave_tui(&mut out, true).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let at = |s: &str| out.find(s).unwrap_or_else(|| panic!("{s:?} in {out:?}"));
+        assert!(at(seq::ALT_SCREEN_ON) < at(seq::FLAGS_PUSH));
+        assert!(at(seq::FLAGS_PUSH) < at(seq::FLAGS_POP));
+        assert!(at(seq::FLAGS_POP) < at(seq::ALT_SCREEN_OFF));
+        // ratatui hides the cursor on every frame; a panic must not leave
+        // the shell without one
+        assert!(at(seq::ALT_SCREEN_OFF) < at(seq::CURSOR_SHOW));
+
+        // Without pushed flags (evdev input, or a terminal without the
+        // protocol) nothing is popped from the shell's stack
+        let mut out = Vec::new();
+        leave_tui(&mut out, false).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains(seq::FLAGS_POP), "{out:?}");
+        assert!(out.contains(seq::CURSOR_SHOW), "{out:?}");
     }
 
     #[test]
