@@ -196,6 +196,16 @@ Default configuration values (in `src/config.rs`):
 | `hold_release.bounce_window_ms` | 5 | Window for bounce detection |
 | `ui.refresh_rate_hz` | 60 | UI refresh rate |
 
+Out-of-range values in a hand-edited `config.toml` are clamped when it is
+loaded (for example `ui.refresh_rate_hz` to 10-240 Hz and
+`stickiness.stuck_threshold_ms` to 250-60000 ms; see `src/config.rs` for all
+ranges), and missing entries fall back to their defaults.
+
+A key counts as stuck only while it is still down past the threshold. Keys
+you held that long and then released are listed as long holds in the Sticky
+view, not as faults. While paused (`Space`) nothing new is recorded, but keys
+that were already down still register their release.
+
 ## Diagnostic Logic
 
 The Virtual Keyboard test helps isolate issues:

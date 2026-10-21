@@ -130,8 +130,51 @@ fn platform_config_dir() -> Option<PathBuf> {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Allowed ranges. A hand-edited config.toml is clamped to these on load (see
+// `Config::sanitize`); the Settings view stays within them.
+// ----------------------------------------------------------------------------
+
+/// Shortest polling run. The Settings view steps in 5 s; a shorter run does
+/// not collect enough keystrokes for a rate estimate (0 ends before it starts).
+pub const POLLING_DURATION_SECS_MIN: u64 = 5;
+/// Longest polling run. Nobody types for an hour to measure a poll rate.
+pub const POLLING_DURATION_SECS_MAX: u64 = 3600;
+/// Polling sample window: at least one 125 Hz poll interval (8 ms, rounded
+/// up to 10 ms)...
+pub const SAMPLE_WINDOW_MS_MIN: u64 = 10;
+/// ...and at most 10 s (the default polling run); a longer window is in
+/// effect the whole-run average.
+pub const SAMPLE_WINDOW_MS_MAX: u64 = 10_000;
+/// Lowest stuck-key threshold. A keystroke lasts 50-150 ms, so anything
+/// shorter would flag ordinary typing; 250 ms is also the Settings view step.
+pub const STUCK_THRESHOLD_MS_MIN: u64 = 250;
+/// Highest stuck-key threshold. Past a minute the check would practically
+/// never fire during a test session.
+pub const STUCK_THRESHOLD_MS_MAX: u64 = 60_000;
+/// Bounce window: 0 would disable bounce detection entirely...
+pub const BOUNCE_WINDOW_MS_MIN: u64 = 1;
+/// ...and 100 ms is already about twice the release-to-press gap of a
+/// deliberate fast double tap (~50 ms); a wider window would count ordinary
+/// typing as bounce.
+pub const BOUNCE_WINDOW_MS_MAX: u64 = 100;
+/// UI refresh rate. Below 10 Hz the screen and the stuck-key check visibly
+/// lag (0 would divide by zero)...
+pub const REFRESH_RATE_HZ_MIN: u32 = 10;
+/// ...and displays (so terminal emulators) rarely refresh faster than 240 Hz,
+/// so a higher rate only burns CPU.
+pub const REFRESH_RATE_HZ_MAX: u32 = 240;
+/// Shortcut overlay duration: 0 would hide it immediately...
+pub const WARNING_DURATION_SECS_MIN: u32 = 1;
+/// ...and a huge value would leave it covering the results.
+pub const WARNING_DURATION_SECS_MAX: u32 = 30;
+
 /// Main application configuration
+///
+/// Missing sections or fields fall back to their defaults, so a partly
+/// hand-written config.toml still loads.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Config {
     /// Polling rate test settings
     pub polling: PollingConfig,
@@ -148,6 +191,7 @@ pub struct Config {
 
 /// Polling rate test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PollingConfig {
     /// Test duration in seconds
     pub test_duration_secs: u64,
@@ -166,6 +210,7 @@ impl Default for PollingConfig {
 
 /// Stickiness detection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StickinessConfig {
     /// Threshold in ms after which a key is considered stuck
     pub stuck_threshold_ms: u64,
@@ -184,10 +229,12 @@ impl Default for StickinessConfig {
 
 /// Hold and release test configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HoldReleaseConfig {
     /// Bounce detection window in ms
     pub bounce_window_ms: u64,
-    /// Minimum hold time to register as intentional
+    /// Minimum hold time to register as intentional.
+    /// Not used by any test yet; kept so existing config files still load.
     pub min_hold_ms: u64,
 }
 
@@ -202,6 +249,7 @@ impl Default for HoldReleaseConfig {
 
 /// UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// Refresh rate for UI updates (in Hz)
     pub refresh_rate_hz: u32,
@@ -230,8 +278,9 @@ pub enum Theme {
 
 /// OEM key and remapping configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OemKeyConfig {
-    /// Enable OEM key capture and remapping
+    /// Apply the custom `key_mappings` (FN handling is set by `fn_mode`)
     pub enabled: bool,
     /// FN key handling mode
     pub fn_mode: FnKeyMode,
@@ -244,9 +293,12 @@ pub struct OemKeyConfig {
     /// Custom FN+key combinations: (key_scancode, result_scancode)
     #[serde(default)]
     pub fn_combos: Vec<(u16, u16)>,
-    /// Capture unknown/unmapped keys for analysis
+    /// Capture unknown/unmapped keys for analysis.
+    /// Not used yet (unknown keys are always captured); kept so existing
+    /// config files still load.
     pub capture_unknown: bool,
-    /// Show OEM key notifications
+    /// Show OEM key notifications.
+    /// Not used yet; kept so existing config files still load.
     pub show_notifications: bool,
 }
 
@@ -323,18 +375,70 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let contents = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&contents)?;
-        Ok(config)
+        Self::load_from(&path)
     }
 
     /// Load configuration from a specific path.
     ///
-    /// Useful for testing or using custom config locations.
+    /// Useful for testing or using custom config locations. Out-of-range
+    /// values are clamped (see `sanitize`).
     pub fn load_from(path: &PathBuf) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
+        config.sanitize();
         Ok(config)
+    }
+
+    /// Clamp every value to the range the app can work with, so a
+    /// hand-edited config.toml cannot crash the app (refresh rate 0) or
+    /// silently break a test (stuck threshold 0 flags every keystroke).
+    ///
+    /// Returns a description of each value that was changed.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let mut changes = Vec::new();
+        clamp_field(
+            &mut changes,
+            "polling.test_duration_secs",
+            &mut self.polling.test_duration_secs,
+            POLLING_DURATION_SECS_MIN,
+            POLLING_DURATION_SECS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "polling.sample_window_ms",
+            &mut self.polling.sample_window_ms,
+            SAMPLE_WINDOW_MS_MIN,
+            SAMPLE_WINDOW_MS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "stickiness.stuck_threshold_ms",
+            &mut self.stickiness.stuck_threshold_ms,
+            STUCK_THRESHOLD_MS_MIN,
+            STUCK_THRESHOLD_MS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "hold_release.bounce_window_ms",
+            &mut self.hold_release.bounce_window_ms,
+            BOUNCE_WINDOW_MS_MIN,
+            BOUNCE_WINDOW_MS_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "ui.refresh_rate_hz",
+            &mut self.ui.refresh_rate_hz,
+            REFRESH_RATE_HZ_MIN,
+            REFRESH_RATE_HZ_MAX,
+        );
+        clamp_field(
+            &mut changes,
+            "ui.warning_duration_secs",
+            &mut self.ui.warning_duration_secs,
+            WARNING_DURATION_SECS_MIN,
+            WARNING_DURATION_SECS_MAX,
+        );
+        changes
     }
 
     /// Save configuration to the default config file.
@@ -366,7 +470,26 @@ impl Config {
 
     /// Get UI refresh interval as Duration
     pub fn refresh_interval(&self) -> Duration {
-        Duration::from_micros(1_000_000 / self.ui.refresh_rate_hz as u64)
+        let hz = self
+            .ui
+            .refresh_rate_hz
+            .clamp(REFRESH_RATE_HZ_MIN, REFRESH_RATE_HZ_MAX);
+        Duration::from_micros(1_000_000 / hz as u64)
+    }
+}
+
+/// Clamp `value` to `min..=max`, noting the change in `changes`.
+fn clamp_field<T>(changes: &mut Vec<String>, name: &str, value: &mut T, min: T, max: T)
+where
+    T: Copy + Ord + std::fmt::Display,
+{
+    let clamped = (*value).clamp(min, max);
+    if clamped != *value {
+        changes.push(format!(
+            "{} = {} is outside {}..={}, using {}",
+            name, value, min, max, clamped
+        ));
+        *value = clamped;
     }
 }
 
@@ -546,5 +669,129 @@ theme = "Light"
     fn config_error_is_std_error() {
         let err: Box<dyn std::error::Error> = Box::new(ConfigError::NoConfigDir);
         assert!(!err.to_string().is_empty());
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "keyboard-testkit-test-{}-{}.toml",
+            name,
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn default_config_is_already_in_range() {
+        let mut config = Config::default();
+        assert!(config.sanitize().is_empty());
+    }
+
+    #[test]
+    fn sanitize_clamps_zero_and_absurd_values() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 0;
+        config.ui.warning_duration_secs = u32::MAX;
+        config.stickiness.stuck_threshold_ms = 0;
+        config.polling.test_duration_secs = 0;
+        config.polling.sample_window_ms = u64::MAX;
+        config.hold_release.bounce_window_ms = 0;
+
+        let changes = config.sanitize();
+        assert_eq!(changes.len(), 6, "{:?}", changes);
+        assert!(changes[0].contains("polling.test_duration_secs"));
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(config.ui.warning_duration_secs, WARNING_DURATION_SECS_MAX);
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+        assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
+        assert_eq!(config.polling.sample_window_ms, SAMPLE_WINDOW_MS_MAX);
+        assert_eq!(config.hold_release.bounce_window_ms, BOUNCE_WINDOW_MS_MIN);
+
+        config.ui.refresh_rate_hz = 100_000;
+        config.sanitize();
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MAX);
+    }
+
+    #[test]
+    fn sanitize_keeps_in_range_user_values() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 144;
+        config.stickiness.stuck_threshold_ms = 5000;
+        config.polling.test_duration_secs = 30;
+        assert!(config.sanitize().is_empty());
+        assert_eq!(config.ui.refresh_rate_hz, 144);
+        assert_eq!(config.stickiness.stuck_threshold_ms, 5000);
+        assert_eq!(config.polling.test_duration_secs, 30);
+    }
+
+    #[test]
+    fn refresh_interval_never_divides_by_zero() {
+        let mut config = Config::default();
+        config.ui.refresh_rate_hz = 0;
+        assert_eq!(
+            config.refresh_interval(),
+            Duration::from_micros(1_000_000 / REFRESH_RATE_HZ_MIN as u64)
+        );
+    }
+
+    #[test]
+    fn load_clamps_hand_edited_values() {
+        let path = temp_path("clamp");
+        fs::write(
+            &path,
+            r#"
+[polling]
+test_duration_secs = 0
+sample_window_ms = 100
+
+[stickiness]
+stuck_threshold_ms = 0
+
+[hold_release]
+bounce_window_ms = 5
+min_hold_ms = 10
+
+[ui]
+refresh_rate_hz = 0
+warning_duration_secs = 3
+theme = "Dark"
+"#,
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("config with out-of-range values must still load");
+        assert_eq!(config.ui.refresh_rate_hz, REFRESH_RATE_HZ_MIN);
+        assert_eq!(config.stickiness.stuck_threshold_ms, STUCK_THRESHOLD_MS_MIN);
+        assert_eq!(config.polling.test_duration_secs, POLLING_DURATION_SECS_MIN);
+        assert!(config.refresh_interval() > Duration::ZERO);
+    }
+
+    #[test]
+    fn load_partial_config_uses_defaults_for_missing_values() {
+        let path = temp_path("partial");
+        fs::write(&path, "[ui]\nrefresh_rate_hz = 120\n").unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("partial config must load");
+        assert_eq!(config.ui.refresh_rate_hz, 120);
+        assert_eq!(config.ui.theme, Theme::Dark);
+        assert_eq!(config.stickiness.stuck_threshold_ms, 2000);
+        assert!(config.oem_keys.enabled);
+    }
+
+    #[test]
+    fn load_existing_full_config_file_unchanged() {
+        // A file written by an earlier version (every field present)
+        let path = temp_path("full");
+        let mut original = Config::default();
+        original.oem_keys.add_mapping(100, 97);
+        original.oem_keys.capture_unknown = false;
+        original.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        let _ = fs::remove_file(&path);
+        let config = loaded.expect("existing config must load");
+        assert_eq!(
+            toml::to_string_pretty(&config).unwrap(),
+            toml::to_string_pretty(&original).unwrap()
+        );
     }
 }
