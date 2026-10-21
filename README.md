@@ -294,8 +294,9 @@ receivers, by the paired keyboard behind it) a radio stall that delivers a
 whole keystroke at once looks like a bounce, so its bounces stay a warning
 that says so: reset (`R`) and retest on the cable or next to the receiver; if
 the key still bounces there, or the keyboard already was on its cable, it is
-the switch. "Wireless" alone in a USB keyboard's name does not count, since
-tri-mode keyboards keep it on their cable.
+the switch. Logitech and Corsair keyboards keep "Wireless" in their USB name
+on the cable, so for them it does not count (their receivers say what they
+are); for other makers it does, since some receivers are named nothing else.
 
 Input during the idle check that looks like whole keystrokes (you pressed a
 key) is a warning worded as a condition; a key left down or firing again and

@@ -162,12 +162,24 @@ const BUS_SPI: u16 = 0x1C;
 /// Receiver", "2.4G Wireless Keyboard", "... Dongle".
 const RECEIVER_NAME_HINTS: [&str; 5] = ["receiver", "transceiver", "unifying", "2.4g", "dongle"];
 
-/// Words that say a keyboard can go wireless, not that it is: tri-mode
-/// keyboards keep them in their USB name on the cable ("Logitech G915 TKL
-/// LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard", "Corsair CORSAIR K63
-/// Wireless Mechanical Gaming Keyboard", "ASUSTeK ROG STRIX SCOPE II 96
-/// WIRELESS"), so they only count off USB.
+/// Words that say a keyboard can go wireless, not always that it is:
+/// tri-mode keyboards keep them in their USB name on the cable ("Logitech
+/// G915 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard", "Corsair
+/// CORSAIR K63 Wireless Mechanical Gaming Keyboard"), while plenty of 2.4 GHz
+/// receivers have nothing else in theirs ("YICHIP Wireless Device"). On USB
+/// they count except for [`VENDORS_NAMING_RECEIVERS`].
 const WIRELESS_NAME_HINTS: [&str; 2] = ["wireless", "lightspeed"];
+
+/// USB vendors whose keyboards keep "Wireless" in their name on the cable
+/// and whose receivers show what they are: Logitech's are named "USB
+/// Receiver" with the paired keyboard behind them, Corsair's "USB Receiver"
+/// or "Gaming Dongle". Their keyboards are wireless on USB only behind or as
+/// such a receiver. Another maker's receiver may be named only after its
+/// keyboard, and taking it for a cable would make radio stalls switch faults,
+/// so for other makers "Wireless" in the name still counts (a keyboard of
+/// theirs on its cable then gets the wireless caveat, which says that on the
+/// cable a bounce is the switch).
+const VENDORS_NAMING_RECEIVERS: [u16; 2] = [0x046d, 0x1b1c];
 
 /// The device's bus type (`BUS_*`) and vendor ID, read with `EVIOCGID`.
 fn read_bus_and_vendor(file: &File) -> Option<(u16, u16)> {
@@ -206,11 +218,11 @@ fn is_radio_free_bus(id: Option<(u16, u16)>) -> bool {
 ///
 /// Bluetooth keyboards have the Bluetooth bus type, also LE ones that
 /// bluetoothd feeds in through uhid. A 2.4 GHz receiver is a USB device: its
-/// name says it is one ("Receiver", "Dongle", "2.4G"), or (Logitech
-/// Unifying, Bolt and Lightspeed receivers) the paired keyboard is a HID
-/// device under the receiver's own. "Wireless" alone is not enough on USB
-/// (see [`WIRELESS_NAME_HINTS`]), so a receiver named only after its
-/// keyboard is taken for a cable, like one whose name gives nothing away.
+/// name says it is one ("Receiver", "Dongle", "2.4G", or "Wireless" from
+/// makers other than [`VENDORS_NAMING_RECEIVERS`]), or (Logitech Unifying,
+/// Bolt and Lightspeed receivers) the paired keyboard is a HID device under
+/// the receiver's own. A receiver whose name gives nothing away is taken for
+/// a cable.
 fn is_wireless_link(id: Option<(u16, u16)>, name: &str, sysfs_path: &Path) -> bool {
     let name = name.to_lowercase();
     let named = |hints: &[&str]| hints.iter().any(|hint| name.contains(hint));
@@ -224,8 +236,12 @@ fn is_wireless_link(id: Option<(u16, u16)>, name: &str, sysfs_path: &Path) -> bo
     match id {
         Some((BUS_BLUETOOTH, _)) => true,
         _ if is_radio_free_bus(id) => false,
-        Some((BUS_USB, _)) => paired_behind_receiver() || named(&RECEIVER_NAME_HINTS),
-        _ => named(&RECEIVER_NAME_HINTS) || named(&WIRELESS_NAME_HINTS),
+        _ if named(&RECEIVER_NAME_HINTS) => true,
+        Some((BUS_USB, vendor)) if VENDORS_NAMING_RECEIVERS.contains(&vendor) => {
+            paired_behind_receiver()
+        }
+        Some((BUS_USB, _)) => paired_behind_receiver() || named(&WIRELESS_NAME_HINTS),
+        _ => named(&WIRELESS_NAME_HINTS),
     }
 }
 
@@ -1211,33 +1227,49 @@ mod tests {
             "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-4/1-4:1.2/0003:046D:C545.0007/\
              0003:046D:408E.0008/input/input12/event7"
         ));
-        // Tri-mode keyboards of other makers keep "Wireless" in their name on
-        // the cable too; their receivers say what they are
-        for (vendor, name) in [
-            (
-                0x1b1c,
-                "Corsair CORSAIR K63 Wireless Mechanical Gaming Keyboard",
-            ),
-            (0x1038, "SteelSeries SteelSeries Apex Pro Mini Wireless"),
-            (0x0b05, "ASUSTeK ROG STRIX SCOPE II 96 WIRELESS"),
+        // Corsair keyboards keep "Wireless" in their name on the cable too;
+        // their receivers say what they are
+        assert!(!wireless(
+            Some((BUS_USB, 0x1b1c)),
+            "Corsair CORSAIR K63 Wireless Mechanical Gaming Keyboard",
+            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/\
+             0003:1B1C:1B45.0009/input/input14/event9"
+        ));
+        for name in [
+            "Corsair CORSAIR SLIPSTREAM WIRELESS USB Receiver",
+            "Corsair CORSAIR K57 RGB WIRELESS Gaming Dongle",
         ] {
             assert!(
-                !wireless(
-                    Some((BUS_USB, vendor)),
+                wireless(
+                    Some((BUS_USB, 0x1b1c)),
                     name,
                     "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/\
-                     0003:1B1C:1B45.0009/input/input14/event9"
+                     0003:1B1C:1BA6.000A/input/input15/event10"
                 ),
                 "{}",
                 name
             );
         }
-        assert!(wireless(
-            Some((BUS_USB, 0x1b1c)),
-            "Corsair CORSAIR SLIPSTREAM WIRELESS USB Receiver",
-            "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-5/1-5:1.0/\
-             0003:1B1C:1BA6.000A/input/input15/event10"
-        ));
+        // Other makers' receivers may carry nothing but "Wireless": taking
+        // one for a cable would turn its radio stalls into switch faults, so
+        // the word still counts for them (also for a keyboard of theirs on
+        // its cable, whose bounces then come with the wireless caveat)
+        for (vendor, name) in [
+            (0x3151, "YICHIP Wireless Device"),
+            (0x1038, "SteelSeries SteelSeries Apex Pro Mini Wireless"),
+            (0x0b05, "ASUSTeK ROG STRIX SCOPE II 96 WIRELESS"),
+        ] {
+            assert!(
+                wireless(
+                    Some((BUS_USB, vendor)),
+                    name,
+                    "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-6/1-6:1.0/\
+                     0003:3151:3020.000B/input/input16/event11"
+                ),
+                "{}",
+                name
+            );
+        }
         // Off USB nothing carries the name over a cable
         assert!(wireless(None, "Keychron K2 Wireless Keyboard", ""));
         // Cables: a USB keyboard and a laptop's own
