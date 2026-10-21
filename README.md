@@ -255,7 +255,9 @@ sticking). While paused (`Space` or `Ctrl+P`) nothing new is recorded, but
 keys that were already down still register their release. Resetting (`r`,
 `R`, `Ctrl+R`) forgets keystrokes, not keys that are still down: a jammed
 key stays listed as stuck. The reset keystroke itself (Ctrl and R) is not
-counted by the tests it clears.
+counted by the tests it clears, as long as R sits where it does on a US
+keyboard (QWERTY, QWERTZ, AZERTY): evdev reports keys by position, so on
+Colemak or Dvorak the key that types R is counted like any other key.
 
 ## Diagnostic Logic
 

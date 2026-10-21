@@ -181,7 +181,9 @@ so the app can show them; saving over a file that did not load keeps it as
   `App::auto_test_just_ended`)
 - A reset (Ctrl+R, r, R) does not count its own keystroke: its keys are not
   carried over as held keys nor fed to the cleared tests
-  (`App::reset_current_on_chord`)
+  (`App::reset_current_on_chord`). The keys are mapped from the terminal's
+  character by US position (`keystroke_keys`), so with evdev on Colemak or
+  Dvorak the key that typed R still counts
 - A held key fires its command once, even where autorepeat arrives as
   presses (`HeldKeyFilter`); only view and Settings navigation repeats
 - Key handling is decided by `command_for_key` in main.rs (unit-tested)
