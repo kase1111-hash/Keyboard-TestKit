@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated dependencies to latest major versions: ratatui 0.29 → 0.30, crossterm 0.28 → 0.29, toml 0.8 → 1.1, enigo 0.2 → 0.6
 - Refreshed Cargo.lock so all transitive dependencies are current
 - Declared minimum supported Rust version (1.88) in Cargo.toml and README
-- Renamed "Latency" view to "Timing" to accurately reflect that it measures inter-event polling intervals rather than true end-to-end input latency
+- Renamed "Latency" view to "Timing": it measures the time between key events, not end-to-end input latency
 
 ### Fixed
 - Auto test false alarms on healthy keyboards:
