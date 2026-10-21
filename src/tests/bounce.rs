@@ -30,6 +30,14 @@ pub const MAX_BOUNCE_WINDOW_MS: u64 = 40;
 /// fastest same-key tapping is ~10-15 Hz (65 ms or more per tap).
 pub const CHATTER_PRESS_GAP_MS: u64 = 40;
 
+/// A key whose keystrokes are all shorter than this is released by the
+/// kernel driver, not by the key: laptop keys with an atkbd "force release"
+/// quirk and WMI hotkeys get a release microseconds after every press, and
+/// repeat as press/release pairs ~33 ms apart while held. A real release
+/// needs another report (a PS/2 break code takes over 1 ms, a 1000 Hz USB
+/// poll 1 ms), so any normal keystroke of a key clears this.
+const MIN_REPORTED_HOLD: Duration = Duration::from_micros(500);
+
 /// Whether a press re-registers the same key too soon to be a new keystroke.
 ///
 /// `last_press` and `last_release` are the previous press and release of the
@@ -70,6 +78,9 @@ struct KeyHoldStats {
     last_press: Option<Instant>,
     /// Previous release of this key (for chatter detection)
     last_release: Option<Instant>,
+    /// Whether the key reports its own releases (a keystroke lasted at least
+    /// [`MIN_REPORTED_HOLD`]); keys the driver auto-releases are not judged
+    reports_releases: bool,
 }
 
 /// Test for hold down, release, and bounce detection
@@ -231,8 +242,10 @@ impl KeyboardTest for HoldReleaseTest {
             KeyEventType::Press => {
                 // A bounce is the switch registering the same key again too
                 // soon after its release/press. Terminal timestamps are read
-                // times, so this is only judged with device timestamps.
+                // times, so this is only judged with device timestamps, and
+                // only for keys whose releases come from the key itself.
                 if check_bounce
+                    && stats.reports_releases
                     && is_chatter_press(
                         event.timestamp,
                         stats.last_press,
@@ -273,7 +286,11 @@ impl KeyboardTest for HoldReleaseTest {
 
                 // Calculate hold duration
                 if let Some(start) = stats.press_start.take() {
-                    let hold_ms = event.timestamp.duration_since(start).as_secs_f64() * 1000.0;
+                    let hold = event.timestamp.saturating_duration_since(start);
+                    if hold >= MIN_REPORTED_HOLD {
+                        stats.reports_releases = true;
+                    }
+                    let hold_ms = hold.as_secs_f64() * 1000.0;
                     stats.total_hold_ms += hold_ms;
 
                     stats.min_hold_ms =
@@ -530,6 +547,36 @@ mod tests {
             row(&test.get_results(), "Bounces Detected").status,
             ResultStatus::Ok
         );
+    }
+
+    #[test]
+    fn driver_auto_released_keys_are_not_bounce() {
+        // A laptop volume key with an atkbd force-release quirk, held for a
+        // second: typematic make codes every 33 ms, each released by the
+        // driver a few µs later. The key never reports its own release.
+        let mut test = HoldReleaseTest::default();
+        let vol = KeyCode(115);
+        let t0 = Instant::now();
+        let mut at = t0;
+        for i in 0..25u64 {
+            test.process_event(&press_at(vol, at, 0));
+            test.process_event(&release_at(vol, at + Duration::from_micros(5)));
+            at += if i == 0 {
+                ms(250)
+            } else {
+                Duration::from_micros(33_333)
+            };
+        }
+        assert_eq!(test.total_bounces(), 0, "{:?}", test.bouncy_keys());
+
+        // A normal key chattering on its very first keystroke is still caught
+        feed(
+            &mut test,
+            KEY,
+            t0 + ms(2000),
+            &[(0, true), (1, false), (3, true), (80, false)],
+        );
+        assert_eq!(test.bouncy_keys(), vec![(KEY, 1)]);
     }
 
     #[test]
