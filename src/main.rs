@@ -373,7 +373,9 @@ fn disconnect_finding(disconnects: u32) -> Option<Finding> {
             "Keyboard disconnected {} time(s) during the session",
             disconnects
         ),
-        detail: "Keys pressed while it was gone were not seen by any test.".to_string(),
+        detail: "Keys pressed while it was gone were not seen by any test. A wireless \
+                 keyboard that went to sleep while idle shows up here too."
+            .to_string(),
         advice: "Check the cable and USB port (try another port), or the wireless \
                  link and batteries."
             .to_string(),
@@ -503,8 +505,8 @@ fn run_app(
     }
 
     // Times an evdev keyboard disappeared (shown in the exit summary)
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut keyboard_disconnects = 0u32;
+    #[cfg(target_os = "linux")]
+    let mut disconnects = DisconnectLog::default();
 
     // Main loop
     loop {
@@ -519,7 +521,7 @@ fn run_app(
         {
             if let Some(ref mut evdev) = evdev_listener {
                 evdev.poll();
-                report_device_changes(&mut app, evdev, &mut keyboard_disconnects);
+                report_device_changes(&mut app, evdev, &mut disconnects);
             } else {
                 listener.poll();
             }
@@ -657,6 +659,10 @@ fn run_app(
         app.total_events,
         app.elapsed_formatted()
     );
+    #[cfg(target_os = "linux")]
+    let keyboard_disconnects = disconnects.count;
+    #[cfg(not(target_os = "linux"))]
+    let keyboard_disconnects = 0;
     Ok(Some(SessionOutcome {
         total_events: app.total_events,
         elapsed: app.elapsed_formatted(),
@@ -670,22 +676,61 @@ fn run_app(
 const NO_KEYBOARD_STATUS: &str =
     "No keyboard connected - plug it in or reconnect it, it is picked up automatically";
 
+/// Keyboard disconnects seen during the session.
+///
+/// One keyboard usually has several event nodes (keys, media keys, an NKRO
+/// interface) that all vanish when it is unplugged, so node disconnects
+/// close together are one disconnect.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct DisconnectLog {
+    /// Separate disconnects so far
+    count: u32,
+    /// When the last node disappeared (cleared when a keyboard comes back)
+    last: Option<std::time::Instant>,
+}
+
+#[cfg(target_os = "linux")]
+impl DisconnectLog {
+    /// Node disconnects this close together belong to the same unplug.
+    const MERGE_WINDOW: Duration = Duration::from_secs(2);
+
+    /// Record that a node disappeared at `now`.
+    fn node_lost(&mut self, now: std::time::Instant) {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= Self::MERGE_WINDOW)
+        {
+            self.count += 1;
+        }
+        self.last = Some(now);
+    }
+
+    /// A keyboard came back: the next node lost is a new disconnect.
+    fn node_found(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Make keyboards that disappear or come back visible in the status line.
 ///
 /// A disconnect also stops a running auto test: its steps would otherwise
 /// time out and blame the missing input on dead keys.
 #[cfg(target_os = "linux")]
-fn report_device_changes(app: &mut App, evdev: &mut EvdevListener, disconnects: &mut u32) {
+fn report_device_changes(
+    app: &mut App,
+    evdev: &mut EvdevListener,
+    disconnects: &mut DisconnectLog,
+) {
+    let mut stopped = "";
     for change in evdev.take_device_changes() {
         match change {
             EvdevDeviceChange::Disconnected { name, .. } => {
-                *disconnects += 1;
-                let stopped = if app.auto_test_running() {
+                disconnects.node_lost(std::time::Instant::now());
+                if app.auto_test_running() {
                     app.abort_auto_test();
-                    " - auto test stopped"
-                } else {
-                    ""
-                };
+                    stopped = " - auto test stopped";
+                }
                 let left = match evdev.device_count() {
                     0 => "no keyboard left".to_string(),
                     n => format!("{} device(s) left", n),
@@ -696,6 +741,7 @@ fn report_device_changes(app: &mut App, evdev: &mut EvdevListener, disconnects: 
                 ));
             }
             EvdevDeviceChange::Connected { name, .. } => {
+                disconnects.node_found();
                 app.set_status(format!("Keyboard connected: {}", name));
             }
         }
@@ -1273,6 +1319,26 @@ mod tests {
         // refresh_rate_hz = 0 in a hand-edited config used to divide by zero
         assert_eq!(frame_interval(0), Duration::from_secs(1));
         assert_eq!(frame_interval(u32::MAX), Duration::from_millis(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_unplug_of_a_multi_node_keyboard_is_one_disconnect() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut log = DisconnectLog::default();
+        // Keyboard, consumer-control and NKRO nodes vanish together
+        log.node_lost(ms(0));
+        log.node_lost(ms(3));
+        log.node_lost(ms(20));
+        assert_eq!(log.count, 1);
+        // It comes back and drops out again: a second disconnect
+        log.node_found();
+        log.node_lost(ms(900));
+        assert_eq!(log.count, 2);
+        // A later, separate drop without a reconnect seen in between
+        log.node_lost(ms(10_000));
+        assert_eq!(log.count, 3);
     }
 
     #[test]
