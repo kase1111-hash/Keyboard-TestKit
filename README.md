@@ -12,10 +12,10 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 | **Polling Rate** | Measure keyboard Hz (125-8000Hz) with jitter detection |
 | **Stickiness** | Detect stuck or unresponsive keys |
 | **Bounce** | Identify mechanical key bounce and measure hold/release timing |
-| **N-Key Rollover** | Test simultaneous key capability and ghosting |
-| **Timing** | Per-key and global inter-event timing measurement |
+| **N-Key Rollover** | Test simultaneous key capability (ghost keys are shown, not auto-detected) |
+| **Timing** | Gaps between key events: typing-rhythm statistics, not a keyboard rating |
 | **Shortcuts** | Detect system hotkey conflicts intercepting input |
-| **Virtual** | Compare physical vs virtual keys to isolate hardware/software issues |
+| **Virtual** | Check that injected keys reach the app, and flag automated (non-human) input |
 | **OEM/FN** | OEM key detection, capture, and FN key remapping |
 | **Auto** | Guided automatic diagnostic that finds issues for you (dead, stuck and chattering keys, phantom input, limited rollover, polling rate) |
 
@@ -191,8 +191,8 @@ the Dashboard, Auto and Help screens.
 2. **Polling** - Keyboard polling rate (Hz) with min/max/average
 3. **Bounce** - Key bounce detection and hold duration analysis
 4. **Sticky** - Stuck key detection with configurable thresholds
-5. **NKRO** - N-key rollover testing and ghosting detection
-6. **Timing** - Per-key inter-event timing measurement
+5. **NKRO** - N-key rollover testing; watch Active Keys for ghost keys
+6. **Timing** - Informational gaps between key events (the keyboard's report interval is in Polling)
 7. **Shortcuts** - System hotkey conflict detection
 8. **Virtual** - Physical vs virtual keyboard comparison
 9. **OEM/FN** - OEM key capture and FN key remapping
@@ -207,7 +207,7 @@ Default configuration values (in `src/config.rs`):
 |---------|---------|-------------|
 | `polling.test_duration_secs` | 10 | Duration for polling rate test |
 | `stickiness.stuck_threshold_ms` | 2000 | Time before key is considered stuck |
-| `hold_release.bounce_window_ms` | 5 | Window for bounce detection |
+| `hold_release.bounce_window_ms` | 20 | A same-key press this soon after its release is a bounce (20-40; older 5 ms values are raised to 20) |
 | `ui.refresh_rate_hz` | 60 | UI refresh rate |
 
 Out-of-range values in a hand-edited `config.toml` are clamped when it is
@@ -225,14 +225,21 @@ already down still register their release.
 
 ## Diagnostic Logic
 
-The Virtual Keyboard test helps isolate issues:
+The Virtual Keyboard test (`v`, `virtual-send` builds) injects `z`, `x`, `c` and
+checks that they reach the app, using your own `v` key press as the physical
+baseline:
 
-| Physical | Virtual | Diagnosis |
-|----------|---------|-----------|
-| Works | Works | Keyboard OK |
-| Fails | Works | **Hardware Issue** |
-| Fails | Fails | **Software/Driver Issue** |
-| Works | Fails | API/Permission Issue |
+| Your key press | Injected keys | Diagnosis |
+|----------------|---------------|-----------|
+| Arrived | Arrived | Input path OK |
+| Arrived | Missing | API/Permission Issue (synthetic input blocked) |
+| Missing | Any | Inconclusive (e.g. the app was paused) |
+
+With evdev input the check is unavailable, because injected keys bypass the
+keyboard device. Faults of individual keys are found by the auto test's sweep.
+
+Bounce and polling-rate results need evdev's kernel timestamps; with terminal
+input those views show "n/a (terminal input)" instead of a result.
 
 ## Export
 

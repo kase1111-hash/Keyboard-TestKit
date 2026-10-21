@@ -8,7 +8,11 @@ use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
-/// Common shortcuts that might cause conflicts
+/// Common shortcuts that might cause conflicts.
+///
+/// Combos are written the way [`ShortcutTest`] builds them: modifiers in
+/// Ctrl/Alt/Shift/Super order followed by the key's keymap name ("Delete",
+/// "Escape", "PrintScreen"), so they can be matched exactly.
 const COMMON_CONFLICTS: &[(&str, &[&str])] = &[
     ("Ctrl+W", &["Close tab/window"]),
     ("Ctrl+Q", &["Quit application"]),
@@ -20,9 +24,10 @@ const COMMON_CONFLICTS: &[(&str, &[&str])] = &[
     ("Alt+Tab", &["Switch window"]),
     ("Alt+F4", &["Close window"]),
     ("Super+L", &["Lock screen"]),
-    ("Ctrl+Alt+Del", &["System menu"]),
-    ("Ctrl+Shift+Esc", &["Task manager"]),
-    ("PrtSc", &["Screenshot"]),
+    ("Ctrl+Alt+Delete", &["System menu"]),
+    ("Ctrl+Shift+Escape", &["Task manager"]),
+    // Works without a modifier, so it is recorded even when pressed alone
+    ("PrintScreen", &["Screenshot"]),
 ];
 
 /// A system-registered shortcut discovered by enumeration
@@ -276,15 +281,15 @@ impl ShortcutTest {
     /// Record a shortcut event
     fn record_shortcut(&mut self, key: KeyCode, timestamp: Instant) {
         let prefix = self.modifiers.to_prefix();
-        if prefix.is_empty() {
-            return; // No modifiers held, not a shortcut
-        }
-
         let key_name = Self::get_key_name(key);
         let combo = format!("{}{}", prefix, key_name);
 
         let description = Self::check_known_conflict(&combo);
         let is_known = description.is_some();
+        // Without a modifier only a known system hotkey (PrintScreen) counts
+        if prefix.is_empty() && !is_known {
+            return;
+        }
 
         let event = ShortcutEvent {
             combo: combo.clone(),
@@ -351,9 +356,8 @@ impl KeyboardTest for ShortcutTest {
                     self.update_modifiers(event.key, true);
                 } else {
                     // Non-modifier key pressed while modifiers held = shortcut
-                    if self.modifiers.any_held() {
-                        self.record_shortcut(event.key, event.timestamp);
-                    }
+                    // (record_shortcut also takes lone system hotkeys)
+                    self.record_shortcut(event.key, event.timestamp);
                     self.pressed_keys.insert(event.key);
                 }
             }
@@ -478,5 +482,75 @@ impl KeyboardTest for ShortcutTest {
         self.start_time = None;
         self.last_shortcut = None;
         // system_shortcuts preserved — they don't change during a session
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyboard::keymap::{KEY_LALT, KEY_LCTRL, KEY_LSHIFT, KEY_LSUPER, KEY_PRINT};
+    use crate::tests::test_helpers::{press, release};
+
+    fn chord(test: &mut ShortcutTest, keys: &[KeyCode]) {
+        for &k in keys {
+            test.process_event(&press(k));
+        }
+        for &k in keys.iter().rev() {
+            test.process_event(&release(k));
+        }
+    }
+
+    /// Key events that produce `combo` (modifier names, then a keymap name).
+    fn keys_for_combo(combo: &str) -> Vec<KeyCode> {
+        combo
+            .split('+')
+            .map(|part| match part {
+                "Ctrl" => KEY_LCTRL,
+                "Alt" => KEY_LALT,
+                "Shift" => KEY_LSHIFT,
+                "Super" => KEY_LSUPER,
+                name => (1u16..=255)
+                    .map(KeyCode)
+                    .find(|k| keymap::get_key_info(*k).name == name)
+                    .unwrap_or_else(|| panic!("no key named {} (in {})", name, combo)),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_known_conflict_entry_can_match() {
+        // Each table entry must be reachable from real key events; the old
+        // "Ctrl+Alt+Del", "Ctrl+Shift+Esc" and "PrtSc" entries never were.
+        for (combo, descriptions) in COMMON_CONFLICTS {
+            let mut test = ShortcutTest::new();
+            chord(&mut test, &keys_for_combo(combo));
+            let recent = test.recent_shortcuts(1);
+            let last = recent.first().expect("shortcut recorded");
+            assert_eq!(last.combo, *combo);
+            assert!(last.is_known_conflict, "{} not recognised", combo);
+            assert_eq!(last.description.as_deref(), Some(descriptions[0]));
+            assert_eq!(test.conflict_count(), 1);
+        }
+        assert_eq!(keys_for_combo("Ctrl+Alt+Delete")[2], KeyCode(111));
+        assert_eq!(keys_for_combo("PrintScreen"), vec![KEY_PRINT]);
+    }
+
+    #[test]
+    fn plain_typing_is_not_a_shortcut() {
+        let mut test = ShortcutTest::new();
+        for key in [30u16, 31, 32, 111, 1] {
+            chord(&mut test, &[KeyCode(key)]);
+        }
+        assert_eq!(test.total_shortcuts(), 0);
+        assert_eq!(test.conflict_count(), 0);
+    }
+
+    #[test]
+    fn unknown_combo_is_recorded_but_not_a_conflict() {
+        let mut test = ShortcutTest::new();
+        chord(&mut test, &[KEY_LCTRL, KEY_LSHIFT, KeyCode(30)]);
+        assert_eq!(test.total_shortcuts(), 1);
+        assert_eq!(test.conflict_count(), 0);
+        assert_eq!(test.recent_shortcuts(1)[0].combo, "Ctrl+Shift+A");
     }
 }

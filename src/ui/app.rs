@@ -265,6 +265,11 @@ impl App {
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
         self.auto_test.set_input_source(source);
+        // The manual views must not show results the source cannot measure
+        self.polling_test.set_input_source(source);
+        self.hold_release_test.set_input_source(source);
+        self.rollover_test.set_input_source(source);
+        self.virtual_test.set_input_source(source);
     }
 
     /// Returns mutable references to all 8 test modules for batch operations.
@@ -369,6 +374,8 @@ impl App {
         if self.state == AppState::Running {
             self.check_stuck_keys();
         }
+        // Settle a physical-vs-virtual check once its wait is over
+        self.virtual_test.tick();
 
         let finished = self.auto_test.tick();
         self.apply_auto_step_transition();
@@ -776,8 +783,9 @@ impl App {
                 editable: true,
             },
             SettingsItem {
-                label: "Bounce Window (ms)".to_string(),
-                value: format!("{}", self.config.hold_release.bounce_window_ms),
+                // Shows the window in effect (old configs held 5 ms, raised to 20)
+                label: "Bounce: release->press (ms)".to_string(),
+                value: format!("{}", self.hold_release_test.bounce_window_ms()),
                 editable: true,
             },
             SettingsItem {
@@ -828,6 +836,8 @@ impl App {
                         .saturating_sub(5)
                         .max(5);
                 }
+                self.polling_test
+                    .set_duration_secs(self.config.polling.test_duration_secs);
             }
             1 => {
                 // Stuck threshold
@@ -850,7 +860,9 @@ impl App {
                     .set_threshold(self.config.stickiness.stuck_threshold_ms);
             }
             2 => {
-                // Bounce window
+                // Bounce window (step from the value in effect)
+                self.config.hold_release.bounce_window_ms =
+                    self.hold_release_test.bounce_window_ms();
                 if increase {
                     self.config.hold_release.bounce_window_ms =
                         self.config.hold_release.bounce_window_ms.saturating_add(1);
@@ -862,6 +874,11 @@ impl App {
                         .saturating_sub(1)
                         .max(1);
                 }
+                // The test clamps to a useful range; keep the config in step
+                self.hold_release_test
+                    .set_bounce_window_ms(self.config.hold_release.bounce_window_ms);
+                self.config.hold_release.bounce_window_ms =
+                    self.hold_release_test.bounce_window_ms();
             }
             3 => {
                 // Refresh rate

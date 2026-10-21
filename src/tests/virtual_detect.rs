@@ -7,17 +7,74 @@
 //! Note: Virtual key sending requires the 'virtual-send' feature and
 //! appropriate system libraries (libxdo on Linux, etc.)
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Thresholds for virtual input detection
-const MIN_HUMAN_INTERVAL_MS: f64 = 15.0;
+// Thresholds for virtual input detection.
+//
+// Different keys pressed within a few ms of each other are normal (chords,
+// Shift+letter, rolled typing, slamming keys in the NKRO test), and so are
+// modifiers landing together (Ctrl+Alt+..., a Hyper key sends four in one
+// report). So only separate keystrokes are timed: non-modifier presses made
+// while no other non-modifier key is held. Synthetic typing releases every
+// key before pressing the next one.
+//
+// The same key registering again within a few ms is not judged here either:
+// that is what a chattering switch produces, and the Hold & Release test
+// reports it as bounce.
+
+/// Interval variance (ms²) below which a sequence is machine-regular: human
+/// typing varies by tens of ms between keystrokes (variance in the 100s+).
 const PERFECT_TIMING_THRESHOLD: f64 = 0.5;
+/// Number of intervals needed before "perfect timing" is judged.
+const PERFECT_TIMING_MIN_SAMPLES: usize = 10;
+/// Five separate (non-overlapping) keystrokes inside this window would each
+/// last under 10 ms from press to next press - no finger does that.
 const BURST_WINDOW_MS: u64 = 50;
 const BURST_COUNT_THRESHOLD: usize = 5;
 const ANALYSIS_WINDOW: usize = 20;
+
+/// Keys sent by the physical-vs-virtual check.
+const INJECTED_KEYS: [char; 3] = ['z', 'x', 'c'];
+/// How long after the injected keys were sent the check waits for them. The
+/// terminal delivers them within a frame or two once the send returns.
+const INJECTION_WINDOW: Duration = Duration::from_millis(500);
+/// How long before the request a key press still counts as the keystroke
+/// that started the check (the 'v' press is stamped just before its command
+/// is handled).
+const TRIGGER_LOOKBACK: Duration = Duration::from_millis(250);
+
+/// Character a key types, if it is a single-character key (letters, digits).
+fn key_char(key: KeyCode) -> Option<char> {
+    let label = keymap::get_key_info(key).label;
+    let mut chars = label.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Whether a key is one the physical-vs-virtual check injects.
+fn is_injected_key(key: KeyCode) -> bool {
+    key_char(key).is_some_and(|c| INJECTED_KEYS.contains(&c))
+}
+
+/// Verdict of the physical-vs-virtual check.
+///
+/// `physical_seen`: a press of the user's own (non-injected) key, such as the
+/// one that started the check, reached the test pipeline. `injected_seen`: at
+/// least one injected key arrived. Without a physical press there is nothing
+/// to compare against (the app may have been paused), so no hardware or
+/// software verdict is guessed.
+fn diagnose(physical_seen: bool, injected_seen: bool) -> DiagnosticResult {
+    match (physical_seen, injected_seen) {
+        (true, true) => DiagnosticResult::KeyboardOk,
+        (true, false) => DiagnosticResult::ApiIssue,
+        (false, _) => DiagnosticResult::Inconclusive,
+    }
+}
 
 /// Classification of input source
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,14 +107,22 @@ impl InputClassification {
 }
 
 /// Diagnostic result for physical vs virtual comparison
+///
+/// The check can only compare the keystroke that started it with the keys it
+/// injects: in terminal mode the starting key press already proves physical
+/// input reaches the app, and the terminal cannot tell keyboards apart. So
+/// `HardwareIssue` and `SoftwareIssue` are not produced (a missing physical
+/// press is reported as `Inconclusive`); per-key hardware faults are found by
+/// the auto test's key sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticResult {
     NotTested,
-    NotAvailable,  // Virtual sending not compiled in
+    NotAvailable,  // Virtual sending not compiled in, or evdev input
     KeyboardOk,    // Physical works + Virtual works
-    HardwareIssue, // Physical fails + Virtual works
-    SoftwareIssue, // Physical fails + Virtual fails
+    HardwareIssue, // Physical fails + Virtual works (not produced, see above)
+    SoftwareIssue, // Physical fails + Virtual fails (not produced, see above)
     ApiIssue,      // Physical works + Virtual fails
+    Inconclusive,  // No physical key press reached the test during the check
 }
 
 impl DiagnosticResult {
@@ -65,10 +130,11 @@ impl DiagnosticResult {
         match self {
             Self::NotTested => "Not tested yet",
             Self::NotAvailable => "Not available",
-            Self::KeyboardOk => "Keyboard OK",
+            Self::KeyboardOk => "Input path OK",
             Self::HardwareIssue => "Hardware Issue Detected",
             Self::SoftwareIssue => "Software/Driver Issue",
             Self::ApiIssue => "API/Permission Issue",
+            Self::Inconclusive => "Inconclusive",
         }
     }
 
@@ -76,16 +142,19 @@ impl DiagnosticResult {
         match self {
             Self::NotTested => "Press 'v' to send virtual test keys",
             Self::NotAvailable => "Build with --features virtual-send for this test",
-            Self::KeyboardOk => "Physical and virtual keys both work correctly",
+            Self::KeyboardOk => "Your key press and the injected keys both reached the app",
             Self::HardwareIssue => "Physical keys fail but virtual works - check keyboard hardware",
             Self::SoftwareIssue => "Both physical and virtual fail - check drivers/software",
-            Self::ApiIssue => "Physical works but virtual fails - check permissions",
+            Self::ApiIssue => {
+                "Injected keys never arrived - check input-injection permissions and focus"
+            }
+            Self::Inconclusive => "Your key press did not reach the test (paused?) - try again",
         }
     }
 
     pub fn to_status(self) -> ResultStatus {
         match self {
-            Self::NotTested | Self::NotAvailable => ResultStatus::Info,
+            Self::NotTested | Self::NotAvailable | Self::Inconclusive => ResultStatus::Info,
             Self::KeyboardOk => ResultStatus::Ok,
             Self::HardwareIssue => ResultStatus::Error,
             Self::SoftwareIssue => ResultStatus::Error,
@@ -240,20 +309,27 @@ pub struct VirtualKeyboardTest {
     interval_variance: f64,
     /// Running mean calculation
     interval_mean: f64,
+    /// Non-modifier keys currently held (a press while one is held is a chord)
+    held: HashSet<KeyCode>,
 
     // Virtual key testing
     /// Virtual key sender
     sender: VirtualKeySender,
     /// Keys we're expecting from virtual send
     expected_virtual_keys: Vec<char>,
-    /// Time when we sent virtual keys
+    /// Time when the virtual keys had been sent (the wait starts here)
     virtual_send_time: Option<Instant>,
+    /// When the check was requested (the 'v' key press)
+    requested_at: Option<Instant>,
+    /// Latest press of a key the check does not inject
+    last_physical_press: Option<Instant>,
+    /// Whether injected keys can reach the test (not with evdev input: they go
+    /// through the display server, not the keyboard device evdev reads)
+    injected_keys_visible: bool,
     /// Results of key comparison tests
     test_results: HashMap<char, TestKeyResult>,
     /// Current diagnostic result
     diagnostic: DiagnosticResult,
-    /// Physical keys received during test
-    physical_keys_received: u32,
     /// Virtual keys received during test
     virtual_keys_received: u32,
     /// Test mode active
@@ -283,22 +359,42 @@ impl VirtualKeyboardTest {
             last_interval_ms: None,
             interval_variance: 0.0,
             interval_mean: 0.0,
+            held: HashSet::new(),
             sender: VirtualKeySender::new(),
             expected_virtual_keys: Vec::new(),
             virtual_send_time: None,
+            requested_at: None,
+            last_physical_press: None,
+            injected_keys_visible: true,
             test_results: HashMap::new(),
             diagnostic,
-            physical_keys_received: 0,
             virtual_keys_received: 0,
             test_mode_active: false,
             pending_send: false,
         }
     }
 
+    /// Tell the test where events come from. With evdev the injected keys
+    /// never reach the test (they enter through the display server, not the
+    /// keyboard device), so the physical-vs-virtual check is unavailable.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.injected_keys_visible = source != InputSource::Evdev;
+        self.diagnostic = self.idle_diagnostic();
+    }
+
+    fn idle_diagnostic(&self) -> DiagnosticResult {
+        if VirtualKeySender::is_available() && self.injected_keys_visible {
+            DiagnosticResult::NotTested
+        } else {
+            DiagnosticResult::NotAvailable
+        }
+    }
+
     /// Request to send virtual test keys (called from main loop)
     pub fn request_virtual_test(&mut self) {
-        if VirtualKeySender::is_available() {
+        if VirtualKeySender::is_available() && self.injected_keys_visible {
             self.pending_send = true;
+            self.requested_at = Some(Instant::now());
         }
     }
 
@@ -315,21 +411,15 @@ impl VirtualKeyboardTest {
             return Err("Virtual sending not available".to_string());
         }
 
-        self.test_mode_active = true;
+        let requested_at = self.requested_at.unwrap_or_else(Instant::now);
+        self.test_mode_active = false;
         self.expected_virtual_keys.clear();
-        self.virtual_send_time = Some(Instant::now());
-        self.physical_keys_received = 0;
-        self.virtual_keys_received = 0;
 
-        // Initialize test results for test keys
-        for key in ['z', 'x', 'c'] {
-            self.test_results.entry(key).or_default().virtual_sent = true;
-            self.test_results.entry(key).or_default().virtual_received = false;
-        }
-
+        // Blocks while the keys are typed (~0.4 s); the injected events are
+        // read from the terminal afterwards, so the wait starts once it returns.
         match self.sender.send_test_sequence() {
             Ok(keys) => {
-                self.expected_virtual_keys = keys;
+                self.begin_check(requested_at, keys, Instant::now());
                 Ok(())
             }
             Err(e) => {
@@ -339,18 +429,54 @@ impl VirtualKeyboardTest {
         }
     }
 
-    /// Analyze timing characteristics
+    /// Start waiting for the injected `keys`, whose sending finished at `sent_at`.
+    fn begin_check(&mut self, requested_at: Instant, keys: Vec<char>, sent_at: Instant) {
+        self.test_mode_active = true;
+        self.requested_at = Some(requested_at);
+        self.virtual_send_time = Some(sent_at);
+        self.virtual_keys_received = 0;
+        self.test_results.clear();
+        for &key in &keys {
+            self.test_results.insert(
+                key,
+                TestKeyResult {
+                    virtual_sent: true,
+                    ..TestKeyResult::default()
+                },
+            );
+        }
+        self.expected_virtual_keys = keys;
+    }
+
+    /// Settle the physical-vs-virtual verdict once the wait for the injected
+    /// keys is over. Call regularly (the app does so every frame); no further
+    /// key press is needed.
+    pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    fn tick_at(&mut self, now: Instant) {
+        if !self.test_mode_active {
+            return;
+        }
+        let Some(sent_at) = self.virtual_send_time else {
+            return;
+        };
+        if now.saturating_duration_since(sent_at) < INJECTION_WINDOW {
+            return; // Still waiting for the injected keys
+        }
+        let physical_seen = match (self.last_physical_press, self.requested_at) {
+            (Some(pressed), Some(requested)) => pressed + TRIGGER_LOOKBACK >= requested,
+            _ => false,
+        };
+        self.diagnostic = diagnose(physical_seen, self.virtual_keys_received > 0);
+        self.test_mode_active = false;
+    }
+
+    /// Analyze the regularity of separate keystrokes (non-modifier presses
+    /// made while no other non-modifier key was held).
     fn analyze_timing(&mut self, interval_ms: f64, timestamp: Instant) -> bool {
         let mut is_suspicious = false;
-
-        if interval_ms < MIN_HUMAN_INTERVAL_MS {
-            self.record_anomaly(
-                format!("Inhuman speed: {:.1}ms interval", interval_ms),
-                timestamp,
-                AnomalySeverity::High,
-            );
-            is_suspicious = true;
-        }
 
         self.intervals.push_back(interval_ms);
         if self.intervals.len() > ANALYSIS_WINDOW {
@@ -369,7 +495,9 @@ impl VirtualKeyboardTest {
             self.interval_mean = mean;
             self.interval_variance = variance;
 
-            if variance < PERFECT_TIMING_THRESHOLD && self.intervals.len() >= 10 {
+            if variance < PERFECT_TIMING_THRESHOLD
+                && self.intervals.len() >= PERFECT_TIMING_MIN_SAMPLES
+            {
                 self.record_anomaly(
                     format!("Perfect timing: variance={:.2}ms²", variance),
                     timestamp,
@@ -465,44 +593,46 @@ impl VirtualKeyboardTest {
 
     /// Check if a key matches our expected virtual keys
     fn check_virtual_key_received(&mut self, key: KeyCode) {
-        let key_info = keymap::get_key_info(key);
-        let key_char = key_info.label.to_lowercase().chars().next();
-
-        if let Some(c) = key_char {
-            if self.expected_virtual_keys.contains(&c) {
-                if let Some(result) = self.test_results.get_mut(&c) {
-                    result.virtual_received = true;
-                    result._last_test_time = Some(Instant::now());
-                }
-                self.virtual_keys_received += 1;
+        // Exact match on the key's character: "Ctrl" or "Caps" is not 'c'
+        let Some(c) = key_char(key) else {
+            return;
+        };
+        if self.expected_virtual_keys.contains(&c) {
+            if let Some(result) = self.test_results.get_mut(&c) {
+                result.virtual_received = true;
+                result._last_test_time = Some(Instant::now());
             }
+            self.virtual_keys_received += 1;
         }
     }
 
-    /// Update diagnostic based on test results
-    fn update_diagnostic(&mut self) {
-        if !self.test_mode_active {
-            return;
+    /// Which of the injected keys arrived, e.g. "z x arrived, c missing".
+    fn injected_summary(&self) -> Option<String> {
+        let sent: Vec<char> = self
+            .expected_virtual_keys
+            .iter()
+            .copied()
+            .filter(|c| self.test_results.get(c).is_some_and(|r| r.virtual_sent))
+            .collect();
+        if sent.is_empty() {
+            return None;
         }
-
-        // Check if enough time has passed since sending (500ms window)
-        if let Some(send_time) = self.virtual_send_time {
-            if send_time.elapsed() < Duration::from_millis(500) {
-                return; // Still waiting for results
-            }
-        }
-
-        let virtual_worked = self.virtual_keys_received > 0;
-        let physical_worked = self.physical_keys_received > 0;
-
-        self.diagnostic = match (physical_worked, virtual_worked) {
-            (true, true) => DiagnosticResult::KeyboardOk,
-            (false, true) => DiagnosticResult::HardwareIssue,
-            (false, false) => DiagnosticResult::SoftwareIssue,
-            (true, false) => DiagnosticResult::ApiIssue,
+        let (arrived, missing): (Vec<char>, Vec<char>) = sent.iter().partition(|c| {
+            self.test_results
+                .get(*c)
+                .is_some_and(|r| r.virtual_received)
+        });
+        let join = |keys: &[char]| {
+            keys.iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         };
-
-        self.test_mode_active = false;
+        Some(match (arrived.is_empty(), missing.is_empty()) {
+            (_, true) => format!("{} arrived", join(&arrived)),
+            (true, false) => format!("{} missing", join(&missing)),
+            (false, false) => format!("{} arrived, {} missing", join(&arrived), join(&missing)),
+        })
     }
 
     /// Current physical-vs-virtual diagnostic result
@@ -538,6 +668,7 @@ impl KeyboardTest for VirtualKeyboardTest {
 
     fn process_event(&mut self, event: &KeyEvent) {
         if event.event_type != KeyEventType::Press {
+            self.held.remove(&event.key);
             return;
         }
 
@@ -547,11 +678,22 @@ impl KeyboardTest for VirtualKeyboardTest {
 
         self.total_keystrokes += 1;
 
-        // Track physical keys during test mode
-        if self.test_mode_active {
-            self.physical_keys_received += 1;
-            self.check_virtual_key_received(event.key);
-            self.update_diagnostic();
+        // Physical-vs-virtual check: injected keys are never physical evidence
+        if is_injected_key(event.key) {
+            if self.test_mode_active {
+                self.check_virtual_key_received(event.key);
+            }
+        } else {
+            self.last_physical_press = Some(event.timestamp);
+        }
+
+        // A press while another key is held is a chord or rolled typing, and a
+        // modifier is only part of a combination; people do both all the
+        // time, so only separate non-modifier keystrokes are timed.
+        let modifier = keymap::is_modifier(event.key);
+        let separate = !modifier && !self.held.iter().any(|k| *k != event.key);
+        if !modifier {
+            self.held.insert(event.key);
         }
 
         let interval_ms = self
@@ -562,14 +704,16 @@ impl KeyboardTest for VirtualKeyboardTest {
 
         let mut is_virtual = false;
 
-        if let Some(interval) = interval_ms {
-            if self.analyze_timing(interval, event.timestamp) {
+        if separate {
+            if let Some(interval) = interval_ms {
+                if self.analyze_timing(interval, event.timestamp) {
+                    is_virtual = true;
+                }
+            }
+
+            if self.detect_burst(event.timestamp) {
                 is_virtual = true;
             }
-        }
-
-        if self.detect_burst(event.timestamp) {
-            is_virtual = true;
         }
 
         if is_virtual {
@@ -600,7 +744,7 @@ impl KeyboardTest for VirtualKeyboardTest {
             // Tooltip: Explain what this test measures
             TestResult::info("--- What This Measures ---", ""),
             TestResult::info("Detects virtual/automated", "input vs physical keys"),
-            TestResult::info("Diagnoses hardware vs", "software keyboard issues"),
+            TestResult::info("'v' injects z, x, c and", "checks they reach the app"),
             TestResult::info(
                 "Look for: 'Physical' input,",
                 "low suspicious %, no anomalies",
@@ -608,27 +752,46 @@ impl KeyboardTest for VirtualKeyboardTest {
             TestResult::info("", ""),
             // Diagnostic section
             TestResult::info("=== DIAGNOSTIC TEST ===", ""),
-            TestResult::new(
+        ];
+
+        // A build without virtual-send says so (below); only then is evdev
+        // the reason the check cannot run.
+        if VirtualKeySender::is_available() && !self.injected_keys_visible {
+            results.push(TestResult::info("Status", "Not available with evdev input"));
+            results.push(TestResult::info(
+                "Info",
+                "Injected keys bypass the keyboard device evdev reads",
+            ));
+        } else {
+            results.push(TestResult::new(
                 "Status",
                 self.diagnostic.as_str(),
                 self.diagnostic.to_status(),
-            ),
-            TestResult::info("Info", self.diagnostic.description().to_string()),
-        ];
-
-        if self.diagnostic == DiagnosticResult::NotTested {
+            ));
             results.push(TestResult::info(
-                "Action",
-                "Press 'v' to send virtual test keys".to_string(),
+                "Info",
+                self.diagnostic.description().to_string(),
             ));
+            if self.diagnostic == DiagnosticResult::NotTested {
+                results.push(TestResult::info(
+                    "Action",
+                    "Press 'v' to send virtual test keys".to_string(),
+                ));
+            }
+            if self.test_mode_active {
+                results.push(TestResult::info(
+                    "Test Active",
+                    "Waiting for the injected keys...".to_string(),
+                ));
+            }
+            if let Some(summary) = self.injected_summary().filter(|_| !self.test_mode_active) {
+                results.push(TestResult::info("Injected Keys", summary));
+            }
         }
-
-        if self.test_mode_active {
-            results.push(TestResult::warning(
-                "Test Active",
-                "Waiting for key events...".to_string(),
-            ));
-        }
+        results.push(TestResult::info(
+            "Note",
+            "Single keys are verified by the Auto test sweep",
+        ));
 
         // Detection section
         results.push(TestResult::info("=== INPUT DETECTION ===", ""));
@@ -672,7 +835,9 @@ impl KeyboardTest for VirtualKeyboardTest {
                 format!("{:.1}ms", self.interval_mean),
             ));
 
-            let variance_status = if self.interval_variance < PERFECT_TIMING_THRESHOLD {
+            let variance_status = if self.interval_variance < PERFECT_TIMING_THRESHOLD
+                && self.intervals.len() >= PERFECT_TIMING_MIN_SAMPLES
+            {
                 ResultStatus::Warning
             } else {
                 ResultStatus::Ok
@@ -714,17 +879,315 @@ impl KeyboardTest for VirtualKeyboardTest {
         self.last_interval_ms = None;
         self.interval_variance = 0.0;
         self.interval_mean = 0.0;
+        self.held.clear();
         self.expected_virtual_keys.clear();
         self.virtual_send_time = None;
+        self.requested_at = None;
+        self.last_physical_press = None;
         self.test_results.clear();
-        self.diagnostic = if VirtualKeySender::is_available() {
-            DiagnosticResult::NotTested
-        } else {
-            DiagnosticResult::NotAvailable
-        };
-        self.physical_keys_received = 0;
+        self.diagnostic = self.idle_diagnostic();
         self.virtual_keys_received = 0;
         self.test_mode_active = false;
         self.pending_send = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::test_helpers::{press_at, release_at};
+
+    const KEY_V: KeyCode = KeyCode(47);
+    const KEY_Z: KeyCode = KeyCode(44);
+    const KEY_X: KeyCode = KeyCode(45);
+    const KEY_C: KeyCode = KeyCode(46);
+    const KEY_LCTRL: KeyCode = KeyCode(29);
+    const KEY_LSHIFT: KeyCode = KeyCode(42);
+    const KEY_CAPS: KeyCode = KeyCode(58);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn tap(test: &mut VirtualKeyboardTest, key: KeyCode, at: Instant, hold: Duration) {
+        test.process_event(&press_at(key, at, 0));
+        test.process_event(&release_at(key, at + hold));
+    }
+
+    fn is_flagged_virtual(test: &VirtualKeyboardTest) -> bool {
+        matches!(
+            test.classification(),
+            InputClassification::Virtual | InputClassification::LikelyVirtual
+        )
+    }
+
+    /// Start a check as the app does: 'v' requested at `t0`, the blocking
+    /// send of z, x, c finishes 400 ms later.
+    fn start_check(test: &mut VirtualKeyboardTest, t0: Instant) -> Instant {
+        let sent_at = t0 + ms(400);
+        test.begin_check(t0, INJECTED_KEYS.to_vec(), sent_at);
+        sent_at
+    }
+
+    // --- Virtual-input heuristics (K-A12) --------------------------------
+
+    #[test]
+    fn chords_rollover_and_shift_are_not_virtual() {
+        let mut test = VirtualKeyboardTest::new();
+        let mut at = Instant::now();
+        // Two-key chords, keys landing 3 ms apart
+        for i in 0..12u16 {
+            let a = KeyCode(30 + i % 4);
+            let b = KeyCode(36 + i % 3);
+            test.process_event(&press_at(a, at, 0));
+            test.process_event(&press_at(b, at + ms(3), 0));
+            test.process_event(&release_at(a, at + ms(90)));
+            test.process_event(&release_at(b, at + ms(95)));
+            at += ms(250 + u64::from(i) * 17);
+        }
+        // Shift+letter and Ctrl+C typed quickly
+        for (modifier, key) in [(KEY_LSHIFT, KeyCode(35)), (KEY_LCTRL, KEY_C)] {
+            test.process_event(&press_at(modifier, at, 0));
+            tap(&mut test, key, at + ms(4), ms(60));
+            test.process_event(&release_at(modifier, at + ms(80)));
+            at += ms(300);
+        }
+        // NKRO view: slam 8 keys at once (same USB report or within ms)
+        for (i, key) in (16u16..24).enumerate() {
+            test.process_event(&press_at(KeyCode(key), at + ms(i as u64 / 3), 0));
+        }
+        for key in 16u16..24 {
+            test.process_event(&release_at(KeyCode(key), at + ms(900)));
+        }
+
+        assert!(test.total_keystrokes >= 30);
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert_eq!(test.virtual_count, 0);
+        assert!(!is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn irregular_human_typing_is_physical() {
+        let mut test = VirtualKeyboardTest::new();
+        let mut at = Instant::now();
+        for i in 0..60u64 {
+            let key = KeyCode(16 + (i * 7 % 20) as u16);
+            tap(&mut test, key, at, ms(50 + i * 13 % 40));
+            at += ms(90 + i * 37 % 160);
+        }
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert_eq!(test.classification(), InputClassification::Physical);
+    }
+
+    /// A few seconds of ordinary typing (irregular gaps, released keys).
+    fn type_normally(test: &mut VirtualKeyboardTest, mut at: Instant) -> Instant {
+        for i in 0..12u64 {
+            tap(test, KeyCode(16 + (i % 10) as u16), at, ms(60));
+            at += ms(150 + i * 29 % 90);
+        }
+        at
+    }
+
+    #[test]
+    fn modifier_combos_and_two_hand_slams_are_not_virtual() {
+        let mut test = VirtualKeyboardTest::new();
+        let mut at = type_normally(&mut test, Instant::now());
+        // NKRO view, both palms down: hid-input emits the modifier byte
+        // first, so six modifier presses then six letters, one timestamp
+        let mods = [29u16, 42, 56, 125, 97, 54];
+        for key in mods.into_iter().chain(30..36) {
+            test.process_event(&press_at(KeyCode(key), at, 0));
+        }
+        for key in mods.into_iter().chain(30..36) {
+            test.process_event(&release_at(KeyCode(key), at + ms(900)));
+        }
+        at += ms(1500);
+        // A Hyper key (Ctrl+Shift+Alt+Super in one report) resolved together
+        // with the letter by tap-hold firmware
+        for key in [29u16, 42, 56, 125] {
+            test.process_event(&press_at(KeyCode(key), at, 0));
+        }
+        tap(&mut test, KeyCode(19), at + ms(1), ms(50));
+        for key in [29u16, 42, 56, 125] {
+            test.process_event(&release_at(KeyCode(key), at + ms(80)));
+        }
+
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert_eq!(test.virtual_count, 0);
+        assert!(!is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn chattering_switch_is_not_virtual() {
+        // One keystroke registers twice (press, 1 ms blip, press again 3 ms
+        // in): a worn switch, which the Hold & Release test reports as
+        // bounce. It is physical input, not automation.
+        let mut test = VirtualKeyboardTest::new();
+        let at = type_normally(&mut test, Instant::now());
+        let key = KeyCode(18);
+        test.process_event(&press_at(key, at, 0));
+        test.process_event(&release_at(key, at + ms(1)));
+        test.process_event(&press_at(key, at + ms(3), 0));
+        test.process_event(&release_at(key, at + ms(70)));
+
+        assert!(test.anomalies.is_empty(), "{:?}", test.anomalies);
+        assert!(!is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn rapid_fire_of_one_key_is_flagged() {
+        // A rapid-fire macro: the same key pressed and released every 8 ms
+        let mut test = VirtualKeyboardTest::new();
+        let at = type_normally(&mut test, Instant::now());
+        for i in 0..10u64 {
+            tap(&mut test, KeyCode(57), at + ms(8 * i), ms(3));
+        }
+        assert!(test
+            .anomalies
+            .iter()
+            .any(|a| a.description.contains("keys in 50ms")));
+        assert!(is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    #[test]
+    fn machine_regular_typing_is_flagged() {
+        // Auto-type: every key pressed and released, a new key every 12.0 ms
+        let mut test = VirtualKeyboardTest::new();
+        let t0 = Instant::now();
+        for i in 0..20u64 {
+            tap(
+                &mut test,
+                KeyCode(16 + (i % 10) as u16),
+                t0 + ms(12 * i),
+                ms(3),
+            );
+        }
+        assert!(test
+            .anomalies
+            .iter()
+            .any(|a| a.description.contains("Perfect timing")));
+        assert!(is_flagged_virtual(&test), "{:?}", test.classification());
+    }
+
+    // --- Physical vs virtual check (K-A7) --------------------------------
+
+    #[test]
+    fn injected_keys_alone_are_not_physical_evidence() {
+        let mut test = VirtualKeyboardTest::new();
+        let t0 = Instant::now();
+        let sent_at = start_check(&mut test, t0);
+        for (i, key) in [KEY_Z, KEY_X, KEY_C].into_iter().enumerate() {
+            tap(&mut test, key, sent_at + ms(10 + i as u64), ms(20));
+        }
+        test.tick_at(sent_at + INJECTION_WINDOW);
+        // Used to be "Keyboard OK" because z, x, c counted as physical presses
+        assert_eq!(test.diagnostic(), DiagnosticResult::Inconclusive);
+    }
+
+    #[test]
+    fn trigger_press_and_injected_keys_give_ok_without_another_key() {
+        let t0 = Instant::now();
+        // Terminal order: the 'v' press is processed after the send ...
+        let mut late = VirtualKeyboardTest::new();
+        let sent_at = start_check(&mut late, t0);
+        late.process_event(&press_at(KEY_V, t0 - ms(1), 0));
+        // ... evdev-like order: processed before the check started
+        let mut early = VirtualKeyboardTest::new();
+        early.process_event(&press_at(KEY_V, t0 - ms(5), 0));
+        start_check(&mut early, t0);
+
+        for test in [&mut late, &mut early] {
+            for (i, key) in [KEY_Z, KEY_X, KEY_C].into_iter().enumerate() {
+                tap(test, key, sent_at + ms(10 + i as u64), ms(20));
+            }
+            // Still waiting: no verdict yet, and none needs another key press
+            test.tick_at(sent_at + ms(100));
+            assert!(test.test_mode_active);
+            assert_eq!(test.diagnostic(), test.idle_diagnostic());
+            test.tick_at(sent_at + INJECTION_WINDOW);
+            assert!(!test.test_mode_active);
+            assert_eq!(test.diagnostic(), DiagnosticResult::KeyboardOk);
+            assert!(test
+                .get_results()
+                .iter()
+                .any(|r| r.label == "Injected Keys" && r.value == "z x c arrived"));
+        }
+    }
+
+    #[test]
+    fn blocked_injection_is_an_api_issue_and_ctrl_is_not_c() {
+        let mut test = VirtualKeyboardTest::new();
+        let t0 = Instant::now();
+        let sent_at = start_check(&mut test, t0);
+        test.process_event(&press_at(KEY_V, t0, 0));
+        // The user fiddles with Ctrl / Caps Lock while waiting
+        tap(&mut test, KEY_LCTRL, sent_at + ms(50), ms(40));
+        tap(&mut test, KEY_CAPS, sent_at + ms(150), ms(40));
+        assert_eq!(test.virtual_keys_received, 0);
+        test.tick_at(sent_at + INJECTION_WINDOW);
+        assert_eq!(test.diagnostic(), DiagnosticResult::ApiIssue);
+        assert!(test
+            .get_results()
+            .iter()
+            .any(|r| r.label == "Injected Keys" && r.value == "z x c missing"));
+    }
+
+    #[test]
+    fn no_key_reaching_the_test_is_inconclusive_not_a_fault() {
+        // App paused, or the start key never reached the test: no events at
+        // all, and an old key press from long before the request.
+        let mut test = VirtualKeyboardTest::new();
+        let t0 = Instant::now() + ms(5000);
+        test.process_event(&press_at(KeyCode(30), t0 - ms(3000), 0));
+        let sent_at = start_check(&mut test, t0);
+        test.tick_at(sent_at + INJECTION_WINDOW);
+        let verdict = test.diagnostic();
+        assert_eq!(verdict, DiagnosticResult::Inconclusive);
+        assert_eq!(verdict.to_status(), ResultStatus::Info);
+    }
+
+    #[test]
+    fn evdev_input_makes_the_check_unavailable() {
+        let mut test = VirtualKeyboardTest::new();
+        test.set_input_source(InputSource::Evdev);
+        assert_eq!(test.diagnostic(), DiagnosticResult::NotAvailable);
+        test.request_virtual_test();
+        assert!(!test.has_pending_send());
+        let results = test.get_results();
+        assert!(results
+            .iter()
+            .any(|r| r.label == "Status" && r.value.starts_with("Not available")));
+        // The reason given is the real blocker: the build first, then evdev
+        let reason = if VirtualKeySender::is_available() {
+            "evdev"
+        } else {
+            "--features virtual-send"
+        };
+        assert!(
+            results.iter().any(|r| r.value.contains(reason)),
+            "{:?}",
+            results
+        );
+        assert!(!results.iter().any(|r| r.status == ResultStatus::Warning));
+        // Still unavailable after a reset
+        test.reset();
+        assert_eq!(test.diagnostic(), DiagnosticResult::NotAvailable);
+    }
+
+    #[test]
+    fn diagnose_never_guesses_hardware_or_software_faults() {
+        assert_eq!(diagnose(true, true), DiagnosticResult::KeyboardOk);
+        assert_eq!(diagnose(true, false), DiagnosticResult::ApiIssue);
+        assert_eq!(diagnose(false, true), DiagnosticResult::Inconclusive);
+        assert_eq!(diagnose(false, false), DiagnosticResult::Inconclusive);
+    }
+
+    #[test]
+    fn key_char_matches_single_character_keys_only() {
+        assert_eq!(key_char(KEY_C), Some('c'));
+        assert_eq!(key_char(KEY_LCTRL), None);
+        assert_eq!(key_char(KEY_CAPS), None);
+        assert!(is_injected_key(KEY_Z));
+        assert!(!is_injected_key(KEY_V));
     }
 }
