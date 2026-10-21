@@ -156,8 +156,8 @@ exported report and on stdout when you quit.
 Keys you press while testing never trigger a command by accident: in the test
 views (Polling ... OEM/FN, `2`-`9`) every key is test input except `Tab`,
 `Esc` and `Ctrl` chords, and in the Shortcuts view `Ctrl` combos are test
-input too (only `Ctrl+C` quits). Single-key commands only work on the
-Dashboard, Auto and Help screens.
+input too (except `Ctrl+C`, which quits). Single-key commands only work on
+the Dashboard, Auto and Help screens.
 
 | Key | Where | Action |
 |-----|-------|--------|
