@@ -347,6 +347,7 @@ impl App {
         self.hold_release_test.set_input_source(source);
         self.stickiness_test.set_input_source(source);
         self.rollover_test.set_input_source(source);
+        self.shortcut_test.set_input_source(source);
         self.virtual_test.set_input_source(source);
     }
 
@@ -746,7 +747,7 @@ impl App {
         results.push(TestResult::info(
             "Max Rollover",
             if self.rollover_test.rollover_measurable() {
-                format!("{}", self.keyboard_state.max_rollover())
+                self.rollover_test.peak_summary()
             } else {
                 "n/a (terminal input)".to_string()
             },
@@ -808,24 +809,24 @@ impl App {
 
     /// Generate a session report
     pub fn generate_report(&self) -> SessionReport {
-        SessionReport::new(
-            ReportInput {
-                start_time: self.start_time,
-                total_events: self.total_events,
-                rollover_measured: self.rollover_test.rollover_measurable(),
-                polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
-                polling: self.polling_test.get_results(),
-                hold_release: self.hold_release_test.get_results(),
-                stickiness: self.stickiness_test.get_results(),
-                rollover: self.rollover_test.get_results(),
-                event_timing: self.event_timing_test.get_results(),
-                shortcuts: self.shortcut_test.get_results(),
-                virtual_detect: self.virtual_test.get_results(),
-                oem_keys: self.oem_test.get_results(),
-                diagnostics: self.findings.iter().flat_map(|f| f.to_results()).collect(),
-            },
-            &self.keyboard_state,
-        )
+        SessionReport::new(ReportInput {
+            start_time: self.start_time,
+            total_events: self.total_events,
+            max_rollover: self
+                .rollover_test
+                .rollover_measurable()
+                .then(|| self.rollover_test.max_keys()),
+            polling_rate_hz: self.polling_test.estimated_poll_rate_hz(),
+            polling: self.polling_test.get_results(),
+            hold_release: self.hold_release_test.get_results(),
+            stickiness: self.stickiness_test.get_results(),
+            rollover: self.rollover_test.get_results(),
+            event_timing: self.event_timing_test.get_results(),
+            shortcuts: self.shortcut_test.get_results(),
+            virtual_detect: self.virtual_test.get_results(),
+            oem_keys: self.oem_test.get_results(),
+            diagnostics: self.findings.iter().flat_map(|f| f.to_results()).collect(),
+        })
     }
 
     /// Export session report to JSON file
@@ -1301,6 +1302,8 @@ mod tests {
     #[test]
     fn app_shortcut_detection_via_pipeline() {
         let mut app = App::default();
+        // A bare Ctrl press only arrives through evdev (or the kitty protocol)
+        app.set_input_source(InputSource::Evdev);
 
         // Press Ctrl (scancode 29 = Left Ctrl)
         app.process_event(&press(29, 1000));

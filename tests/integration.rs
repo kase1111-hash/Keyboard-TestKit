@@ -61,6 +61,8 @@ fn full_pipeline_processes_through_all_tests() {
 #[test]
 fn full_pipeline_shortcut_detection() {
     let mut app = App::default();
+    // A bare Ctrl press only arrives through evdev (or the kitty protocol)
+    app.set_input_source(InputSource::Evdev);
 
     // Press Ctrl+C (scancode 29=LCtrl, 46=C)
     app.process_event(&press(29, 1000));
@@ -93,6 +95,18 @@ fn full_pipeline_rollover_tracking() {
         app.process_event(&release(k, 1000));
     }
     assert_eq!(app.keyboard_state.current_rollover(), 0);
+
+    // The rating, the Dashboard and the report count Shift apart: a 6KRO
+    // keyboard held with modifiers is not "7KRO" or "NKRO"
+    app.set_input_source(InputSource::Evdev);
+    app.view = AppView::Dashboard;
+    let dash = app.current_results();
+    let max = dash.iter().find(|r| r.label == "Max Rollover").unwrap();
+    assert_eq!(max.value, "5 + 1 modifier(s)");
+    assert_eq!(app.rollover_test.rollover_rating(), "5KRO");
+    let report = app.generate_report();
+    assert_eq!(report.summary.max_rollover, Some(5));
+    assert!(report.to_text().contains("Max Rollover:    5KRO"));
 }
 
 // ---------------------------------------------------------------------------

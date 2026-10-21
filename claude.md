@@ -110,13 +110,14 @@ trait KeyboardTest {
    timestamp quantization; key-rate and gap statistics are informational
 2. **StickinessTest** - Stuck keys (still down past the threshold); released
    long holds are information only
-3. **RolloverTest** - Keys registered at once; ghost keys are shown, not
-   detected
+3. **RolloverTest** - Keys registered at once, rated without modifiers
+   (shown separately); ghost keys are shown, not detected
 4. **EventTimingTest** - Gaps between key events: typing rhythm, never a
    keyboard rating (the poll interval comes from PollingRateTest)
 5. **HoldReleaseTest** - Hold times & switch chatter (same-key re-press
    < 20-40 ms after release or < 40 ms after press, evdev only)
-6. **ShortcutTest** - System hotkey conflict detection
+6. **ShortcutTest** - Modifier combos and known system shortcuts (n/a when
+   the source does not report modifier keys)
 7. **VirtualKeyboardTest** - Physical vs virtual key comparison
 8. **OemKeyTest** - OEM/FN key capture & restoration
 9. **AutoTest** - Guided diagnostic (idle, sweep, hold, rollover, rapid tap) whose

@@ -3,7 +3,7 @@
 //! Detects modifier key combos in real-time and enumerates known
 //! system-registered hotkeys (desktop environment shortcuts on Linux).
 
-use super::{KeyboardTest, ResultStatus, TestResult};
+use super::{InputSource, KeyboardTest, ResultStatus, TestResult};
 use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
@@ -228,6 +228,9 @@ pub struct ShortcutTest {
     last_shortcut: Option<ShortcutEvent>,
     /// System-registered shortcuts discovered at startup
     system_shortcuts: Vec<SystemShortcut>,
+    /// Whether the input source reports modifier keys. Legacy terminals and
+    /// the Windows console never do, so no combo can be recorded there.
+    modifiers_reported: bool,
 }
 
 impl ShortcutTest {
@@ -242,7 +245,14 @@ impl ShortcutTest {
             start_time: None,
             last_shortcut: None,
             system_shortcuts,
+            modifiers_reported: true,
         }
+    }
+
+    /// Tell the test where events come from: combos need modifier keys,
+    /// which only evdev and the kitty keyboard protocol report.
+    pub fn set_input_source(&mut self, source: InputSource) {
+        self.modifiers_reported = source.can_report(keymap::KEY_LSHIFT);
     }
 
     /// Get system-registered shortcuts
@@ -385,27 +395,40 @@ impl KeyboardTest for ShortcutTest {
             TestResult::info("", ""),
         ];
 
-        // Current modifier state
-        let mod_status = if self.modifiers.any_held() {
-            self.modifiers.to_prefix().trim_end_matches('+').to_string()
-        } else {
-            "None".to_string()
-        };
-        results.push(TestResult::info("Modifiers Held", mod_status));
-
-        // Stats
-        results.push(TestResult::info(
-            "Total Shortcuts",
-            format!("{}", self.total_shortcuts),
-        ));
-
-        if self.conflict_count > 0 {
-            results.push(TestResult::warning(
-                "Known Conflicts",
-                format!("{}", self.conflict_count),
+        if !self.modifiers_reported {
+            // Ctrl+W arrives as a plain W: "0 conflicts" would be a result
+            // this input cannot produce
+            results.push(TestResult::info("Known Conflicts", "n/a (terminal input)"));
+            results.push(TestResult::info(
+                "Modifier keys",
+                "are not reported by this terminal;",
+            ));
+            results.push(TestResult::info(
+                "combos need evdev",
+                "(Linux) or the kitty protocol",
             ));
         } else {
-            results.push(TestResult::ok("Known Conflicts", "0"));
+            // Current modifier state
+            let mod_status = if self.modifiers.any_held() {
+                self.modifiers.to_prefix().trim_end_matches('+').to_string()
+            } else {
+                "None".to_string()
+            };
+            results.push(TestResult::info("Modifiers Held", mod_status));
+
+            // Stats
+            results.push(TestResult::info(
+                "Total Shortcuts",
+                format!("{}", self.total_shortcuts),
+            ));
+            if self.conflict_count > 0 {
+                results.push(TestResult::warning(
+                    "Known Conflicts",
+                    format!("{}", self.conflict_count),
+                ));
+            } else {
+                results.push(TestResult::ok("Known Conflicts", "0"));
+            }
         }
 
         // Last shortcut
@@ -543,6 +566,41 @@ mod tests {
         }
         assert_eq!(test.total_shortcuts(), 0);
         assert_eq!(test.conflict_count(), 0);
+    }
+
+    #[test]
+    fn terminal_without_modifier_keys_does_not_claim_no_conflicts() {
+        // Ctrl+W through a legacy terminal or the Windows console arrives
+        // as a plain W: nothing can be recorded, so no green "0"
+        let mut sources = vec![InputSource::TerminalPressOnly];
+        if cfg!(windows) {
+            // The console API reports releases but not Shift/Ctrl/Alt
+            sources.push(InputSource::TerminalWithRelease);
+        }
+        for source in sources {
+            let mut test = ShortcutTest::new();
+            test.set_input_source(source);
+            chord(&mut test, &[KeyCode(17)]);
+            let results = test.get_results();
+            let conflicts = results
+                .iter()
+                .find(|r| r.label == "Known Conflicts")
+                .unwrap();
+            assert_eq!(conflicts.status, ResultStatus::Info);
+            assert!(conflicts.value.contains("n/a"), "{:?}", conflicts);
+            assert!(!results.iter().any(|r| r.status == ResultStatus::Ok));
+        }
+        // Evdev (and the kitty protocol) report modifiers: a real count
+        let mut test = ShortcutTest::new();
+        test.set_input_source(InputSource::Evdev);
+        chord(&mut test, &[KEY_LCTRL, KeyCode(17)]);
+        let results = test.get_results();
+        let conflicts = results
+            .iter()
+            .find(|r| r.label == "Known Conflicts")
+            .unwrap();
+        assert_eq!(conflicts.status, ResultStatus::Warning);
+        assert_eq!(conflicts.value, "1");
     }
 
     #[test]

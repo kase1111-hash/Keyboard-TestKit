@@ -14,7 +14,7 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 | **Bounce** | Identify mechanical key bounce and measure hold/release timing |
 | **N-Key Rollover** | Test simultaneous key capability (ghost keys are shown, not auto-detected) |
 | **Timing** | Gaps between key events: typing-rhythm statistics, not a keyboard rating |
-| **Shortcuts** | Detect system hotkey conflicts intercepting input |
+| **Shortcuts** | Record modifier combos and flag known system shortcuts (needs evdev or the kitty keyboard protocol) |
 | **Virtual** | Check that injected keys reach the app, and flag automated (non-human) input |
 | **OEM/FN** | OEM key detection, capture, and FN key remapping |
 | **Auto** | Guided automatic diagnostic that finds issues for you (dead, stuck and chattering keys, phantom input, limited rollover, polling rate, keyboard disconnects) |
@@ -201,9 +201,9 @@ between views or Settings values may repeat).
 2. **Polling** - Report-rate estimate from evdev timestamps, plus key-rate statistics
 3. **Bounce** - Key bounce detection and hold duration analysis
 4. **Sticky** - Stuck key detection with a configurable threshold (needs real key releases)
-5. **NKRO** - N-key rollover testing (needs real key releases); watch Active Keys for ghost keys
+5. **NKRO** - N-key rollover testing (needs real key releases); the rating counts keys other than modifiers, which are shown next to it; watch Active Keys for ghost keys
 6. **Timing** - Informational gaps between key events (the keyboard's report interval is in Polling)
-7. **Shortcuts** - System hotkey conflict detection
+7. **Shortcuts** - Modifier combos pressed, flagging known system shortcuts (n/a where the terminal does not report modifier keys)
 8. **Virtual** - Physical vs virtual keyboard comparison
 9. **OEM/FN** - OEM key capture and FN key remapping
 0. **Auto** - Guided automatic diagnostic with ranked findings
