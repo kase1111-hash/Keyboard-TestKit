@@ -185,7 +185,7 @@ impl Widget for HelpPanel {
                     ("3", "Bounce"),
                     ("4", "Sticky"),
                     ("5", "NKRO"),
-                    ("6", "Latency"),
+                    ("6", "Timing"),
                     ("7", "Shortcuts"),
                     ("8", "Virtual"),
                     ("9", "OEM/FN"),

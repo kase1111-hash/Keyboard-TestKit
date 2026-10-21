@@ -9,15 +9,15 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 
 | Test | Description |
 |------|-------------|
-| **Polling Rate** | Measure keyboard Hz (125-8000Hz) with jitter detection |
-| **Stickiness** | Detect stuck or unresponsive keys |
+| **Polling Rate** | Estimate the keyboard's report rate (125/250/500 Hz) from evdev timestamps; 1000 Hz+ and Bluetooth show no grid |
+| **Stickiness** | Detect keys that stay down (stuck) |
 | **Bounce** | Identify mechanical key bounce and measure hold/release timing |
 | **N-Key Rollover** | Test simultaneous key capability (ghost keys are shown, not auto-detected) |
 | **Timing** | Gaps between key events: typing-rhythm statistics, not a keyboard rating |
 | **Shortcuts** | Detect system hotkey conflicts intercepting input |
 | **Virtual** | Check that injected keys reach the app, and flag automated (non-human) input |
 | **OEM/FN** | OEM key detection, capture, and FN key remapping |
-| **Auto** | Guided automatic diagnostic that finds issues for you (dead, stuck and chattering keys, phantom input, limited rollover, polling rate) |
+| **Auto** | Guided automatic diagnostic that finds issues for you (dead, stuck and chattering keys, phantom input, limited rollover, polling rate, keyboard disconnects) |
 
 ## Screenshots
 
@@ -40,7 +40,7 @@ A portable, single-executable keyboard testing and diagnostic utility with a ter
 │ │ Total Events    47                                                      │ │
 │ │ Keys Pressed    4                                                       │ │
 │ │ Max Rollover    4                                                       │ │
-│ │ Est. Poll Rate  1000 Hz                                                 │ │
+│ │ Est. Poll Rate  125 Hz                                                  │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ RUNNING │ Dashboard │ 00:12 │ Events: 47 │ Tab: switch │ q: quit           │
@@ -124,13 +124,15 @@ On Linux, run with `sudo` (or add your user to the `input` group) so the app
 can read the keyboard through evdev: that gives raw scancodes, kernel
 timestamps and real key-release events. If a keyboard is unplugged or a
 wireless keyboard loses its link, the status line says so (a running auto
-test stops) and the keyboard is picked up again when it comes back. Without
-evdev the terminal is used as the input source; terminals that speak the kitty
-keyboard protocol (kitty, WezTerm, foot, Ghostty, Alacritty 0.13+) still report
-key releases, other terminals only report presses: a key reported again
-within 200 ms is counted as a new press (unless it comes faster than a finger
-can press, which is autorepeat), a held key is recognised by its autorepeat,
-and releases are estimated, so hold times and rollover cannot be measured.
+test stops), the disconnect is listed as a finding, and the keyboard is
+picked up again when it comes back. Without evdev the terminal is used as the
+input source; terminals that speak the kitty keyboard protocol (kitty,
+WezTerm, foot, Ghostty, Alacritty 0.13+) still report key releases, other
+terminals only report presses: a key reported again within 200 ms is counted
+as a new press (unless it comes faster than a finger can press, which is
+autorepeat), a held key is recognised by its autorepeat, and releases are
+estimated, so hold times, stuck keys and rollover cannot be measured: those
+views show "n/a (terminal input)" instead of a number.
 
 ### Automatic Diagnostic
 
@@ -141,14 +143,17 @@ auto test runs five short steps and then writes a ranked list of findings:
 |------|--------|---------------|
 | Idle check | Nothing for 3 s | Phantom input, keys already stuck |
 | Key sweep | Press every key once (`Ctrl+N` if your keyboard lacks one) | Dead keys, keys that never release |
-| Hold & release | Hold a letter key or Space ~1 s | Release reporting, stuck keys |
+| Hold & release | Hold a letter key or Space ~1 s | Release reporting |
 | Rollover | Hold 6 or more letter keys at once | Limited N-key rollover |
 | Rapid tap | Tap one key quickly with one finger | Switch chatter, polling rate (both evdev only) |
 
-Only evdev sees every key. Through a terminal the sweep leaves out keys the
-terminal cannot report (modifiers and CapsLock without the kitty protocol, the
-ISO/JIS extra keys) and lists them as not checked, and a key that never
-registers is reported as "not registered" rather than dead.
+Hold & release and Rollover need real key releases, so they are skipped on
+terminals that only report presses. Only evdev sees every key. Through a
+terminal the sweep leaves out keys the terminal cannot report (modifiers and
+CapsLock without the kitty protocol, the ISO/JIS extra keys) and lists them as
+not checked, and a key that never registers is reported as "not registered"
+rather than dead. A key that is held down (jammed) through the sweep is
+reported as stuck, not dead.
 
 While the auto test runs every key is treated as test input, so `q`, `r`,
 `Esc` and the other shortcuts can be verified like any other key. `Ctrl+N`
@@ -167,7 +172,7 @@ the Dashboard, Auto and Help screens.
 | Key | Where | Action |
 |-----|-------|--------|
 | `Tab` / `Shift+Tab` | Any view | Next / previous view |
-| `Esc` / `Ctrl+C` | Any view | Quit (`Ctrl+C` aborts a running auto test) |
+| `Esc` / `Ctrl+C` | Any view | Quit (`Ctrl+C` aborts a running auto test; `Esc` leaves Settings) |
 | `Ctrl+P` | Any view but Shortcuts | Pause/resume testing |
 | `Ctrl+R` | Any view but Shortcuts | Reset the current test |
 | `Ctrl+E` | Any view but Shortcuts | Export report to JSON |
@@ -188,10 +193,10 @@ the Dashboard, Auto and Help screens.
 ### Test Views
 
 1. **Dashboard** - Overview with session stats and real-time metrics
-2. **Polling** - Keyboard polling rate (Hz) with min/max/average
+2. **Polling** - Report-rate estimate from evdev timestamps, plus key-rate statistics
 3. **Bounce** - Key bounce detection and hold duration analysis
-4. **Sticky** - Stuck key detection with configurable thresholds
-5. **NKRO** - N-key rollover testing; watch Active Keys for ghost keys
+4. **Sticky** - Stuck key detection with a configurable threshold (needs real key releases)
+5. **NKRO** - N-key rollover testing (needs real key releases); watch Active Keys for ghost keys
 6. **Timing** - Informational gaps between key events (the keyboard's report interval is in Polling)
 7. **Shortcuts** - System hotkey conflict detection
 8. **Virtual** - Physical vs virtual keyboard comparison
@@ -207,21 +212,23 @@ Default configuration values (in `src/config.rs`):
 |---------|---------|-------------|
 | `polling.test_duration_secs` | 10 | Duration for polling rate test |
 | `stickiness.stuck_threshold_ms` | 2000 | Time before key is considered stuck |
-| `hold_release.bounce_window_ms` | 20 | A same-key press this soon after its release is a bounce (20-40; older 5 ms values are raised to 20) |
+| `hold_release.bounce_window_ms` | 20 | A same-key press this soon after its release is a bounce (20-40, also in Settings; older 5 ms values load as 20) |
 | `ui.refresh_rate_hz` | 60 | UI refresh rate |
 
 Out-of-range values in a hand-edited `config.toml` are clamped when it is
-loaded (for example `ui.refresh_rate_hz` to 10-240 Hz and
-`stickiness.stuck_threshold_ms` to 250-60000 ms; see `src/config.rs` for all
-ranges), and missing entries fall back to their defaults. A stuck threshold
-below 250 ms, such as the 50 ms that older versions saved as their default,
-is replaced by the 2000 ms default.
+loaded (for example `ui.refresh_rate_hz` to 10-240 Hz,
+`stickiness.stuck_threshold_ms` to 250-60000 ms and
+`polling.test_duration_secs` to 5-3600 s; see `src/config.rs` for all
+ranges), and missing entries fall back to their defaults. The Settings view
+(`S`) stays within the same ranges. A stuck threshold below 250 ms, such as
+the 50 ms that older versions saved as their default, is replaced by the
+2000 ms default.
 
 A key counts as stuck only while it is still down past the threshold. Keys
 you held that long and then released are listed as long holds in the Sticky
 view, not as faults (if you did not hold one that long, the key is
-sticking). While paused (`Space`) nothing new is recorded, but keys that were
-already down still register their release.
+sticking). While paused (`Space` or `Ctrl+P`) nothing new is recorded, but
+keys that were already down still register their release.
 
 ## Diagnostic Logic
 
@@ -239,7 +246,16 @@ With evdev input the check is unavailable, because injected keys bypass the
 keyboard device. Faults of individual keys are found by the auto test's sweep.
 
 Bounce and polling-rate results need evdev's kernel timestamps; with terminal
-input those views show "n/a (terminal input)" instead of a result.
+input those views show "n/a (terminal input)" instead of a result. Stuck keys
+and rollover need real key releases, so a terminal that only reports presses
+shows "n/a (terminal input)" there too (and `max_rollover` is `null` in the
+exported report).
+
+A keyboard that disconnects (evdev) is reported as a "Connection" warning on
+the Dashboard, in the exported report and on exit. An unplug you made on
+purpose, or a wireless keyboard going to sleep, looks the same, so the
+finding is worded as a condition; resetting all tests (`R`) or starting the
+auto test clears it.
 
 ## Export
 
@@ -251,11 +267,11 @@ Press `Ctrl+E` (or `e` on the Dashboard, Auto and Help screens) to export a JSON
   "summary": {
     "total_events": 1543,
     "max_rollover": 6,
-    "estimated_polling_rate_hz": 1000.0,
+    "estimated_polling_rate_hz": 125.0,
     "issues_detected": 1
   },
   "tests": {
-    "polling": [ { "label": "Est. Poll Rate", "value": "1000 Hz ...", "status": "ok" } ],
+    "polling": [ { "label": "Est. Poll Rate", "value": "125 Hz (report every 8 ms)", "status": "info" } ],
     "rollover": [ ... ],
     "diagnostics": [
       { "label": "Switch bounce", "value": "3 bounce(s) on 1 key(s)", "status": "error" },

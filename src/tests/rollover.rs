@@ -6,7 +6,10 @@ use crate::keyboard::{keymap, KeyCode, KeyEvent, KeyEventType};
 use std::collections::HashSet;
 use std::time::Instant;
 
-/// Test for N-Key Rollover and ghosting detection
+/// Test for N-Key Rollover: how many keys register at once.
+///
+/// Ghost keys are shown (Active Keys) but not detected automatically: a ghost
+/// arrives as an ordinary press (see [`RolloverTest::ghost_count`]).
 pub struct RolloverTest {
     /// Currently pressed keys
     pressed_keys: HashSet<KeyCode>,

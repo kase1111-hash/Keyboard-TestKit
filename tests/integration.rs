@@ -444,6 +444,48 @@ fn keyboard_disconnect_is_a_finding_everywhere_not_only_at_exit() {
 }
 
 #[test]
+fn key_stuck_before_the_auto_test_starts_is_reported_as_stuck() {
+    // Backspace jammed down 10 s ago; the user then presses Shift+A to
+    // start the auto test. Starting must not forget the jammed key (the idle
+    // step is there to catch it), nor flag the Shift used to type 'A'.
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    let jammed = Instant::now() - Duration::from_secs(10);
+    app.process_event(&timed(14, KeyEventType::Press, jammed, 0));
+    app.process_event(&timed(42, KeyEventType::Press, Instant::now(), 0));
+    app.start_auto_test();
+    app.process_event(&timed(42, KeyEventType::Release, Instant::now(), 0));
+    app.tick();
+    app.refresh_findings();
+
+    let stuck = app
+        .findings
+        .iter()
+        .find(|f| f.category == "Stuck key")
+        .expect("stuck key finding");
+    assert_eq!(stuck.severity, Severity::Critical);
+    assert!(
+        stuck.detail.starts_with("Backspace (10."),
+        "{}",
+        stuck.detail
+    );
+    assert!(!stuck.detail.contains("Shift"), "{}", stuck.detail);
+    assert!(
+        !app.findings.iter().any(|f| f.category == "Phantom input"),
+        "{:?}",
+        app.findings
+    );
+
+    // Released keys from before the run stay forgotten: a clean slate
+    let mut app = App::default();
+    app.set_input_source(InputSource::Evdev);
+    tap(&mut app, 30, 1000);
+    app.start_auto_test();
+    assert_eq!(app.keyboard_state.total_events(), 0);
+    assert!(app.stickiness_test.held_keys().is_empty());
+}
+
+#[test]
 fn export_includes_findings_from_the_last_moment() {
     // A bounce typed right before Ctrl+E (no tick in between) is in the file
     let mut app = App::default();

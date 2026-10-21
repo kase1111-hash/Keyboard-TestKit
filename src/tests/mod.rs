@@ -6,12 +6,12 @@
 //!
 //! | Test | Description |
 //! |------|-------------|
-//! | [`PollingRateTest`] | Measures keyboard polling frequency (Hz) and jitter |
+//! | [`PollingRateTest`] | Estimates the keyboard's report rate from evdev timestamp quantization |
 //! | [`StickinessTest`] | Detects stuck keys that fail to release properly |
-//! | [`RolloverTest`] | Tests N-Key Rollover (NKRO) and ghosting detection |
-//! | [`EventTimingTest`] | Measures inter-event timing intervals per-key and globally |
+//! | [`RolloverTest`] | Counts keys registered at once (NKRO); ghost keys are shown, not detected |
+//! | [`EventTimingTest`] | Gaps between key events: typing-rhythm statistics, not a keyboard rating |
 //! | [`HoldReleaseTest`] | Analyzes key hold duration and mechanical bounce |
-//! | [`ShortcutTest`] | Validates keyboard shortcut combinations |
+//! | [`ShortcutTest`] | Records modifier combos and flags known system shortcuts |
 //! | [`VirtualKeyboardTest`] | Compares physical vs virtual key events |
 //! | [`OemKeyTest`] | Captures OEM keys and provides FN key restoration |
 //! | [`AutoTest`] | Guided automatic diagnostic that turns all of the above into findings |

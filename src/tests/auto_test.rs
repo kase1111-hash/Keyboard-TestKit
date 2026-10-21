@@ -6,8 +6,8 @@
 //!
 //! The steps are:
 //!
-//! 1. **Idle** – hands off the keyboard; any event is a phantom key press or a
-//!    key that is already stuck.
+//! 1. **Idle** – hands off the keyboard; any event is a phantom key press,
+//!    and a key already held down when the run started shows up as stuck.
 //! 2. **Sweep** – press every key of the main block once; keys that never
 //!    register are reported as dead, keys that never release as stuck. Only
 //!    keys the input source can report are expected, and only evdev can call
@@ -959,10 +959,21 @@ impl AutoTest {
         // --- Sweep step: dead / unreleased keys ---------------------------
         match self.outcome_of(StepKind::Sweep) {
             Some(StepOutcome::TimedOut) => {
-                findings.extend(missing_key_findings(
-                    self.input_source,
-                    &self.sweep_missing(),
-                ));
+                // A key held down through the sweep (jammed, or down since
+                // before the run) cannot send a new press, but it did
+                // register: it is a stuck key or a long hold, not dead.
+                let held_down: HashSet<KeyCode> = ctx
+                    .stickiness
+                    .flagged_keys()
+                    .into_iter()
+                    .map(|(k, _, _)| k)
+                    .collect();
+                let missing: Vec<KeyCode> = self
+                    .sweep_missing()
+                    .into_iter()
+                    .filter(|k| !held_down.contains(k))
+                    .collect();
+                findings.extend(missing_key_findings(self.input_source, &missing));
             }
             Some(StepOutcome::Skipped | StepOutcome::Aborted) => {
                 let missing = self.sweep_missing();
@@ -2001,6 +2012,47 @@ mod tests {
         assert_eq!(dead.severity, Severity::Critical);
         assert!(dead.title.starts_with("2 key(s)"));
         assert!(dead.detail.contains('S') && dead.detail.contains('D'));
+    }
+
+    #[test]
+    fn key_held_down_through_the_sweep_is_stuck_not_dead() {
+        // Backspace jammed since before the run never sends a press in the
+        // sweep. It is reported as stuck (and later as a long hold if it
+        // frees up), not as a dead key with "replace the switch" advice.
+        let mut parts = ctx_parts();
+        let jammed = Instant::now() - Duration::from_secs(150);
+        parts
+            .2
+            .process_event(&evt(14, KeyEventType::Press, jammed, 0));
+        parts.2.check_stuck_keys();
+        let mut t = AutoTest::new(InputSource::Evdev);
+        t.set_expected_keys(vec![KeyCode(14), KeyCode(30), KeyCode(31)]);
+        let t0 = Instant::now();
+        t.start_at(t0);
+        t.tick_at(t0 + IDLE_DURATION);
+        t.process_event(&evt(
+            30,
+            KeyEventType::Press,
+            t0 + Duration::from_secs(4),
+            0,
+        ));
+        t.tick_at(t0 + IDLE_DURATION + StepKind::Sweep.timeout());
+        // (Held keys are not judged during the hold step that follows)
+        t.abort();
+        let findings = t.analyze(&ctx!(parts));
+        let dead = findings.iter().find(|f| f.category == "Dead keys").unwrap();
+        assert_eq!(dead.detail, "Keys: S");
+        assert!(findings
+            .iter()
+            .any(|f| f.category == "Stuck key" && f.detail.starts_with("Backspace")));
+
+        parts
+            .2
+            .process_event(&evt(14, KeyEventType::Release, Instant::now(), 0));
+        let findings = t.analyze(&ctx!(parts));
+        let dead = findings.iter().find(|f| f.category == "Dead keys").unwrap();
+        assert_eq!(dead.detail, "Keys: S");
+        assert!(findings.iter().any(|f| f.category == "Long hold"));
     }
 
     #[test]

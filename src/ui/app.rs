@@ -513,11 +513,29 @@ impl App {
 
     /// Start the automatic diagnostic and switch to its view.
     pub fn start_auto_test(&mut self) {
+        // Keys down right now (a jammed key, the Shift used to type 'A'): a
+        // key that went down before the run sends no new press, so forgetting
+        // it would hide a stuck key from the idle step and the sweep would
+        // call it dead. Their presses are carried over, with the original
+        // times, to the trackers that judge held keys.
+        let held: Vec<KeyEvent> = self
+            .keyboard_state
+            .pressed_keys()
+            .iter()
+            .filter_map(|&key| {
+                let pressed_at = self.keyboard_state.get_key_state(key)?.last_press?;
+                Some(KeyEvent::new(key, KeyEventType::Press, pressed_at, 0))
+            })
+            .collect();
         // Give the run a clean slate so old data does not pollute the findings
         // (a keyboard replugged before the run is not a fault of the run)
         self.keyboard_state.reset();
         for test in self.all_tests_mut() {
             test.reset();
+        }
+        for press in &held {
+            self.keyboard_state.process_event(press);
+            self.stickiness_test.process_event(press);
         }
         self.disconnects = DisconnectLog::default();
         self.total_events = 0;

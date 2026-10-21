@@ -4,12 +4,17 @@
 //!
 //! ## Features
 //!
-//! - **Polling Rate Testing**: Measure keyboard polling frequency (Hz) with jitter detection
-//! - **Stickiness Detection**: Identify stuck or unresponsive keys
-//! - **Bounce Detection**: Test key hold duration and detect mechanical bounce
-//! - **N-Key Rollover (NKRO)**: Measure simultaneous key capability and ghosting
-//! - **Event Timing**: Measure inter-event timing per-key and globally
-//! - **Virtual Keyboard Testing**: Compare physical vs virtual key events
+//! - **Polling Rate**: Estimate the report rate (125/250/500 Hz) from evdev timestamps
+//! - **Stickiness Detection**: Identify keys that stay down
+//! - **Bounce Detection**: Test key hold duration and detect switch chatter (evdev)
+//! - **N-Key Rollover (NKRO)**: Count keys registered at once (needs real releases)
+//! - **Event Timing**: Gaps between key events (typing rhythm, informational)
+//! - **Virtual Keyboard Testing**: Check that injected keys reach the app
+//! - **Auto Test**: Guided diagnostic that turns all of the above into findings
+//!
+//! Results a given input source cannot measure (terminal timestamps, guessed
+//! releases) are shown as "n/a" rather than guessed; see
+//! [`tests::InputSource`].
 //!
 //! ## Architecture
 //!
