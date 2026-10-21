@@ -375,6 +375,14 @@ impl App {
         self.disconnects.count
     }
 
+    /// Tell the tests which keys' events in the batch about to be processed
+    /// came from a wireless keyboard (see `EvdevListener::take_wireless_keys`;
+    /// call before every batch): a radio stall can look like switch chatter,
+    /// which the bounce findings then say.
+    pub fn note_wireless_keys(&mut self, keys: &[crate::keyboard::KeyCode]) {
+        self.hold_release_test.note_wireless_keys(keys);
+    }
+
     /// Tell the app where key events come from. Call once at startup.
     pub fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;

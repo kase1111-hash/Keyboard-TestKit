@@ -26,6 +26,7 @@
 //! [`AutoTest::analyze`] can also be run at any time, without the guided
 //! sequence, to get live findings from whatever has been typed so far.
 
+use super::bounce::bounces_are_fault;
 use super::{
     EventTimingTest, HoldReleaseTest, OemKeyTest, PollingRateTest, ResultStatus, RolloverTest,
     ShortcutTest, StickinessTest, TestResult, VirtualKeyboardTest,
@@ -1061,7 +1062,10 @@ impl AutoTest {
         // reads them, so a press and release read in one burst look like a
         // bounce (e.g. over SSH or while the app is busy drawing).
         if self.input_source.has_precise_timestamps() {
-            findings.extend(bounce_finding(&ctx.hold_release.bouncy_keys()));
+            let hold_release = ctx.hold_release;
+            findings.extend(bounce_finding(&hold_release.bouncy_keys(), |key| {
+                hold_release.wireless_bounces(key)
+            }));
         } else {
             if self.step_was_run(StepKind::RapidTap) && self.rapid_presses > 0 {
                 findings.push(Finding::new(
@@ -1664,50 +1668,94 @@ fn phantom_finding(events: &[(KeyCode, KeyEventType)]) -> Option<Finding> {
     })
 }
 
-/// The finding for keys that bounced (see [`HoldReleaseTest::bouncy_keys`]).
+/// The finding for keys that bounced (see [`HoldReleaseTest::bouncy_keys`]);
+/// `over_wireless` says how many of a key's bounces came from a wireless
+/// keyboard.
 ///
-/// One doubled keystroke may be a worn switch, but also a wireless keyboard
-/// whose delayed report reached the computer together with the next one,
-/// which kernel timestamps cannot tell apart. A key that bounces again is a
-/// fault; a single bounce is a Warning worded as a condition.
-fn bounce_finding(bouncy: &[(KeyCode, u32)]) -> Option<Finding> {
+/// Only re-presses with a contact no finger makes are counted, so a radio
+/// report delivered late (a fast double letter arriving with no gap) is not
+/// a bounce. A key that bounces again is a fault, a single bounce a Warning
+/// worded as a condition (see [`bounces_are_fault`]). Over a wireless link a
+/// stall that delivers a whole keystroke at once has the shape of a bounce,
+/// so there it stays a Warning that says so.
+fn bounce_finding(
+    bouncy: &[(KeyCode, u32)],
+    over_wireless: impl Fn(KeyCode) -> u32,
+) -> Option<Finding> {
     if bouncy.is_empty() {
         return None;
     }
-    let mut bouncy = bouncy.to_vec();
-    bouncy.sort_by_key(|(k, n)| (std::cmp::Reverse(*n), k.0));
-    let total: u32 = bouncy.iter().map(|(_, n)| n).sum();
+    let mut bouncy: Vec<(KeyCode, u32, u32)> = bouncy
+        .iter()
+        .map(|(k, n)| (*k, *n, over_wireless(*k)))
+        .collect();
+    bouncy.sort_by_key(|(k, n, _)| (std::cmp::Reverse(*n), k.0));
+    let total: u32 = bouncy.iter().map(|(_, n, _)| n).sum();
     let detail = bouncy
         .iter()
         .take(6)
-        .map(|(k, n)| {
+        .map(|(k, n, wireless)| {
             let plural = if *n == 1 { "" } else { "s" };
-            format!("{} ({} bounce{})", keymap::get_key_info(*k).name, n, plural)
+            let link = match *wireless {
+                0 => String::new(),
+                w if w == *n => ", wireless".to_string(),
+                w => format!(", {} wireless", w),
+            };
+            format!(
+                "{} ({} bounce{}{})",
+                keymap::get_key_info(*k).name,
+                n,
+                plural,
+                link
+            )
         })
         .collect::<Vec<_>>()
         .join(", ");
-    Some(if bouncy.iter().any(|(_, n)| *n >= 2) {
+    let wireless_note = if bouncy.iter().any(|(_, _, wireless)| *wireless > 0) {
+        " Over a wireless link, a radio stall that delivers a whole keystroke at once \
+         looks the same: reset (R) and retest on the cable or next to the receiver; if \
+         the key still bounces there, it is the switch."
+    } else {
+        ""
+    };
+    let advice = |text: &str| format!("{}{}", text, wireless_note);
+    let finding = if bouncy.iter().any(|(_, n, w)| bounces_are_fault(*n, *w)) {
         Finding::new(
             Severity::Critical,
             "Switch bounce",
             format!("{} bounce(s) on {} key(s)", total, bouncy.len()),
             detail,
-            "Contact bounce causes doubled characters. Clean the switch or increase \
-             firmware debounce; replace the switch if it continues. (A wireless keyboard \
-             can look the same when radio reports are delayed: retest it close to the \
-             receiver or with the cable.)",
+            advice(
+                "Contact bounce causes doubled characters. Clean the switch or increase \
+                 firmware debounce; replace the switch if it continues.",
+            ),
         )
-    } else {
+    } else if bouncy.iter().all(|(_, n, _)| *n == 1) {
         Finding::new(
             Severity::Warning,
             "Switch bounce",
             format!("{} key(s) registered one press twice", bouncy.len()),
             detail,
-            "A worn switch, or a wireless keyboard delivering a delayed report together \
-             with the next one. Press the key several times: if it bounces again, clean or \
-             replace the switch.",
+            advice(
+                "The switch closed for less time than a finger holds a key: usually a \
+                 worn or dirty switch. Press the key several times: if it bounces again, \
+                 clean or replace the switch.",
+            ),
         )
-    })
+    } else {
+        // Repeated, but no key bounced twice in events from a cable
+        Finding::new(
+            Severity::Warning,
+            "Switch bounce",
+            format!("{} bounce(s) on {} key(s)", total, bouncy.len()),
+            detail,
+            advice(
+                "Contact bounce causes doubled characters, but on the keys marked \
+                 wireless it cannot be told from the radio link.",
+            ),
+        )
+    };
+    Some(finding)
 }
 
 /// The finding for a hold step that timed out.
@@ -2593,8 +2641,7 @@ mod tests {
 
     #[test]
     fn a_single_bounce_is_a_conditional_warning() {
-        // One doubled keystroke: a worn switch, or a wireless keyboard whose
-        // delayed release arrived together with the next press
+        // One doubled keystroke is worth a look, not yet a pattern
         let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
         let mut parts = ctx_parts();
         let s = t0 + Duration::from_secs(1);
@@ -2606,8 +2653,147 @@ mod tests {
             .expect("bounce finding");
         assert_eq!(bounce.severity, Severity::Warning);
         assert_eq!(bounce.detail, "A (1 bounce)");
-        assert!(bounce.advice.contains("wireless"), "{}", bounce.advice);
         assert!(bounce.advice.contains("if it bounces again"));
+        // A wired keyboard has no radio to blame
+        assert!(!bounce.advice.contains("wireless"), "{}", bounce.advice);
+    }
+
+    /// Taps of `key` every 90 ms (35 ms down) from `at` on a wireless
+    /// keyboard whose radio holds every release back until the next press
+    /// (0.1 ms before it): normal fast tapping with no gaps at all.
+    fn radio_bunched_taps(key: u16, at: Instant, count: u64) -> Vec<KeyEvent> {
+        let ms = Duration::from_millis;
+        let mut events = Vec::new();
+        for i in 0..count {
+            let down = at + ms(i * 90);
+            events.push(evt(key, KeyEventType::Press, down, 0));
+            let up = if i + 1 == count {
+                down + ms(35)
+            } else {
+                down + ms(90) - Duration::from_micros(100)
+            };
+            events.push(evt(key, KeyEventType::Release, up, 0));
+        }
+        events
+    }
+
+    #[test]
+    fn radio_bunched_tapping_is_not_chatter() {
+        // A healthy Bluetooth keyboard during the rapid-tap step: every
+        // release arrives late, together with the next press
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        let events = radio_bunched_taps(30, s, 50);
+        parts.1.note_wireless_keys(&[KeyCode(30)]);
+        feed_both(&mut t, &mut parts.1, &events);
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+
+        // Not flagged on a keyboard taken for wired either (a receiver
+        // whose name gives nothing away)
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        feed_both(&mut t, &mut parts.1, &radio_bunched_taps(30, s, 50));
+        let findings = t.analyze(&ctx!(parts));
+        assert!(!findings.iter().any(Finding::is_issue), "{:?}", findings);
+    }
+
+    #[test]
+    fn bounces_over_a_wireless_link_stay_a_warning_that_says_so() {
+        // Three stalls of a 2.4 GHz link that each delivered a whole tap
+        // (release, press, release) at once: the shape of a release bounce,
+        // but a radio can do it again and again, so it is not a verdict
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        parts.1.note_wireless_keys(&[KeyCode(30)]);
+        let s = t0 + Duration::from_secs(1);
+        let us = Duration::from_micros;
+        let mut events = Vec::new();
+        for i in 0..3u64 {
+            let down = s + Duration::from_millis(i * 400);
+            let burst = down + Duration::from_millis(150);
+            events.push(evt(30, KeyEventType::Press, down, 0));
+            events.push(evt(30, KeyEventType::Release, burst, 0));
+            events.push(evt(30, KeyEventType::Press, burst + us(80), 0));
+            events.push(evt(30, KeyEventType::Release, burst + us(160), 0));
+        }
+        feed_both(&mut t, &mut parts.1, &events);
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .expect("bounce finding");
+        assert_eq!(bounce.severity, Severity::Warning);
+        assert_eq!(bounce.detail, "A (3 bounces, wireless)");
+        assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
+        assert!(bounce.advice.contains("cable"), "{}", bounce.advice);
+
+        // A wired key that chatters twice next to it is still a fault, and
+        // the wireless key keeps its caveat
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &taps(31, s + Duration::from_secs(3), 5, &[1, 3]),
+        );
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .unwrap();
+        assert_eq!(bounce.severity, Severity::Critical);
+        assert_eq!(bounce.detail, "A (3 bounces, wireless), S (2 bounces)");
+        assert!(bounce.advice.contains("wireless link"), "{}", bounce.advice);
+    }
+
+    #[test]
+    fn a_key_typed_on_a_wireless_and_a_wired_keyboard_is_judged_by_its_wired_bounces() {
+        // A laptop with a Bluetooth keyboard: a radio stall on A over the
+        // Bluetooth keyboard, then A chatters twice on the laptop's own
+        let (mut t, t0) = run_at_step(InputSource::Evdev, StepKind::RapidTap);
+        let mut parts = ctx_parts();
+        let s = t0 + Duration::from_secs(1);
+        let burst = s + Duration::from_millis(150);
+        let us = Duration::from_micros;
+        parts.1.note_wireless_keys(&[KeyCode(30)]);
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &[
+                evt(30, KeyEventType::Press, s, 0),
+                evt(30, KeyEventType::Release, burst, 0),
+                evt(30, KeyEventType::Press, burst + us(80), 0),
+                evt(30, KeyEventType::Release, burst + us(160), 0),
+            ],
+        );
+        parts.1.note_wireless_keys(&[]);
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &taps(30, s + Duration::from_secs(1), 5, &[1]),
+        );
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .expect("bounce finding");
+        // One on each link: not a pattern yet
+        assert_eq!(bounce.severity, Severity::Warning);
+        assert_eq!(bounce.detail, "A (2 bounces, 1 wireless)");
+
+        feed_both(
+            &mut t,
+            &mut parts.1,
+            &taps(30, s + Duration::from_secs(2), 5, &[3]),
+        );
+        let findings = t.analyze(&ctx!(parts));
+        let bounce = findings
+            .iter()
+            .find(|f| f.category == "Switch bounce")
+            .unwrap();
+        assert_eq!(bounce.severity, Severity::Critical);
+        assert_eq!(bounce.detail, "A (3 bounces, 1 wireless)");
     }
 
     #[test]
