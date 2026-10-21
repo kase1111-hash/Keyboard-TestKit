@@ -130,7 +130,8 @@ Config file locations:
 ### UI Controls
 
 - Any view: Tab/Shift+Tab navigate, Esc/Ctrl+C quit, Ctrl+P pause,
-  Ctrl+R reset current test, Ctrl+E export JSON report
+  Ctrl+R reset current test, Ctrl+E export JSON report (not in the
+  Shortcuts view, where Ctrl combos are test input)
 - Test views (Polling ... OEM/FN): every other key is test input, except the
   view's own action keys (v on Virtual; a, f, c on OEM/FN)
 - Dashboard, Auto and Help also take single keys: 1-9, 0 jump to a view,

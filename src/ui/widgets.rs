@@ -157,6 +157,7 @@ impl Widget for HelpPanel {
                 "TEST VIEWS 2-9",
                 &[
                     ("keys", "Every other key is test input"),
+                    ("Ctrl", "Shortcuts: Ctrl combos too"),
                     ("v", "Virtual: send test keys"),
                     ("a f c", "OEM: add FN key, FN mode, clear"),
                 ][..],

@@ -420,7 +420,8 @@ fn print_help() {
     println!("TUI CONTROLS:");
     println!("  Tab/Shift+Tab    Navigate views");
     println!("  Esc/Ctrl+C       Quit");
-    println!("  Ctrl+P/R/E       Pause, reset current test, export report (any view)");
+    println!("  Ctrl+P/R/E       Pause, reset current test, export report (any view");
+    println!("                   but Shortcuts, where Ctrl combos are test input)");
     println!("  In the test views (Polling ... OEM/FN) every other key is test input.");
     println!("  On the Dashboard, Auto and Help screens these single keys also work:");
     println!("  A                Run the automatic diagnostic (Ctrl+N skip step, Ctrl+C abort)");
@@ -709,6 +710,10 @@ fn report_device_changes(app: &mut App, evdev: &mut EvdevListener, disconnects: 
 const TEST_VIEW_HINT: &str =
     "Keys here are test input - Ctrl+P pause, Ctrl+R reset, Ctrl+E export, Esc quit";
 
+/// Status hint shown when the Shortcuts view is opened.
+const SHORTCUTS_VIEW_HINT: &str =
+    "Keys and Ctrl combos here are test input - Tab to leave, Esc or Ctrl+C quit";
+
 /// What a terminal keystroke asks the app to do, besides being test input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -781,7 +786,8 @@ fn command_char(key: &CtKeyEvent) -> Option<char> {
 /// - while the auto test runs, every key is test input except Ctrl+N (skip
 ///   step) and Ctrl+C (abort);
 /// - everywhere else Tab / Shift+Tab switch views, Esc and Ctrl+C quit, and
-///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export;
+///   Ctrl+P / Ctrl+R / Ctrl+E pause, reset the current test and export,
+///   except in the Shortcuts view, where Ctrl combos are the test input;
 /// - single-key commands (q, Space, r, R, e, A, S, t, m, ?, 1-9/0) only work
 ///   on the Dashboard, Auto and Help screens; in the key-test views every
 ///   other key is test input, apart from the view's own action keys (v on
@@ -824,10 +830,12 @@ fn command_for_key(
         };
     }
 
-    // Ctrl chords work in every view. Ctrl+Alt is AltGr on Windows, which
-    // types characters on many layouts, so it is never a command.
+    // Ctrl chords work in every view but Shortcuts, which records Ctrl
+    // combos (Ctrl+R, Ctrl+P...) as its test input. Ctrl+Alt is AltGr on
+    // Windows, which types characters on many layouts, so it is never a
+    // command.
     if ctrl {
-        if key.modifiers.contains(KeyModifiers::ALT) {
+        if key.modifiers.contains(KeyModifiers::ALT) || view == AppView::Shortcuts {
             return Command::None;
         }
         return match ctrl_char {
@@ -985,7 +993,12 @@ fn apply_command(app: &mut App, command: Command) {
     }
     // Entering a key-test view: say how commands work there
     if app.view != view_before && is_key_test_view(app.view) {
-        app.set_status(TEST_VIEW_HINT.to_string());
+        let hint = if app.view == AppView::Shortcuts {
+            SHORTCUTS_VIEW_HINT
+        } else {
+            TEST_VIEW_HINT
+        };
+        app.set_status(hint.to_string());
     }
 }
 
@@ -1094,14 +1107,29 @@ mod tests {
                 cmd(press(CtKeyCode::Tab, KeyModifiers::SHIFT), view),
                 Command::PrevView
             );
-            assert_eq!(cmd(ctrl('p'), view), Command::TogglePause);
-            assert_eq!(cmd(ctrl('r'), view), Command::ResetCurrent);
-            assert_eq!(cmd(ctrl('e'), view), Command::Export);
+            if view != AppView::Shortcuts {
+                assert_eq!(cmd(ctrl('p'), view), Command::TogglePause);
+                assert_eq!(cmd(ctrl('r'), view), Command::ResetCurrent);
+                assert_eq!(cmd(ctrl('e'), view), Command::Export);
+            }
         }
         assert_eq!(cmd(plain('v'), AppView::Virtual), Command::SendVirtualKeys);
         assert_eq!(cmd(plain('a'), AppView::OemKeys), Command::AddOemMapping);
         assert_eq!(cmd(plain('f'), AppView::OemKeys), Command::CycleFnMode);
         assert_eq!(cmd(plain('c'), AppView::OemKeys), Command::ClearOemMappings);
+    }
+
+    #[test]
+    fn ctrl_combos_are_test_input_in_the_shortcuts_view() {
+        // Testing Ctrl+R / Ctrl+P / Ctrl+E there must not reset the recorded
+        // shortcuts, pause the capture or write a report.
+        for c in "abcdefghijklmnopqrstuvwxyz".chars().filter(|c| *c != 'c') {
+            assert_eq!(cmd(ctrl(c), AppView::Shortcuts), Command::None, "Ctrl+{c}");
+        }
+        assert_eq!(cmd(ctrl('c'), AppView::Shortcuts), Command::Quit);
+        let mut app = App::default();
+        apply_command(&mut app, Command::ShowView(AppView::Shortcuts));
+        assert_eq!(app.get_status(), Some(SHORTCUTS_VIEW_HINT));
     }
 
     #[test]

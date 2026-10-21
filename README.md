@@ -155,16 +155,17 @@ exported report and on stdout when you quit.
 
 Keys you press while testing never trigger a command by accident: in the test
 views (Polling ... OEM/FN, `2`-`9`) every key is test input except `Tab`,
-`Esc` and `Ctrl` chords. Single-key commands only work on the Dashboard, Auto
-and Help screens.
+`Esc` and `Ctrl` chords, and in the Shortcuts view `Ctrl` combos are test
+input too (only `Ctrl+C` quits). Single-key commands only work on the
+Dashboard, Auto and Help screens.
 
 | Key | Where | Action |
 |-----|-------|--------|
 | `Tab` / `Shift+Tab` | Any view | Next / previous view |
 | `Esc` / `Ctrl+C` | Any view | Quit (`Ctrl+C` aborts a running auto test) |
-| `Ctrl+P` | Any view | Pause/resume testing |
-| `Ctrl+R` | Any view | Reset the current test |
-| `Ctrl+E` | Any view | Export report to JSON |
+| `Ctrl+P` | Any view but Shortcuts | Pause/resume testing |
+| `Ctrl+R` | Any view but Shortcuts | Reset the current test |
+| `Ctrl+E` | Any view but Shortcuts | Export report to JSON |
 | `v` | Virtual view | Send virtual keys |
 | `a` / `f` / `c` | OEM/FN view | Add last unknown key as FN scancode / cycle FN key mode / clear OEM key mappings |
 | `A` | Dashboard, Auto, Help | Run the automatic diagnostic |
